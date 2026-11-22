@@ -67,6 +67,18 @@ pub fn run(exefs: &Path, mush8: &Path, prelude: &Path) -> Result<()> {
             m.syms.len()
         );
     }
+    for m in &mods {
+        // Cross-check Mush8's dynamic-section parser (used by the loader) against the NSO header.
+        let dynsym = m.nso.symbols().len();
+        match nxfs::module::parse(&m.nso.image) {
+            Ok(d) => {
+                let named = d.symbols.iter().filter(|s| !s.name.is_empty()).count();
+                let rel = d.relocs.iter().filter(|r| r.kind == nxfs::module::R_AARCH64_RELATIVE).count();
+                println!("{:<10} loader view: {named} named symbols (NSO header: {dynsym}), {} relocations ({rel} RELATIVE)", m.name, d.relocs.len());
+            }
+            Err(e) => println!("{:<10} loader view: Mush8 cannot parse the dynamic section: {e:#}", m.name),
+        }
+    }
     let mush8_modules = ["main", "subsdk0", "sdk"];
     let extra: Vec<_> = mods.iter().map(|m| m.name.as_str()).filter(|n| !mush8_modules.contains(n) && *n != "rtld").collect();
     if !extra.is_empty() {
@@ -90,16 +102,22 @@ pub fn run(exefs: &Path, mush8: &Path, prelude: &Path) -> Result<()> {
     }
 
     let defined: BTreeSet<&str> = mods.iter().flat_map(|m| m.syms.iter().filter(|s| s.defined).map(|s| s.name.as_str())).collect();
-    let mut unresolved: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut unresolved: BTreeMap<&str, (bool, Vec<&str>)> = BTreeMap::new();
     for m in &mods {
         for s in m.syms.iter().filter(|s| !s.defined && !defined.contains(s.name.as_str())) {
-            unresolved.entry(&s.name).or_default().push(&m.name);
+            let e = unresolved.entry(&s.name).or_insert((true, Vec::new()));
+            e.0 &= s.info >> 4 == 2; // STB_WEAK: the game checks for null before calling
+            e.1.push(&m.name);
         }
     }
     let hle = mush8_hle(mush8);
     println!("\n# Imports no module defines ({})", unresolved.len());
-    for (name, by) in &unresolved {
-        let tag = if hle.contains(*name) { "mush8-hle" } else { "MISSING " };
+    for (name, (weak, by)) in &unresolved {
+        let tag = match (hle.contains(*name), weak) {
+            (true, _) => "mush8-hle",
+            (false, true) => "weak     ",
+            (false, false) => "MISSING  ",
+        };
         println!("{tag}  {}  <- {}", nxfs::nso::demangle(name), by.join(","));
     }
 

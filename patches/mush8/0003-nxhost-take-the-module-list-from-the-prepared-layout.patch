@@ -1,0 +1,172 @@
+From ad4a8be62f2d6c942ae32db875cbdd108fa0f81e Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:03:28 +0100
+Subject: [PATCH 3/3] nxhost: take the module list from the prepared layouts
+
+main.rs, loader.rs and build.rs hardcoded [main, subsdk0, sdk] (MK8DX).
+Splatoon 3 ships main and sdk only. loader::module_names() now returns the
+modules that have a .layout in the prepared directory, in Horizon load order
+(main, subsdk0..9, sdk; rtld is never run). On iOS, build.rs embeds the same
+set and generates the extern statics and lookup() that loader.rs used to
+spell out by hand. MK8DX resolves to the same three modules as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/build.rs      | 21 ++++++++++++--
+ crates/nxhost/src/loader.rs | 55 ++++++++++++++++++++++---------------
+ crates/nxhost/src/main.rs   |  4 +--
+ 3 files changed, 53 insertions(+), 27 deletions(-)
+
+diff --git a/crates/nxhost/build.rs b/crates/nxhost/build.rs
+index bf70ac3..1c5d959 100644
+--- a/crates/nxhost/build.rs
++++ b/crates/nxhost/build.rs
+@@ -4,7 +4,8 @@ use std::fmt::Write;
+ use std::path::{Path, PathBuf};
+ 
+ const PAGE: u64 = 0x4000;
+-const MODULES: [&str; 3] = ["main", "subsdk0", "sdk"];
++/// Same order as loader::MODULE_ORDER; only the ones with a .layout in NX_MODULES_DIR are embedded.
++const MODULE_ORDER: [&str; 12] = ["main", "subsdk0", "subsdk1", "subsdk2", "subsdk3", "subsdk4", "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9", "sdk"];
+ const FIRST_SEGMENT: u64 = 0x1_0400_0000;
+ 
+ fn main() {
+@@ -19,9 +20,19 @@ fn main() {
+         return;
+     };
+     let dir = PathBuf::from(dir);
++    let modules: Vec<&str> = MODULE_ORDER.iter().copied().filter(|n| dir.join(format!("{n}.layout")).exists()).collect();
++    assert!(modules.first() == Some(&"main"), "{}: no main.layout", dir.display());
+     let mut asm = String::new();
++    let mut rs = String::from("unsafe extern \"C\" {\n");
++    let mut lookup = String::from("fn lookup(name: &str) -> Option<(*const u8, *const u8, *const u8, u64)> {\n    unsafe {\n        match name {\n");
+     let mut addr = FIRST_SEGMENT;
+-    for (i, name) in MODULES.iter().enumerate() {
++    for (i, name) in modules.iter().enumerate() {
++        println!("cargo:rerun-if-changed={}", dir.join(format!("{name}.layout")).display());
++        for k in ["x", "d", "t"] {
++            writeln!(rs, "    static nx_mod_{name}_{k}: u8;").unwrap();
++        }
++        writeln!(rs, "    static nx_mod_{name}_len: u64;").unwrap();
++        writeln!(lookup, "            \"{name}\" => Some((&raw const nx_mod_{name}_x, &raw const nx_mod_{name}_d, &raw const nx_mod_{name}_t, nx_mod_{name}_len)),").unwrap();
+         let (bin, layout) = (dir.join(format!("{name}.bin")), dir.join(format!("{name}.layout")));
+         println!("cargo:rerun-if-changed={}", bin.display());
+         println!("cargo:rerun-if-changed={}", layout.display());
+@@ -56,7 +67,11 @@ fn main() {
+         writeln!(asm, ".section __DATA,__const\n.p2align 3\n.globl _nx_mod_{name}_len\n_nx_mod_{name}_len:\n.quad {}", image.len()).unwrap();
+     }
+     asm.push_str(".text\n");
+-    let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("modules.s");
++    rs.push_str("}\n");
++    lookup.push_str("            _ => None,\n        }\n    }\n}\n");
++    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
++    std::fs::write(out_dir.join("modules.rs"), rs + &lookup).unwrap();
++    let out = out_dir.join("modules.s");
+     std::fs::write(&out, asm).unwrap();
+     println!("cargo:rustc-cfg=embedded_modules");
+ }
+diff --git a/crates/nxhost/src/loader.rs b/crates/nxhost/src/loader.rs
+index 040ae49..c3e61e3 100644
+--- a/crates/nxhost/src/loader.rs
++++ b/crates/nxhost/src/loader.rs
+@@ -75,6 +75,17 @@ fn unimpl(idx: u64, _args: &crate::stubs::Args) -> u64 {
+     0
+ }
+ 
++/// Load order of Horizon ExeFS modules: main, subsdk0..subsdk9, sdk. rtld is never run.
++pub const MODULE_ORDER: [&str; 12] = ["main", "subsdk0", "subsdk1", "subsdk2", "subsdk3", "subsdk4", "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9", "sdk"];
++
++/// The prepared modules present in `dir` (those with a `.layout`), in load order.
++/// MK8DX has main, subsdk0, sdk; Splatoon 3 has main, sdk.
++pub fn module_names(dir: &Path) -> Result<Vec<&'static str>> {
++    let names: Vec<&'static str> = MODULE_ORDER.iter().copied().filter(|n| dir.join(format!("{n}.layout")).exists()).collect();
++    ensure!(names.first() == Some(&"main"), "{}: no prepared main module (main.layout)", dir.display());
++    Ok(names)
++}
++
+ pub fn load(dir: &Path, names: &[&str], hle: &HashMap<&str, u64>) -> Result<Vec<Module>> {
+     let a = kernel::aspace();
+     let mut next = a.code() + PAGE;
+@@ -280,30 +291,12 @@ mod embedded {
+ 
+     std::arch::global_asm!(include_str!(concat!(env!("OUT_DIR"), "/modules.s")));
+ 
+-    unsafe extern "C" {
+-        static nx_mod_main_x: u8;
+-        static nx_mod_main_d: u8;
+-        static nx_mod_main_t: u8;
+-        static nx_mod_main_len: u64;
+-        static nx_mod_subsdk0_x: u8;
+-        static nx_mod_subsdk0_d: u8;
+-        static nx_mod_subsdk0_t: u8;
+-        static nx_mod_subsdk0_len: u64;
+-        static nx_mod_sdk_x: u8;
+-        static nx_mod_sdk_d: u8;
+-        static nx_mod_sdk_t: u8;
+-        static nx_mod_sdk_len: u64;
+-    }
++    // Generated by build.rs for the modules present in NX_MODULES_DIR:
++    // extern statics nx_mod_<name>_{x,d,t,len} and fn lookup(name).
++    include!(concat!(env!("OUT_DIR"), "/modules.rs"));
+ 
+     pub fn image(name: &str, text: u64, tramp: u64) -> Result<Option<(u64, &'static [u8])>> {
+-        let (x, d, t, len) = unsafe {
+-            match name {
+-                "main" => (&raw const nx_mod_main_x, &raw const nx_mod_main_d, &raw const nx_mod_main_t, nx_mod_main_len),
+-                "subsdk0" => (&raw const nx_mod_subsdk0_x, &raw const nx_mod_subsdk0_d, &raw const nx_mod_subsdk0_t, nx_mod_subsdk0_len),
+-                "sdk" => (&raw const nx_mod_sdk_x, &raw const nx_mod_sdk_d, &raw const nx_mod_sdk_t, nx_mod_sdk_len),
+-                _ => return Ok(None),
+-            }
+-        };
++        let Some((x, d, t, len)) = lookup(name) else { return Ok(None) };
+         let base = x as u64;
+         ensure!(d as u64 == base + align_up(text, PAGE) && t as u64 == base + tramp, "{name}: linked segments are not contiguous (rebuild with matching layouts)");
+         ensure!(base + align_up(len, PAGE) < crate::mem::ADDRESS_SPACE_END, "{name}: linked at {base:#x}, above the guest address space");
+@@ -323,3 +316,21 @@ mod embedded {
+ pub fn symbol(mods: &[Module], name: &str) -> Option<u64> {
+     mods.iter().find_map(|m| m.dynamic.symbols.iter().find(|s| s.defined() && s.name == name).map(|s| m.base + s.value))
+ }
++
++#[cfg(test)]
++mod module_order_tests {
++    use super::module_names;
++
++    #[test]
++    fn module_names_follow_horizon_load_order() {
++        let dir = std::env::temp_dir().join(format!("nxhost-modules-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        for n in ["sdk", "main", "subsdk1", "rtld"] {
++            std::fs::write(dir.join(format!("{n}.layout")), "").unwrap();
++        }
++        assert_eq!(module_names(&dir).unwrap(), ["main", "subsdk1", "sdk"]);
++        std::fs::remove_file(dir.join("main.layout")).unwrap();
++        assert!(module_names(&dir).is_err());
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++}
+diff --git a/crates/nxhost/src/main.rs b/crates/nxhost/src/main.rs
+index b055fbf..0b9dacc 100644
+--- a/crates/nxhost/src/main.rs
++++ b/crates/nxhost/src/main.rs
+@@ -344,7 +344,7 @@ fn start(args: Args) -> Result<()> {
+     };
+     eprintln!("[host] RomFS: {:.2} GB", nxfs::storage::Storage::size(&*romfs) as f64 / 1e9);
+     if args.precompile {
+-        let modules: Vec<PathBuf> = ["main", "subsdk0", "sdk"].iter().map(|m| dir.join(format!("{m}.bin"))).collect();
++        let modules: Vec<PathBuf> = loader::module_names(&dir)?.iter().map(|m| dir.join(format!("{m}.bin"))).collect();
+         nvn::precompile(romfs, &modules)?;
+         std::process::exit(0);
+     }
+@@ -371,7 +371,7 @@ fn start(args: Args) -> Result<()> {
+     let a = kernel::aspace();
+     eprintln!("[host] guest address space at {:#x}..{:#x}", a.base, a.base + a.layout.total());
+ 
+-    let mods = loader::load(&dir, &["main", "subsdk0", "sdk"], &hle::table())?;
++    let mods = loader::load(&dir, &loader::module_names(&dir)?, &hle::table())?;
+     let _ = diag::MODULES.set(
+         mods.iter()
+             .map(|m| {
+-- 
+2.56.1
+

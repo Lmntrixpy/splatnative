@@ -1,0 +1,526 @@
+From e768d5a2890e6a178d05c2339e837487b59aac43 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Sun, 22 Nov 2026 23:57:56 +0100
+Subject: [PATCH 1/3] nxpatch: rewrite compressed switch tables that dispatch
+ through x18
+
+Mush8 only handled br x18 at a hardcoded list of i32 jump tables (MK8DX).
+Splatoon 3 11.3.0 has 110 such sites (main 102, sdk 8), all clang's
+compressed form: adr x18, anchor; ldrb/ldrh wK, [xB, xI]; add x18, x18,
+xK, lsl #2; br x18.
+
+The new switch.rs detects that pattern and emits an O(1) dispatch through a
+pad table (ldp s,t; b anchor+4e per entry). No flags or guest registers are
+changed; out-of-range values trap with brk #0x18 instead of jumping wrong.
+ldrb tables get all 256 pads; ldrh tables are decoded when adrp/add base and
+cmp/b.hi bound are found, otherwise get the full 65536-entry range.
+Known MK8 tables keep their original path. verify now reads jump targets
+from Output::jump_targets for both kinds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxpatch/src/equiv.rs   |   6 +-
+ crates/nxpatch/src/main.rs    |   1 +
+ crates/nxpatch/src/rewrite.rs |  67 +++++---
+ crates/nxpatch/src/switch.rs  | 309 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 358 insertions(+), 25 deletions(-)
+ create mode 100644 crates/nxpatch/src/switch.rs
+
+diff --git a/crates/nxpatch/src/equiv.rs b/crates/nxpatch/src/equiv.rs
+index 49005f7..45f2e7c 100644
+--- a/crates/nxpatch/src/equiv.rs
++++ b/crates/nxpatch/src/equiv.rs
+@@ -221,10 +221,8 @@ pub fn verify(original: &[u8], out: &Output) -> Result<Summary> {
+             }
+             let mut inp = make_input(trial, p.start ^ (trial << 40));
+             if p.kind == Kind::JumpTable {
+-                let jt = crate::rewrite::JUMP_TABLES.iter().find(|j| j.site == p.start).unwrap();
+-                let k = trial as usize % jt.count;
+-                let e = i32::from_le_bytes(original[(jt.table as usize + 4 * k)..][..4].try_into().unwrap());
+-                inp.x[18] = BASE + (jt.table as i64 + e as i64) as u64;
++                let targets = &out.jump_targets[&p.start];
++                inp.x[18] = BASE + targets[trial as usize % targets.len()];
+             }
+             let expect = if p.kind == Kind::Svc {
+                 let mut st = orig.run(&inp, p.start + 4, [(0, 0), (0, 0)]);
+diff --git a/crates/nxpatch/src/main.rs b/crates/nxpatch/src/main.rs
+index 1287517..ae3d1e5 100644
+--- a/crates/nxpatch/src/main.rs
++++ b/crates/nxpatch/src/main.rs
+@@ -6,6 +6,7 @@ mod equiv;
+ mod ips;
+ mod rewrite;
+ mod spin;
++mod switch;
+ 
+ use anyhow::{Context, Result};
+ use std::collections::BTreeMap;
+diff --git a/crates/nxpatch/src/rewrite.rs b/crates/nxpatch/src/rewrite.rs
+index dad2c17..99d9090 100644
+--- a/crates/nxpatch/src/rewrite.rs
++++ b/crates/nxpatch/src/rewrite.rs
+@@ -361,6 +361,8 @@ pub struct Output {
+     pub keypage: u64,
+     pub tramp: (u64, u64),
+     pub patches: Vec<Patch>,
++    /// For every jump-table site: the real targets it can reach (module offsets), used by `verify`.
++    pub jump_targets: BTreeMap<u64, Vec<u64>>,
+ }
+ 
+ fn align_up(v: u64, a: u64) -> u64 {
+@@ -451,38 +453,38 @@ impl Ctx<'_> {
+ }
+ 
+ #[derive(Clone, Copy, PartialEq, Eq)]
+-enum Need {
++pub(crate) enum Need {
+     Plain,
+     X18,
+     SysReg,
+ }
+ 
+-struct Emitter {
+-    base: u64,
+-    words: Vec<u32>,
+-    fixups: Vec<(usize, usize)>,
+-    labels: Vec<Option<usize>>,
++pub(crate) struct Emitter {
++    pub(crate) base: u64,
++    pub(crate) words: Vec<u32>,
++    pub(crate) fixups: Vec<(usize, usize)>,
++    pub(crate) labels: Vec<Option<usize>>,
+ }
+ 
+ impl Emitter {
+-    fn pc(&self) -> u64 {
++    pub(crate) fn pc(&self) -> u64 {
+         self.base + self.words.len() as u64 * 4
+     }
+-    fn emit(&mut self, w: u32) {
++    pub(crate) fn emit(&mut self, w: u32) {
+         self.words.push(w);
+     }
+-    fn label(&mut self) -> usize {
++    pub(crate) fn label(&mut self) -> usize {
+         self.labels.push(None);
+         self.labels.len() - 1
+     }
+-    fn bind(&mut self, l: usize) {
++    pub(crate) fn bind(&mut self, l: usize) {
+         self.labels[l] = Some(self.words.len());
+     }
+-    fn cond_to(&mut self, w: u32, l: usize) {
++    pub(crate) fn cond_to(&mut self, w: u32, l: usize) {
+         self.fixups.push((self.words.len(), l));
+         self.words.push(w);
+     }
+-    fn resolve(&mut self) -> Result<()> {
++    pub(crate) fn resolve(&mut self) -> Result<()> {
+         for &(at, l) in &self.fixups {
+             let to = self.labels[l].context("unbound label")?;
+             let from = self.base + at as u64 * 4;
+@@ -624,10 +626,11 @@ pub fn rewrite_skipping(nso: &nxfs::nso::Nso, skip: &[u64]) -> Result<Output> {
+     let mut e = Emitter { base: tramp_base, words: Vec::new(), fixups: Vec::new(), labels: Vec::new() };
+     let mut patched = words.clone();
+     let mut patches = Vec::new();
++    let mut jump_targets = BTreeMap::new();
+ 
+     for &(start, end, kind) in &regions {
+         let tramp = e.pc();
+-        let kind = emit_region(&cx, &mut e, &need, start, end, kind, keypage)
++        let kind = emit_region(&cx, &mut e, &need, start, end, kind, keypage, &mut jump_targets)
+             .with_context(|| format!("region at {:#x}", start * 4))?;
+         e.resolve()?;
+         patched[start] = asm::b(start as u64 * 4, tramp)?;
+@@ -712,6 +715,7 @@ pub fn rewrite_skipping(nso: &nxfs::nso::Nso, skip: &[u64]) -> Result<Output> {
+         keypage,
+         tramp: (tramp_base, tramp_end),
+         patches,
++        jump_targets,
+     })
+ }
+ 
+@@ -876,7 +880,17 @@ fn emit_aspect_scale(e: &mut Emitter, keypage: u64, store: u32, back: u64) -> Re
+     Ok(())
+ }
+ 
+-fn emit_region(cx: &Ctx, e: &mut Emitter, need: &[Need], start: usize, end: usize, kind: Kind, keypage: u64) -> Result<Kind> {
++#[allow(clippy::too_many_arguments)]
++fn emit_region(
++    cx: &Ctx,
++    e: &mut Emitter,
++    need: &[Need],
++    start: usize,
++    end: usize,
++    kind: Kind,
++    keypage: u64,
++    jump_targets: &mut BTreeMap<u64, Vec<u64>>,
++) -> Result<Kind> {
+     let words = cx.words;
+     let pc_of = |i: usize| i as u64 * 4;
+ 
+@@ -898,11 +912,17 @@ fn emit_region(cx: &Ctx, e: &mut Emitter, need: &[Need], start: usize, end: usiz
+     };
+ 
+     if end - start == 1 && words[start] == 0xD61F_0240 {
+-        let jt = JUMP_TABLES
+-            .iter()
+-            .find(|j| j.module_id == cx.module_id && j.site == pc_of(start))
+-            .with_context(|| format!("br x18 at {:#x} is not a known jump table", pc_of(start)))?;
+-        return emit_jump_table(cx, e, &sc, jt, keypage).map(|_| Kind::JumpTable);
++        if let Some(jt) = JUMP_TABLES.iter().find(|j| j.module_id == cx.module_id && j.site == pc_of(start)) {
++            jump_targets.insert(pc_of(start), jump_table_targets(cx, jt)?.into_iter().collect());
++            return emit_jump_table(cx, e, &sc, jt, keypage).map(|_| Kind::JumpTable);
++        }
++        // SplatNative: compiler-generated compressed switch tables, found by pattern instead of a table.
++        let sw = crate::switch::detect(cx.words, cx.image, need, start)
++            .with_context(|| format!("br x18 at {:#x}", pc_of(start)))?;
++        ensure!(!sc.ctx_spill && sc.u.is_none());
++        crate::switch::emit(e, sc.s, sc.t, &sw, keypage, cx.words.len() as u64 * 4, |e| sc.prologue(e, keypage))?;
++        jump_targets.insert(pc_of(start), sw.samples.clone());
++        return Ok(Kind::JumpTable);
+     }
+ 
+     sc.prologue(e, keypage)?;
+@@ -980,8 +1000,7 @@ fn emit_region(cx: &Ctx, e: &mut Emitter, need: &[Need], start: usize, end: usiz
+     Ok(kind)
+ }
+ 
+-fn emit_jump_table(cx: &Ctx, e: &mut Emitter, sc: &Scratch, jt: &JumpTable, keypage: u64) -> Result<()> {
+-    ensure!(!sc.ctx_spill && sc.u.is_none());
++fn jump_table_targets(cx: &Ctx, jt: &JumpTable) -> Result<BTreeSet<u64>> {
+     let read_i32 = |addr: u64| -> Result<i32> {
+         let b = cx.image.get(addr as usize..addr as usize + 4).context("jump table outside image")?;
+         Ok(i32::from_le_bytes(b.try_into()?))
+@@ -992,6 +1011,12 @@ fn emit_jump_table(cx: &Ctx, e: &mut Emitter, sc: &Scratch, jt: &JumpTable, keyp
+         ensure!((t as usize) < cx.words.len() * 4, "jump table target {t:#x} outside text");
+         targets.insert(t);
+     }
++    Ok(targets)
++}
++
++fn emit_jump_table(cx: &Ctx, e: &mut Emitter, sc: &Scratch, jt: &JumpTable, keypage: u64) -> Result<()> {
++    ensure!(!sc.ctx_spill && sc.u.is_none());
++    let targets = jump_table_targets(cx, jt)?;
+     let (s, t) = (sc.s, sc.t);
+     sc.prologue(e, keypage)?;
+     e.emit(asm::str(s, t, ctx::X18));
+diff --git a/crates/nxpatch/src/switch.rs b/crates/nxpatch/src/switch.rs
+new file mode 100644
+index 0000000..643a2c9
+--- /dev/null
++++ b/crates/nxpatch/src/switch.rs
+@@ -0,0 +1,309 @@
++// SplatNative - switch.rs
++// Compiler-generated compressed switch tables that dispatch through x18.
++//
++// Mush8 rewrites every x18 access, so a `br x18` cannot simply jump: the
++// trampoline has to reach the target without clobbering any guest register or
++// the flags. Mush8 does that for a hardcoded list of i32 tables. Splatoon 3
++// has 110 such sites, all of clang's compressed form:
++//
++//     adr   x18, anchor
++//     ldrb  wK, [xB, xI]            (or ldrh wK, [xB, xI, lsl #1])
++//     add   x18, x18, xK, lsl #2
++//     br    x18
++//
++// The target is always anchor + 4*e with e an 8- or 16-bit table entry. The
++// trampoline computes e from the runtime x18 and jumps through a pad table
++// (one `ldp; b` pair per possible e), so dispatch is O(1), uses no flags and
++// restores the two scratch registers before reaching the target. A value
++// outside the pad range traps (`brk #0x18`) instead of jumping somewhere wrong.
++//
++// For ldrb the pad range is the full 256 entries and needs no table decoding.
++// For ldrh the table is decoded when its base (adrp+add) and bound (cmp+b.hi)
++// can be found; otherwise the full 65536-entry range is used. Decoding only
++// narrows the pad range: dispatch always uses the runtime value.
++use crate::asm::{self, Reg, SP};
++use crate::rewrite::{Emitter, Need, ctx};
++use anyhow::{Context, Result, bail, ensure};
++use std::collections::BTreeSet;
++
++const WINDOW: usize = 24;
++const BASE_SEARCH: usize = 4096;
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Switch {
++    pub site: u64,
++    pub anchor: u64,
++    /// 1 for ldrb, 2 for ldrh tables.
++    pub width: u8,
++    /// Number of entries the pad table covers (anchor + 4*e for e < pads).
++    pub pads: u64,
++    /// Whether the table itself was decoded.
++    pub decoded: bool,
++    /// Real targets (decoded) or representative ones, for `nxpatch verify`.
++    pub samples: Vec<u64>,
++}
++
++fn add_x18_lsl2(w: u32) -> Option<Reg> {
++    (w & 0xFFE0_FFFF == 0x8B00_0A52).then_some((w >> 16) & 31)
++}
++
++struct Load {
++    width: u8,
++    rt: Reg,
++    rn: Reg,
++    rm: Reg,
++}
++
++/// `ldrb wT, [xN, xM]` / `ldrb wT, [xN, wM, uxtw]` / `ldrh wT, [xN, xM, lsl #1]`.
++fn table_load(w: u32) -> Option<Load> {
++    let width = match w & 0xFFE0_0C00 {
++        0x3860_0800 => 1,
++        0x7860_0800 => 2,
++        _ => return None,
++    };
++    let option = (w >> 13) & 7;
++    let scaled = (w >> 12) & 1 == 1;
++    if !(option == 0b011 || option == 0b010) || (width == 2 && !scaled) || (width == 1 && scaled) {
++        return None;
++    }
++    Some(Load { width, rt: w & 31, rn: (w >> 5) & 31, rm: (w >> 16) & 31 })
++}
++
++fn is_adr_to(w: u32, rd: Reg) -> bool {
++    asm::is_adr(w) && w & 31 == rd
++}
++
++/// Conservative: true if `w` may write register `r` (any instruction whose
++/// Rt/Rd or Rt2 field is `r`). False positives only make table decoding give up.
++fn may_write(w: u32, r: Reg) -> bool {
++    let pair = w & 0x3A00_0000 == 0x2800_0000;
++    w & 31 == r || (pair && (w >> 10) & 31 == r)
++}
++
++/// `cmp wN, #imm` (subs wzr, wN, #imm, no shift).
++fn cmp_w_imm(w: u32) -> Option<(Reg, u32)> {
++    (w & 0xFFC0_001F == 0x7100_001F).then(|| ((w >> 5) & 31, (w >> 10) & 0xFFF))
++}
++
++fn bcond(w: u32) -> Option<u32> {
++    asm::is_bcond(w).then_some(w & 0xF)
++}
++
++/// Finds the base of the table read by the load at `l`: the nearest earlier
++/// writer of `b` must be `add xB, xB, #lo`, and the writer before that `adrp xB`.
++fn table_base(words: &[u32], l: usize, b: Reg) -> Option<u64> {
++    let mut m = l;
++    let mut lo = None;
++    for _ in 0..BASE_SEARCH {
++        m = m.checked_sub(1)?;
++        let w = words[m];
++        // Conditional branches leave this path as fallthrough; b/bl/br/ret end it
++        // (bl may also clobber the base register).
++        if asm::is_uncond_branch(w) {
++            return None;
++        }
++        if !may_write(w, b) {
++            continue;
++        }
++        match lo {
++            None if w & 0xFFC0_0000 == 0x9100_0000 && (w >> 5) & 31 == b => lo = Some(((w >> 10) & 0xFFF) as u64),
++            Some(lo) if asm::is_adrp(w) => return Some(asm::adr_target(w, m as u64 * 4) + lo),
++            _ => return None,
++        }
++    }
++    None
++}
++
++/// Number of table entries from `cmp wI, #c; b.hi` (c+1) or `b.hs` (c) shortly before `before`.
++fn table_count(words: &[u32], before: usize, index: Reg) -> Option<u64> {
++    let lo = before.saturating_sub(WINDOW);
++    for m in (lo..before).rev() {
++        if let Some((rn, c)) = cmp_w_imm(words[m]) {
++            if rn != index {
++                return None;
++            }
++            return match words.get(m + 1).copied().and_then(bcond) {
++                Some(0x8) => Some(c as u64 + 1),
++                Some(0x2) => Some(c as u64),
++                _ => None,
++            };
++        }
++    }
++    None
++}
++
++pub fn detect(words: &[u32], image: &[u8], need: &[Need], i: usize) -> Result<Switch> {
++    ensure!(words[i] == 0xD61F_0240, "not br x18");
++    let lo = i.saturating_sub(WINDOW);
++    let (j, k_reg) = (lo..i).rev().find_map(|j| add_x18_lsl2(words[j]).map(|k| (j, k))).context("no `add x18, x18, xK, lsl #2` before it")?;
++    let a = (lo..j).rev().find(|&a| is_adr_to(words[a], 18)).context("no `adr x18, anchor` before it")?;
++    let anchor = asm::adr_target(words[a], a as u64 * 4);
++    for m in (a + 1..i).filter(|&m| m != j) {
++        let (w, pc) = (words[m], m as u64 * 4);
++        // `need` comes from classify (capstone operand analysis), so SIMD v18 is not mistaken for x18.
++        ensure!(need[m] == Need::Plain, "x18 is also used at {pc:#x}");
++        ensure!(!asm::is_uncond_branch(w), "branch at {pc:#x} inside the dispatch sequence");
++    }
++    // xK is consumed by the add, so code between the add and the br may reuse it.
++    let l = (lo..j).rev().find(|&m| may_write(words[m], k_reg)).context("no load of the table entry")?;
++    let load = table_load(words[l]).with_context(|| format!("entry register x{k_reg} is not loaded by ldrb/ldrh at {:#x}", l * 4))?;
++    ensure!(load.rt == k_reg);
++
++    let base = table_base(words, l, load.rn);
++    let count = table_count(words, a.min(l), load.rm);
++    let mut decoded = None;
++    if let (Some(base), Some(count)) = (base, count) {
++        let w = load.width as usize;
++        let at = base as usize;
++        if count > 0 && count <= 0x1_0000 && image.len() >= at + w * count as usize {
++            let e: Vec<u64> = (0..count as usize)
++                .map(|n| if w == 1 { image[at + n] as u64 } else { u16::from_le_bytes([image[at + 2 * n], image[at + 2 * n + 1]]) as u64 })
++                .collect();
++            decoded = Some(e);
++        }
++    }
++    let text_end = words.len() as u64 * 4;
++    let full = 1u64 << (8 * load.width as u64);
++    let (pads, samples, ok) = match &decoded {
++        Some(e) => {
++            let t: BTreeSet<u64> = e.iter().map(|&e| anchor + 4 * e).collect();
++            if t.iter().all(|&t| t < text_end) {
++                let pads = if load.width == 1 { full } else { e.iter().max().unwrap() + 1 };
++                (pads, t.into_iter().collect(), true)
++            } else {
++                (full, Vec::new(), false)
++            }
++        }
++        None => (full, Vec::new(), false),
++    };
++    let samples = if samples.is_empty() { (0..8).map(|e| anchor + 4 * e).filter(|&t| t < text_end).collect() } else { samples };
++    Ok(Switch { site: i as u64 * 4, anchor, width: load.width, pads, decoded: ok, samples })
++}
++
++fn and_imm3(d: Reg, n: Reg) -> u32 {
++    0x9240_0400 | (n << 5) | d
++}
++fn lsr_imm(d: Reg, n: Reg, sh: u32) -> u32 {
++    0xD340_FC00 | (sh << 16) | (n << 5) | d
++}
++fn adr_fwd(d: Reg, bytes: u32) -> u32 {
++    0x1000_0000 | ((bytes & 3) << 29) | ((bytes >> 2) << 5) | d
++}
++fn add_lsl(d: Reg, n: Reg, m: Reg, sh: u32) -> u32 {
++    0x8B00_0000 | (m << 16) | (sh << 10) | (n << 5) | d
++}
++fn br(n: Reg) -> u32 {
++    0xD61F_0000 | (n << 5)
++}
++fn cbnz_x(t: Reg) -> u32 {
++    0xB500_0000 | t
++}
++
++/// Emits the dispatch trampoline. `prologue` leaves the guest's x18 in `s`
++/// and the thread context in `t`, with s/t saved at [sp, #-16].
++pub fn emit(e: &mut Emitter, s: Reg, t: Reg, sw: &Switch, _keypage: u64, text_end: u64, prologue: impl FnOnce(&mut Emitter) -> Result<()>) -> Result<()> {
++    if sw.pads == 0 {
++        bail!("empty switch table");
++    }
++    let range = sw.pads.next_power_of_two();
++    prologue(e)?;
++    e.emit(asm::str(s, t, ctx::X18));
++    let pc = e.pc();
++    e.emit(asm::adrp(t, pc, sw.anchor)?);
++    if sw.anchor & 0xFFF != 0 {
++        e.emit(asm::add_imm(t, t, (sw.anchor & 0xFFF) as u32));
++    }
++    e.emit(asm::sub_reg(s, s, t));
++    let slow = e.label();
++    e.emit(and_imm3(t, s));
++    e.cond_to(cbnz_x(t), slow);
++    e.emit(lsr_imm(t, s, 2 + range.trailing_zeros()));
++    e.cond_to(cbnz_x(t), slow);
++    e.emit(adr_fwd(t, 12));
++    e.emit(add_lsl(t, t, s, 1));
++    e.emit(br(t));
++    for n in 0..range {
++        let target = sw.anchor + 4 * n;
++        if n < sw.pads && target < text_end {
++            e.emit(asm::ldp(s, t, SP, -16));
++            let pc = e.pc();
++            e.emit(asm::b(pc, target)?);
++        } else {
++            e.emit(asm::brk(0x18));
++            e.emit(asm::brk(0x18));
++        }
++    }
++    e.bind(slow);
++    e.emit(asm::brk(0x18));
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const ADR_X18: fn(u64, u64) -> u32 = |pc, to| {
++        let d = (to - pc) as u32;
++        0x1000_0000 | ((d & 3) << 29) | ((d >> 2) << 5) | 18
++    };
++
++    #[test]
++    fn encodings_match_the_architecture() {
++        // Reference encodings (llvm-mc).
++        assert_eq!(and_imm3(10, 9), 0x9240_052A); // and x10, x9, #3
++        assert_eq!(lsr_imm(10, 9, 10), 0xD34A_FD2A); // lsr x10, x9, #10
++        assert_eq!(adr_fwd(10, 12), 0x1000_006A); // adr x10, #12
++        assert_eq!(add_lsl(10, 10, 9, 1), 0x8B09_054A); // add x10, x10, x9, lsl #1
++        assert_eq!(br(10), 0xD61F_0140); // br x10
++        assert_eq!(add_x18_lsl2(0x8B02_0A52), Some(2)); // add x18, x18, x2, lsl #2
++        assert!(table_load(0x3871_69C2).is_some()); // ldrb w2, [x14, x17]
++        let h = table_load(0x786D_7B03).unwrap(); // ldrh w3, [x24, x13, lsl #1]
++        assert_eq!((h.width, h.rt, h.rn, h.rm), (2, 3, 24, 13));
++    }
++
++    /// The exact sequence from Splatoon 3 11.3.0 main at 0x9bff10..0x9bff2c,
++    /// relocated to offset 0, with a synthetic table.
++    #[test]
++    fn detects_and_decodes_ldrb_table() {
++        let mut words = vec![0xD503_201Fu32; 16];
++        let table = 0x100u64;
++        words[0] = 0x9000_0011; // adrp x17, #0
++        words[1] = 0x9104_0231; // add x17, x17, #0x100
++        words[2] = 0x7100_15FF; // cmp w15, #5
++        words[3] = 0x5400_0228; // b.hi
++        words[4] = ADR_X18(16, 32); // adr x18, #32 (anchor 0x20)
++        words[5] = 0x386F_6A20; // ldrb w0, [x17, x15]
++        words[6] = 0x8B00_0A52; // add x18, x18, x0, lsl #2
++        words[7] = 0xD61F_0240; // br x18
++        let mut image: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++        image.resize(0x200, 0);
++        image[table as usize..table as usize + 6].copy_from_slice(&[0, 1, 2, 5, 1, 3]);
++        let need = vec![Need::Plain; words.len()];
++        let sw = detect(&words, &image, &need, 7).unwrap();
++        assert_eq!(sw.anchor, 0x20);
++        assert_eq!(sw.width, 1);
++        assert!(sw.decoded);
++        assert_eq!(sw.pads, 256);
++        assert_eq!(sw.samples, vec![0x20, 0x24, 0x28, 0x2c, 0x34]);
++    }
++
++    #[test]
++    fn rejects_unknown_shapes() {
++        let mut words = vec![0xD503_201Fu32; 8];
++        words[7] = 0xD61F_0240;
++        let need = vec![Need::Plain; 8];
++        assert!(detect(&words, &[0; 32], &need, 7).is_err());
++    }
++
++    #[test]
++    fn ldrh_without_table_uses_full_range() {
++        let mut words = vec![0xD503_201Fu32; 8];
++        words[3] = ADR_X18(12, 16);
++        words[4] = 0x786D_7B03; // ldrh w3, [x24, x13, lsl #1]  (x24 set elsewhere)
++        words[5] = 0x8B03_0A52; // add x18, x18, x3, lsl #2
++        words[6] = 0xD61F_0240;
++        let need = vec![Need::Plain; 8];
++        let sw = detect(&words, &[0; 32], &need, 6).unwrap();
++        assert_eq!((sw.width, sw.pads, sw.decoded), (2, 65536, false));
++    }
++}
+-- 
+2.56.1
+

@@ -1,0 +1,177 @@
+From e2156cbda83020eea1b59fafef09d5d4a735a696 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:03:28 +0100
+Subject: [PATCH 2/3] nxfs: parse DT_RELR and DT_GNU_HASH dynamic sections
+
+Splatoon 3 11.3.0 is linked with a newer SDK: main uses DT_RELR for its
+relative relocations (528692 of them) and sdk has DT_GNU_HASH but no
+DT_HASH. module::parse bailed on both, so neither the macOS loader nor the
+iOS build.rs could load the game.
+
+RELR entries are expanded into R_AARCH64_RELATIVE Rela records with the
+implicit addend read from the image, so the loader and build.rs's
+no-relocation-in-code check work unchanged. The symbol count comes from
+DT_HASH when present, otherwise from the GNU hash chains. Both match the
+NSO header's dynsym count on Splatoon 3 (main 1292, sdk 23065).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxfs/src/module.rs | 115 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 112 insertions(+), 3 deletions(-)
+
+diff --git a/crates/nxfs/src/module.rs b/crates/nxfs/src/module.rs
+index 95eeb29..34082d9 100644
+--- a/crates/nxfs/src/module.rs
++++ b/crates/nxfs/src/module.rs
+@@ -54,6 +54,57 @@ fn u64_at(b: &[u8], o: u64) -> Result<u64> {
+     Ok(u64::from_le_bytes(b[o..o + 8].try_into()?))
+ }
+ 
++/// Decodes one DT_RELR entry (SplatNative: Splatoon 3's SDK links with RELR).
++/// An even entry is an address to relocate; an odd entry is a bitmap of the 63
++/// words after the last address. RELR relocations are R_AARCH64_RELATIVE with an
++/// implicit addend, which is the value stored at the location.
++fn relr_entry(image: &[u8], entry: u64, next: &mut u64, out: &mut Vec<Rela>) -> Result<()> {
++    let mut push = |at: u64| -> Result<()> {
++        out.push(Rela { offset: at, kind: R_AARCH64_RELATIVE, sym: 0, addend: u64_at(image, at)? as i64 });
++        Ok(())
++    };
++    if entry & 1 == 0 {
++        push(entry)?;
++        *next = entry + 8;
++    } else {
++        let mut bits = entry >> 1;
++        let mut at = *next;
++        while bits != 0 {
++            if bits & 1 != 0 {
++                push(at)?;
++            }
++            bits >>= 1;
++            at += 8;
++        }
++        *next += 63 * 8;
++    }
++    Ok(())
++}
++
++/// Number of dynamic symbols from a DT_GNU_HASH table (SplatNative: Splatoon 3's
++/// sdk has no DT_HASH). Symbols below `symoffset` are not hashed; the highest
++/// hashed symbol is found by following the last bucket's chain to its end bit.
++fn gnu_hash_symbol_count(image: &[u8], at: u64) -> Result<u64> {
++    let nbuckets = u32_at(image, at)? as u64;
++    let symoffset = u32_at(image, at + 4)? as u64;
++    let bloom_size = u32_at(image, at + 8)? as u64;
++    let buckets = at + 16 + bloom_size * 8;
++    let chains = buckets + nbuckets * 4;
++    let mut last = 0u64;
++    for b in 0..nbuckets {
++        last = last.max(u32_at(image, buckets + 4 * b)? as u64);
++    }
++    if last == 0 {
++        return Ok(symoffset);
++    }
++    ensure!(last >= symoffset, "GNU hash bucket {last} below symoffset {symoffset}");
++    let mut i = last;
++    while u32_at(image, chains + 4 * (i - symoffset))? & 1 == 0 {
++        i += 1;
++    }
++    Ok(i + 1)
++}
++
+ pub fn parse(image: &[u8]) -> Result<Dynamic> {
+     let mod0 = u32_at(image, 4)? as u64;
+     if u32_at(image, mod0)? != u32::from_le_bytes(*b"MOD0") {
+@@ -65,7 +116,10 @@ pub fn parse(image: &[u8]) -> Result<Dynamic> {
+ 
+     let (mut rela, mut relasz, mut jmprel, mut pltrelsz) = (0, 0, 0, 0);
+     let (mut symtab, mut strtab, mut syment, mut hash) = (0, 0, 24, 0);
++    let mut gnu_hash = 0;
+     let (mut init_array, mut init_arraysz, mut fini_array, mut fini_arraysz) = (None, 0, None, 0);
++    let (mut relr, mut relrsz, mut relrent) = (0, 0, 8);
++    let mut relr_next = 0u64;
+     let mut o = dynamic;
+     loop {
+         let (tag, val) = (u64_at(image, o)? as i64, u64_at(image, o + 8)?);
+@@ -85,7 +139,10 @@ pub fn parse(image: &[u8]) -> Result<Dynamic> {
+             26 => fini_array = Some(val),
+             27 => init_arraysz = val,
+             28 => fini_arraysz = val,
+-            36 | 35 => bail!("RELR relocations are not supported"),
++            35 => relrsz = val,
++            36 => relr = val,
++            37 => relrent = val,
++            0x6fff_fef5 => gnu_hash = val,
+             _ => {}
+         }
+     }
+@@ -106,8 +163,21 @@ pub fn parse(image: &[u8]) -> Result<Dynamic> {
+         }
+     }
+ 
+-    ensure!(hash != 0, "no DT_HASH");
+-    let nsyms = u32_at(image, hash + 4)? as u64;
++    ensure!(relrsz == 0 || relrent == 8, "DT_RELRENT {relrent} is not 8");
++    let mut r = relr;
++    while r < relr + relrsz {
++        let entry = u64_at(image, r)?;
++        r += 8;
++        relr_entry(image, entry, &mut relr_next, &mut d.relocs)?;
++    }
++
++    let nsyms = if hash != 0 {
++        u32_at(image, hash + 4)? as u64
++    } else if gnu_hash != 0 {
++        gnu_hash_symbol_count(image, gnu_hash)?
++    } else {
++        bail!("no DT_HASH or DT_GNU_HASH");
++    };
+     for i in 0..nsyms {
+         let s = symtab + i * syment;
+         let name_off = strtab + u32_at(image, s)? as u64;
+@@ -121,3 +191,42 @@ pub fn parse(image: &[u8]) -> Result<Dynamic> {
+     }
+     Ok(d)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn gnu_hash_counts_symbols() {
++        // nbuckets 2, symoffset 3, bloom 1; buckets [3, 5]; chains for 3..=6, end bit on 4 and 6.
++        let mut image = vec![0u8; 0x100];
++        let words: [u32; 4] = [2, 3, 1, 6];
++        for (i, w) in words.iter().enumerate() {
++            image[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
++        }
++        let rest: [u32; 6] = [3, 5, 0x10, 0x11, 0x20, 0x21];
++        for (i, w) in rest.iter().enumerate() {
++            let o = 16 + 8 + i * 4;
++            image[o..o + 4].copy_from_slice(&w.to_le_bytes());
++        }
++        assert_eq!(gnu_hash_symbol_count(&image, 0).unwrap(), 7);
++    }
++
++    #[test]
++    fn relr_address_and_bitmap_entries() {
++        let mut image = vec![0u8; 0x400];
++        for (i, v) in [(0x100u64, 0x11u64), (0x108, 0x22), (0x118, 0x33), (0x300, 0x44)] {
++            image[i as usize..i as usize + 8].copy_from_slice(&v.to_le_bytes());
++        }
++        let mut out = Vec::new();
++        let mut next = 0;
++        relr_entry(&image, 0x100, &mut next, &mut out).unwrap(); // address 0x100
++        // bitmap: bit0 -> 0x108, bit2 -> 0x118 (bit 0 of the entry is the marker)
++        relr_entry(&image, (0b101 << 1) | 1, &mut next, &mut out).unwrap();
++        assert_eq!(next, 0x108 + 63 * 8);
++        relr_entry(&image, 0x300, &mut next, &mut out).unwrap();
++        let got: Vec<(u64, i64)> = out.iter().map(|r| (r.offset, r.addend)).collect();
++        assert_eq!(got, [(0x100, 0x11), (0x108, 0x22), (0x118, 0x33), (0x300, 0x44)]);
++        assert!(out.iter().all(|r| r.kind == R_AARCH64_RELATIVE && r.sym == 0));
++    }
++}
+-- 
+2.56.1
+

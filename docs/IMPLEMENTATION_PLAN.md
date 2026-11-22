@@ -11,19 +11,20 @@ Status: ✅ erledigt · ⏳ in Arbeit · ⛔ blockiert · ☐ offen
 - ✅ `s3fs`: XCI/HFS0-Reader, `Package` (NSP|XCI) über nxfs – Unit-Tests + gegen echte XCI geprüft
 - ✅ `s3tool info|inspect|extract|analyze`
 
-## Phase 3 – Splatoon-3-Binary vermessen ⛔ (braucht eigene `prod.keys`)
-1. ☐ `s3tool inspect rom/*.xci rom/*.nsp` → Display-Version, Module, Build-IDs
-2. ☐ `s3tool extract --base rom/*.xci --update rom/*.nsp --out work`
-3. ☐ `s3tool analyze work/exefs` → fehlende Imports, NVN-Procs, Dienste, Nextendo-Patch-Status
-4. ☐ `nxpatch classify` + `nxpatch rewrite` + `nxpatch verify` auf alle Module
-   → Rewriter-Probleme (unbekannte Muster, Jump-Tables) identifizieren
-5. ☐ Ergebnisse in `docs/SPLATOON3_PROFILE.md`
+## Phase 3 – Splatoon-3-Binary vermessen ✅
+1. ✅ `s3tool inspect` → Update ist **11.3.0**, Module main + sdk (+ rtld), kein subsdk
+2. ✅ `s3tool extract` (ExeFS + control; RomFS noch nicht)
+3. ✅ `s3tool analyze` → 14 weak Imports, 569 NVN-Procs (124 in Mush8), Dienste, Nextendo-Patches passen
+4. ✅ `nxpatch rewrite` + `verify`: 65 277 Patches äquivalent, 0 Fehler
+5. ✅ `docs/SPLATOON3_PROFILE.md`
 
-## Phase 4 – Mush8 generalisieren (Patch-Serie `patches/mush8/`)
-1. ☐ `0001` Modulliste aus ExeFS statt `["main","subsdk0","sdk"]` (main.rs, loader.rs, build.rs)
-2. ☐ `0002` Spielidentität (Title-ID, Versionen) konfigurierbar statt `game.rs`/`mods.rs`-Konstanten
-3. ☐ `0003` MK8-spezifische HLE/Patches nur für MK8-Module-IDs aktiv (ist großteils schon so – prüfen)
-4. ☐ Speicherlayout für Splatoon (NPDM-Heapgröße, Applet-Ressourcen)
+## Phase 4 – Mush8 generalisieren (Patch-Serie `patches/mush8/`, `tools/apply-mush8-patches.sh`)
+1. ✅ `0001` nxpatch: Jump-Tables über x18 per Muster statt Liste
+2. ✅ `0002` nxfs: DT_RELR + DT_GNU_HASH
+3. ✅ `0003` nxhost: Modulliste aus den Layouts (macOS + iOS build.rs, `cargo check` iOS mit Splatoon-Modulen grün)
+4. ☐ Spielidentität (Title-ID, Versionstabelle `game.rs`, `mods.rs`, Savedata-Pfad) konfigurierbar
+5. ☐ Speicherlayout für Splatoon (NPDM-Heap, Applet-Ressourcen)
+6. ☐ ldrh-Jump-Tables: Basis weiter zurückverfolgen → Trampoline von 25 MiB verkleinern
 
 ## Phase 5 – Start auf macOS bis Nintendo-Logo/Hauptmenü
 1. ☐ `nxhost` mit Splatoon auf macOS starten, `[hle] UNIMPL`/Stub-Log auswerten
