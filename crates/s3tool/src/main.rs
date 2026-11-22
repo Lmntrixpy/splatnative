@@ -89,7 +89,7 @@ fn main() -> Result<()> {
             let k = keys(&cli.keys)?;
             for f in files {
                 let p = Package::open(f, &k)?;
-                println!("== {} ({:?})", f.display(), p.container);
+                println!("== {} ({:?})", f.display(), Listing::open(f)?.container);
                 for n in &p.ncas {
                     println!("  {} {:?} program={:016x} keygen={}", n.name, n.content_type, n.program_id, n.key_generation);
                 }
@@ -98,7 +98,7 @@ fn main() -> Result<()> {
                         println!("  display version: {v}");
                     }
                 }
-                if let Ok(prog) = p.program() {
+                if let Ok(prog) = program(&p) {
                     if let Ok(pfs) = exefs(prog) {
                         for e in &pfs.entries {
                             let s = pfs.storage_of(e);
@@ -122,15 +122,15 @@ fn main() -> Result<()> {
                 }
                 println!("display version: {}", display_version(c).unwrap_or_else(|e| format!("? ({e:#})")));
             }
-            let pfs = exefs(latest.program()?)?;
+            let pfs = exefs(program(latest)?)?;
             for e in &pfs.entries {
                 write_file(pfs.storage_of(e).as_ref(), 0, e.size, &out.join("exefs").join(&e.name))?;
                 println!("exefs/{} ({} bytes)", e.name, e.size);
             }
             if *romfs {
                 let storage = match &update {
-                    Some(u) => u.program()?.patched_romfs(base.program()?)?,
-                    None => base.program()?.fs_storage(section(base.program()?, FsType::RomFs)?)?,
+                    Some(u) => program(u)?.patched_romfs(program(&base)?)?,
+                    None => program(&base)?.fs_storage(section(program(&base)?, FsType::RomFs)?)?,
                 };
                 let fs = RomFs::open(storage)?;
                 let files = fs.files();
@@ -151,6 +151,10 @@ fn main() -> Result<()> {
 
 fn section(n: &Nca, t: FsType) -> Result<&nxfs::nca::Section> {
     n.sections.iter().find(|s| s.fs_type == t).with_context(|| format!("{}: no {t:?} section", n.name))
+}
+
+fn program(p: &Package) -> Result<&Nca> {
+    p.find(ContentType::Program).context("no Program NCA")
 }
 
 fn exefs(prog: &Nca) -> Result<Pfs0> {

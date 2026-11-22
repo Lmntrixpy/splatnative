@@ -1,0 +1,192 @@
+From f1fa53797fd85e9dc597aa6723a1959822082534 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:07:27 +0100
+Subject: [PATCH 5/5] nxhost: identify the game, not only the MK8DX update
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+game.rs had one MK8DX version table, mods.rs a hardcoded MK8DX title ID,
+and the save directory logic assumed MK8DX versions. Games are now a table
+(title ID, name, known main build IDs → version): MK8DX 4.0.1/3.0.5 and
+Splatoon 3 11.3.0 (main 28c4287a…). identify() records the game; mods use
+its title ID and name; non-MK8 games default to work/save-<title id>.
+MK8DX behaves exactly as before, including before identification.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/game.rs | 68 +++++++++++++++++++++++++++++++++------
+ crates/nxhost/src/main.rs |  6 +++-
+ crates/nxhost/src/mods.rs | 16 +++++----
+ 3 files changed, 72 insertions(+), 18 deletions(-)
+
+diff --git a/crates/nxhost/src/game.rs b/crates/nxhost/src/game.rs
+index a629ad9..b291815 100644
+--- a/crates/nxhost/src/game.rs
++++ b/crates/nxhost/src/game.rs
+@@ -4,16 +4,49 @@ use anyhow::{Context, Result, bail};
+ use std::path::Path;
+ use std::sync::OnceLock;
+ 
+-const VERSIONS: &[(&str, &str)] = &[("158c0c7399aabd7bf83795c2ef3484c7", "4.0.1"), ("fe941ed5ba14be5d505698da1bbf4fe7", "3.0.5")];
++/// A supported game and its known updates, keyed by the main module's build ID.
++/// SplatNative: was a single MK8DX version table.
++pub struct Game {
++    pub title_id: u64,
++    pub name: &'static str,
++    pub versions: &'static [(&'static str, &'static str)],
++}
++
++pub const MK8DX: Game = Game {
++    title_id: 0x0100_1520_0002_2000,
++    name: "Mario Kart 8 Deluxe",
++    versions: &[("158c0c7399aabd7bf83795c2ef3484c7", "4.0.1"), ("fe941ed5ba14be5d505698da1bbf4fe7", "3.0.5")],
++};
++
++pub const SPLATOON3: Game = Game { title_id: 0x0100_C250_0FC2_0000, name: "Splatoon 3", versions: &[("28c4287aee36f7499da60f3e68b54c70", "11.3.0")] };
++
++pub const GAMES: &[&Game] = &[&MK8DX, &SPLATOON3];
+ 
+-static VERSION: OnceLock<&'static str> = OnceLock::new();
++static CURRENT: OnceLock<(&'static Game, &'static str)> = OnceLock::new();
++
++/// The running game. Before identification this is MK8DX 4.0.1, as before.
++pub fn current() -> &'static Game {
++    CURRENT.get().map_or(&MK8DX, |c| c.0)
++}
++
++pub fn is_mk8() -> bool {
++    std::ptr::eq(current(), &MK8DX)
++}
+ 
+ pub fn version() -> &'static str {
+-    VERSION.get().copied().unwrap_or("4.0.1")
++    CURRENT.get().map_or("4.0.1", |c| c.1)
+ }
+ 
+-fn named(id: &str) -> Option<&'static str> {
+-    VERSIONS.iter().find(|(p, _)| id.starts_with(p)).map(|(_, v)| *v)
++pub fn title_id_hex() -> String {
++    format!("{:016x}", current().title_id)
++}
++
++fn named(id: &str) -> Option<(&'static Game, &'static str)> {
++    GAMES.iter().find_map(|g| g.versions.iter().find(|(p, _)| id.starts_with(p)).map(|(_, v)| (*g, *v)))
++}
++
++fn supported() -> String {
++    GAMES.iter().map(|g| format!("{} {}", g.name, g.versions.iter().map(|v| v.1).collect::<Vec<_>>().join("/"))).collect::<Vec<_>>().join(", ")
+ }
+ 
+ pub fn update_main_id(update: &nxfs::Nsp) -> Result<String> {
+@@ -35,18 +68,33 @@ pub fn identify(update: &nxfs::Nsp, patched: &Path) -> Result<&'static str> {
+ }
+ 
+ pub fn identify_id(id: &str, patched: &Path) -> Result<&'static str> {
+-    let Some(version) = named(id) else {
+-        bail!("this update isn't supported (main {id}): use update 4.0.1 or 3.0.5");
++    let Some((game, version)) = named(id) else {
++        bail!("this update isn't supported (main {id}): supported are {}", supported());
+     };
+     let prepared = prepared_main_id(patched)?;
+     if !prepared.starts_with(id) {
+-        let built = named(&prepared).unwrap_or("another update");
++        let built = named(&prepared).map_or("another update", |g| g.1);
+         if cfg!(target_os = "ios") {
+             bail!("this build of Mush8 is for update {built}, but the update file is {version}: import the {built} update, or build Mush8 again with {version}");
+         }
+         bail!("the game code was prepared for update {built}, but the update file is {version}: Prepare again");
+     }
+-    let _ = VERSION.set(version);
+-    eprintln!("[host] Mario Kart 8 Deluxe {version}");
++    let _ = CURRENT.set((game, version));
++    eprintln!("[host] {} {version}", game.name);
+     Ok(version)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn identifies_games_by_main_build_id() {
++        let (g, v) = named("158c0c7399aabd7bf83795c2ef3484c700000000").unwrap();
++        assert_eq!((g.title_id, v), (0x0100_1520_0002_2000, "4.0.1"));
++        let (g, v) = named("28c4287aee36f7499da60f3e68b54c70da382d75").unwrap();
++        assert_eq!((g.name, v), ("Splatoon 3", "11.3.0"));
++        assert!(named("0000").is_none());
++        assert!(supported().contains("Splatoon 3 11.3.0"));
++    }
++}
+diff --git a/crates/nxhost/src/main.rs b/crates/nxhost/src/main.rs
+index 0b9dacc..dd84587 100644
+--- a/crates/nxhost/src/main.rs
++++ b/crates/nxhost/src/main.rs
+@@ -351,7 +351,11 @@ fn start(args: Args) -> Result<()> {
+     let romfs = aspect::romfs(romfs)?;
+     let _ = services::fs::CONFIG.set(services::fs::Config {
+         romfs,
+-        save_dir: if args.save == std::path::Path::new("work/save") && version != "4.0.1" { PathBuf::from(format!("work/save-{version}")) } else { args.save.clone() },
++        save_dir: match (args.save == std::path::Path::new("work/save"), game::is_mk8()) {
++            (true, true) if version != "4.0.1" => PathBuf::from(format!("work/save-{version}")),
++            (true, false) => PathBuf::from(format!("work/save-{}", game::title_id_hex())),
++            _ => args.save.clone(),
++        },
+         sd_dir: args.sdmc.clone(),
+         system_dir: args.system.clone(),
+         firmware_dir: args.firmware.clone(),
+diff --git a/crates/nxhost/src/mods.rs b/crates/nxhost/src/mods.rs
+index 72ea558..cf6738c 100644
+--- a/crates/nxhost/src/mods.rs
++++ b/crates/nxhost/src/mods.rs
+@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+ 
+ const ARCHIVES: &[&str] = &["sarc", "szs", "bntx", "msbt"];
+-const TITLE_ID: &str = "0100152000022000";
+ 
+ enum Node {
+     File(PathBuf),
+@@ -39,21 +38,24 @@ fn entries(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+ }
+ 
+ fn root(dir: &Path) -> Result<PathBuf> {
++    let title_id = crate::game::title_id_hex();
++    let title_id = title_id.as_str();
++    let game = crate::game::current().name;
+     let files = entries(dir)?;
+     if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+-        if name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit()) && !name.eq_ignore_ascii_case(TITLE_ID) {
+-            bail!("{}: this title is not Mario Kart 8 Deluxe ({TITLE_ID})", dir.display());
++        if name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit()) && !name.eq_ignore_ascii_case(title_id) {
++            bail!("{}: this title is not {game} ({title_id})", dir.display());
+         }
+     }
+     let atmosphere = child(dir, "atmosphere");
+     let mut candidates = vec![dir.to_path_buf()];
+-    if let Some(title) = atmosphere.as_ref().and_then(|p| child(p, "contents")).and_then(|p| child(&p, TITLE_ID)) {
++    if let Some(title) = atmosphere.as_ref().and_then(|p| child(p, "contents")).and_then(|p| child(&p, title_id)) {
+         candidates.push(title);
+     }
+-    if let Some(title) = child(dir, "contents").and_then(|p| child(&p, TITLE_ID)) {
++    if let Some(title) = child(dir, "contents").and_then(|p| child(&p, title_id)) {
+         candidates.push(title);
+     }
+-    if let Some(title) = child(dir, TITLE_ID) {
++    if let Some(title) = child(dir, title_id) {
+         candidates.push(title);
+     }
+     for candidate in candidates {
+@@ -66,7 +68,7 @@ fn root(dir: &Path) -> Result<PathBuf> {
+         || atmosphere.as_ref().and_then(|p| child(p, "exefs_patches")).is_some() {
+         return Ok(dir.to_path_buf());
+     }
+-    bail!("{}: no RomFS/ExeFS mod for Mario Kart 8 Deluxe ({TITLE_ID}), or exefs_patches directory", dir.display())
++    bail!("{}: no RomFS/ExeFS mod for {game} ({title_id}), or exefs_patches directory", dir.display())
+ }
+ 
+ fn validate(dir: &Path) -> Result<()> {
+-- 
+2.56.1
+

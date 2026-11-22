@@ -1,0 +1,349 @@
+From 9f295e851e7711ea35261712a11f5d7fe6d0a0bc Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:06:16 +0100
+Subject: [PATCH 4/5] nxfs: open XCI game card images
+
+Splatoon 3's base game here is a game card dump (XCI). nxfs only read NSP
+(PFS0) files. hfs0.rs parses HFS0 partitions (unencrypted), xci.rs finds
+the root HFS0 from the card header (also with a 0x1000 key-area prefix) and
+its secure partition, whose NCAs use the normal key-area encryption.
+package_files() lists either container and Nsp::open accepts both, so
+nxhost --base can point at an XCI and the BKTR RomFS is read in place
+without an extracted copy.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxfs/src/hfs0.rs | 140 ++++++++++++++++++++++++++++++++++++++++
+ crates/nxfs/src/lib.rs  |  33 +++++++---
+ crates/nxfs/src/xci.rs  | 105 ++++++++++++++++++++++++++++++
+ 3 files changed, 269 insertions(+), 9 deletions(-)
+ create mode 100644 crates/nxfs/src/hfs0.rs
+ create mode 100644 crates/nxfs/src/xci.rs
+
+diff --git a/crates/nxfs/src/hfs0.rs b/crates/nxfs/src/hfs0.rs
+new file mode 100644
+index 0000000..229e1d3
+--- /dev/null
++++ b/crates/nxfs/src/hfs0.rs
+@@ -0,0 +1,140 @@
++// SplatNative - hfs0.rs
++//! HFS0 ("hashed file system"), the partition format inside XCI game card images.
++//!
++//! Layout (all little endian):
++//!   0x00 "HFS0"  0x04 u32 file count  0x08 u32 string table size  0x0C u32 reserved
++//!   0x10 file entries, 0x40 bytes each:
++//!        0x00 u64 data offset (relative to end of header)
++//!        0x08 u64 size
++//!        0x10 u32 name offset into string table
++//!        0x14 u32 hashed region size
++//!        0x18 u64 reserved
++//!        0x20 [u8; 32] SHA-256 of the first `hashed region size` bytes
++//!   string table, then file data.
++//!
++// SplatNative - hfs0.rs
++//! HFS0 is not encrypted, so this parser works without any keys.
++
++use anyhow::{Result, bail, ensure};
++use crate::storage::{DynStorage, Sub};
++use std::sync::Arc;
++
++const ENTRY: usize = 0x40;
++
++#[derive(Debug, Clone)]
++pub struct Entry {
++    pub name: String,
++    /// Absolute offset inside the HFS0's storage.
++    pub offset: u64,
++    pub size: u64,
++    pub hashed_size: u32,
++    pub hash: [u8; 32],
++}
++
++pub struct Hfs0 {
++    storage: DynStorage,
++    pub entries: Vec<Entry>,
++}
++
++impl Hfs0 {
++    pub fn open(storage: DynStorage) -> Result<Self> {
++        let hdr = storage.read_vec(0, 16)?;
++        if &hdr[..4] != b"HFS0" {
++            bail!("not an HFS0 partition (magic {:02x?})", &hdr[..4]);
++        }
++        let n = u32::from_le_bytes(hdr[4..8].try_into()?) as usize;
++        let st = u32::from_le_bytes(hdr[8..12].try_into()?) as usize;
++        ensure!(n <= 0x10000 && st <= 0x10_0000, "implausible HFS0 header: {n} files, {st:#x} bytes of names");
++        let table = storage.read_vec(16, n * ENTRY + st)?;
++        let strs = &table[n * ENTRY..];
++        let data = (16 + n * ENTRY + st) as u64;
++        let total = storage.size();
++        let mut entries = Vec::with_capacity(n);
++        for i in 0..n {
++            let e = &table[i * ENTRY..(i + 1) * ENTRY];
++            let off = u64::from_le_bytes(e[0..8].try_into()?);
++            let size = u64::from_le_bytes(e[8..16].try_into()?);
++            let so = u32::from_le_bytes(e[16..20].try_into()?) as usize;
++            let hashed_size = u32::from_le_bytes(e[20..24].try_into()?);
++            ensure!(so < strs.len().max(1), "HFS0 entry {i}: name offset {so:#x} outside the string table");
++            let end = strs[so..].iter().position(|&c| c == 0).unwrap_or(strs.len() - so);
++            let name = String::from_utf8_lossy(&strs[so..so + end]).into_owned();
++            let offset = data + off;
++            ensure!(offset.checked_add(size).is_some_and(|e| e <= total), "HFS0 entry {name}: {offset:#x}+{size:#x} is past the end ({total:#x})");
++            entries.push(Entry { name, offset, size, hashed_size, hash: e[0x20..0x40].try_into()? });
++        }
++        Ok(Self { storage, entries })
++    }
++
++    pub fn entry(&self, name: &str) -> Option<&Entry> {
++        self.entries.iter().find(|e| e.name == name)
++    }
++
++    pub fn file(&self, name: &str) -> Option<DynStorage> {
++        self.entry(name).map(|e| self.storage_of(e))
++    }
++
++    pub fn storage_of(&self, e: &Entry) -> DynStorage {
++        Arc::new(Sub::new(self.storage.clone(), e.offset, e.size))
++    }
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::*;
++    use crate::storage::Mem;
++
++    /// Builds an HFS0 image with the given files.
++    pub(crate) fn build(files: &[(&str, &[u8])]) -> Vec<u8> {
++        let mut names = Vec::new();
++        let mut name_offs = Vec::new();
++        for (n, _) in files {
++            name_offs.push(names.len() as u32);
++            names.extend_from_slice(n.as_bytes());
++            names.push(0);
++        }
++        while names.len() % 0x10 != 0 {
++            names.push(0);
++        }
++        let mut out = Vec::new();
++        out.extend_from_slice(b"HFS0");
++        out.extend_from_slice(&(files.len() as u32).to_le_bytes());
++        out.extend_from_slice(&(names.len() as u32).to_le_bytes());
++        out.extend_from_slice(&0u32.to_le_bytes());
++        let mut off = 0u64;
++        for (i, (_, d)) in files.iter().enumerate() {
++            out.extend_from_slice(&off.to_le_bytes());
++            out.extend_from_slice(&(d.len() as u64).to_le_bytes());
++            out.extend_from_slice(&name_offs[i].to_le_bytes());
++            out.extend_from_slice(&0x200u32.to_le_bytes());
++            out.extend_from_slice(&0u64.to_le_bytes());
++            out.extend_from_slice(&[i as u8; 32]);
++            off += d.len() as u64;
++        }
++        out.extend_from_slice(&names);
++        for (_, d) in files {
++            out.extend_from_slice(d);
++        }
++        out
++    }
++
++    #[test]
++    fn parses_entries_and_data() {
++        let img = build(&[("update", b"aaaa"), ("secure", b"bbbbbbbb")]);
++        let h = Hfs0::open(Arc::new(Mem(img))).unwrap();
++        assert_eq!(h.entries.len(), 2);
++        assert_eq!(h.entries[1].name, "secure");
++        assert_eq!(h.entries[1].hash, [1; 32]);
++        assert_eq!(h.file("secure").unwrap().read_vec(0, 8).unwrap(), b"bbbbbbbb");
++        assert_eq!(h.file("update").unwrap().read_vec(0, 4).unwrap(), b"aaaa");
++        assert!(h.file("normal").is_none());
++    }
++
++    #[test]
++    fn rejects_bad_magic_and_truncation() {
++        assert!(Hfs0::open(Arc::new(Mem(b"PFS0\0\0\0\0\0\0\0\0\0\0\0\0".to_vec()))).is_err());
++        let mut img = build(&[("secure", b"bbbbbbbb")]);
++        img.truncate(img.len() - 4);
++        assert!(Hfs0::open(Arc::new(Mem(img))).is_err());
++    }
++}
+diff --git a/crates/nxfs/src/lib.rs b/crates/nxfs/src/lib.rs
+index fa0f3d4..c473b7a 100644
+--- a/crates/nxfs/src/lib.rs
++++ b/crates/nxfs/src/lib.rs
+@@ -4,6 +4,7 @@ pub mod bflan;
+ pub mod bflyt;
+ pub mod bntx;
+ pub mod crypto;
++pub mod hfs0;
+ pub mod keys;
+ pub mod module;
+ pub mod msbt;
+@@ -13,6 +14,7 @@ pub mod pfs0;
+ pub mod romfs;
+ pub mod sarc;
+ pub mod storage;
++pub mod xci;
+ 
+ use anyhow::{Context, Result};
+ use nca::{Nca, TitleKeys};
+@@ -26,23 +28,36 @@ pub struct Nsp {
+     pub ncas: Vec<Nca>,
+ }
+ 
++/// The files of a game package before decryption: an NSP's PFS0 entries, or
++/// the `secure` partition of an XCI game card image (SplatNative).
++pub fn package_files(path: &Path) -> Result<Vec<(String, DynStorage)>> {
++    let f = Arc::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
++    let size = f.metadata()?.len();
++    let whole: DynStorage = Arc::new(FileRange::new(f, 0, size));
++    if whole.read_vec(0, 4)? == b"PFS0" {
++        let pfs = Pfs0::open(whole)?;
++        return Ok(pfs.entries.iter().map(|e| (e.name.clone(), pfs.storage_of(e))).collect());
++    }
++    let card = xci::Xci::open(whole).with_context(|| format!("{} is neither an NSP nor an XCI", path.display()))?;
++    let secure = card.secure()?;
++    Ok(secure.entries.iter().map(|e| (e.name.clone(), secure.storage_of(e))).collect())
++}
++
+ impl Nsp {
++    /// Opens an NSP or an XCI and decrypts its NCA headers.
+     pub fn open(path: &Path, keys: &keys::Keys) -> Result<Self> {
+-        let f = Arc::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
+-        let size = f.metadata()?.len();
+-        let pfs = Pfs0::open(Arc::new(FileRange::new(f, 0, size)))?;
++        let files = package_files(path)?;
+ 
+         let mut title_keys = TitleKeys::new();
+-        for e in pfs.entries.iter().filter(|e| e.name.ends_with(".tik")) {
+-            let tik = pfs.storage_of(e).read_vec(0, e.size as usize)?;
+-            let (rights, key) = nca::ticket_title_key(keys, &tik).with_context(|| e.name.clone())?;
++        for (name, s) in files.iter().filter(|(n, _)| n.ends_with(".tik")) {
++            let tik = s.read_vec(0, s.size() as usize)?;
++            let (rights, key) = nca::ticket_title_key(keys, &tik).with_context(|| name.clone())?;
+             title_keys.insert(rights, key);
+         }
+ 
+         let mut ncas = Vec::new();
+-        for e in pfs.entries.iter().filter(|e| e.name.ends_with(".nca")) {
+-            let s: DynStorage = pfs.storage_of(e);
+-            ncas.push(Nca::open(&e.name, s, keys, &title_keys)?);
++        for (name, s) in files.iter().filter(|(n, _)| n.ends_with(".nca")) {
++            ncas.push(Nca::open(name, s.clone(), keys, &title_keys)?);
+         }
+         Ok(Self { ncas })
+     }
+diff --git a/crates/nxfs/src/xci.rs b/crates/nxfs/src/xci.rs
+new file mode 100644
+index 0000000..52e6252
+--- /dev/null
++++ b/crates/nxfs/src/xci.rs
+@@ -0,0 +1,105 @@
++// SplatNative - xci.rs
++//! XCI game card images.
++//!
++//! An XCI starts with a 0x200-byte card header (0x100 RSA signature, then the
++//! "HEAD" structure). The fields used here are not encrypted:
++//!   0x100 "HEAD"
++//!   0x10D u8  card size code
++//!   0x130 u64 offset of the root HFS0
++//!   0x138 u64 size of the root HFS0 header
++//! The root HFS0 holds the partitions `update`, `normal`, `secure` (and on newer
++//! cards `logo`). The game's NCAs are in `secure`. They use the standard NCA
++//! key-area encryption (no tickets), which nca.rs implements.
++//!
++//! Some dump tools prepend the 0x1000-byte "initial data / key area"; the
++//! header then sits at 0x1100. Both forms are accepted. The card's own
++//! encrypted extended header (0x190..) is never read or needed.
++
++use crate::hfs0::Hfs0;
++use anyhow::{Context, Result, bail, ensure};
++use crate::storage::{DynStorage, FileRange, Sub};
++use std::fs::File;
++use std::path::Path;
++use std::sync::Arc;
++
++pub struct Xci {
++    /// Offset of the card header inside the file (0 or 0x1000).
++    pub prefix: u64,
++    pub card_size_code: u8,
++    pub root: Hfs0,
++}
++
++impl Xci {
++    pub fn open_file(path: &Path) -> Result<Self> {
++        let f = Arc::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
++        let size = f.metadata()?.len();
++        Self::open(Arc::new(FileRange::new(f, 0, size)))
++    }
++
++    pub fn open(storage: DynStorage) -> Result<Self> {
++        let prefix = [0u64, 0x1000]
++            .into_iter()
++            .find(|&p| storage.size() >= p + 0x200 && storage.read_vec(p + 0x100, 4).is_ok_and(|m| m == b"HEAD"))
++            .context("not an XCI image: no HEAD magic at 0x100 or 0x1100")?;
++        let h = storage.read_vec(prefix, 0x200)?;
++        let card_size_code = h[0x10D];
++        let root_off = u64::from_le_bytes(h[0x130..0x138].try_into()?);
++        let root_hdr = u64::from_le_bytes(h[0x138..0x140].try_into()?);
++        let abs = prefix + root_off;
++        ensure!(root_hdr >= 0x10 && abs < storage.size(), "XCI root HFS0 at {abs:#x} is outside the image");
++        let root = Hfs0::open(Arc::new(Sub::new(storage.clone(), abs, storage.size() - abs))).context("XCI root partition")?;
++        Ok(Self { prefix, card_size_code, root })
++    }
++
++    pub fn partition(&self, name: &str) -> Result<Hfs0> {
++        match self.root.file(name) {
++            Some(s) => Hfs0::open(s).with_context(|| format!("XCI {name} partition")),
++            None => bail!("XCI has no {name} partition (has: {})", self.root.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", ")),
++        }
++    }
++
++    /// The partition holding the game's NCAs.
++    pub fn secure(&self) -> Result<Hfs0> {
++        self.partition("secure")
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::hfs0::tests::build;
++    use crate::storage::Mem;
++
++    fn card(prefix: usize) -> Vec<u8> {
++        let secure = build(&[("abc.nca", b"NCA-DATA"), ("abc.cnmt.nca", b"META")]);
++        let root = build(&[("update", b""), ("normal", b""), ("secure", &secure)]);
++        let mut img = vec![0u8; prefix + 0x400];
++        let h = prefix;
++        img[h + 0x100..h + 0x104].copy_from_slice(b"HEAD");
++        img[h + 0x10D] = 0xE1;
++        img[h + 0x130..h + 0x138].copy_from_slice(&0x400u64.to_le_bytes());
++        img[h + 0x138..h + 0x140].copy_from_slice(&0x200u64.to_le_bytes());
++        img.truncate(h + 0x400);
++        img.extend_from_slice(&root);
++        img
++    }
++
++    #[test]
++    fn opens_plain_and_key_area_dumps() {
++        for prefix in [0, 0x1000] {
++            let x = Xci::open(Arc::new(Mem(card(prefix)))).unwrap();
++            assert_eq!(x.prefix, prefix as u64);
++            assert_eq!(x.card_size_code, 0xE1);
++            let s = x.secure().unwrap();
++            let names: Vec<_> = s.entries.iter().map(|e| e.name.as_str()).collect();
++            assert_eq!(names, ["abc.nca", "abc.cnmt.nca"]);
++            assert_eq!(s.file("abc.nca").unwrap().read_vec(0, 8).unwrap(), b"NCA-DATA");
++            assert!(x.partition("logo").is_err());
++        }
++    }
++
++    #[test]
++    fn rejects_non_xci() {
++        assert!(Xci::open(Arc::new(Mem(vec![0; 0x2000]))).is_err());
++    }
++}
+-- 
+2.56.1
+
