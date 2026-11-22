@@ -1,7 +1,7 @@
 From fa74d636b5fcd3563b5afa10906590dacd313586 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:27:46 +0100
-Subject: [PATCH 12/15] nxhost: report an empty applet channel as am 2 for
+Subject: [PATCH 12/16] nxhost: report an empty applet channel as am 2 for
  non-MK8 games
 
 Splatoon 3's nn::oe::TryPopLaunchParameter accepts only 0x480 (am module

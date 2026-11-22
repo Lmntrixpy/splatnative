@@ -90,5 +90,12 @@ Jeder Lauf ist auf 120–150 s begrenzt; Logs in `work/runN.log`.
 | 7 | Time ok; **`nnMain` läuft**, Metal erkennt Apple M2, GPU-Heap angelegt | `nn::oe::TryPopLaunchParameter`: leerer Kanal als 0x2680 statt 0x480 | Patch: am-Ergebnis 0x480 (nicht-MK8) |
 | 8 | – | `MapSharedMemory` 0xcc01 (zufällig, 3 von 4 Läufen) | Patch: 16-KiB-Host-Seiten → InvalidCurrentMemory, SDK versucht andere Adresse |
 | 9–13 | RomFS-Lesezugriffe, Sprache `de`, Version 11.3.0, Betriebsmodus | Hänger, 100 % CPU: `TryWaitSystemEvent` auf Handle 0, `IApplicationFunctions` 210 ohne Event | Patch: Event für cmd 210; Diagnose per `sample` + `NX_TRACE_SVC` |
-| 14 | nvdrv, vi:m/s/u, acc:u0, hid, `nvnDeviceInitialize` | SIGSEGV (Nullzeiger +0x20) in main+0x452c7b8 unter `nnMain+0x688`, nach hid-Stubs 1004/11 | offen |
+| 14–15 | nvdrv, vi:m/s/u, acc:u0, hid, `nvnDeviceInitialize` | SIGSEGV (Nullzeiger +0x20) in main+0x452c7b8 unter `nnMain+0x688`, nach hid-Stubs 1004/11 | offen, siehe unten |
+
+### Offener Befund (Lauf 15)
+- Gelesen wird der globale Zeiger `main+0x61e2150` (bss) mit Funktionszeigern bei +0x20/+0x30/+0x48.
+- Einziger Schreiber: `main+0x4529ca8` (speichert ein neu allokiertes 0x1e8-Byte-Objekt).
+- `NX_WATCH=main+0x61e2150`: **kein Schreibzugriff vor dem Absturz** → ein Init-Schritt läuft nicht oder zu spät.
+- Absturzpfad: `nnMain+0x688` → main+0x452be0c (`blr [x20->vtable+0x60]`, nachdem ein 0x298-Objekt nach x20+0x38 gelegt wurde) → main+0x452a600 (`+0xc0`) → Leser.
+- Nächster Schritt: Aufrufer des Schreibers dynamisch bestimmen (Watch auf dessen vtable-Slot bzw. Trace der virtuellen Aufrufe) und prüfen, welcher Stub-Rückgabewert (hid 1004/11, acc 160, ISelfController 44, nvdrv 3/8/13) den Init-Pfad abkürzt.
 

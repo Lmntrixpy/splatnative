@@ -1,0 +1,32 @@
+From e532626c10e4c30f1a30ee9c4bda685988b5f616 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:39:34 +0100
+Subject: [PATCH 16/16] nxhost: log NX_WATCH watchpoint hits
+
+The hardware watchpoint behind NX_WATCH disarmed silently on a hit. It now
+prints the faulting pc, lr, address and a guest backtrace, which is what
+the watch is for when tracking down who initializes a global.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/diag.rs | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/crates/nxhost/src/diag.rs b/crates/nxhost/src/diag.rs
+index 8c58034..fa40821 100644
+--- a/crates/nxhost/src/diag.rs
++++ b/crates/nxhost/src/diag.rs
+@@ -62,6 +62,9 @@ extern "C" fn on_signal(sig: i32, info: *mut libc::siginfo_t, uc: *mut libc::c_v
+         let mc = &*(*uc).uc_mcontext;
+         let ss = &mc.__ss;
+         if sig == libc::SIGTRAP && WATCHING.load(std::sync::atomic::Ordering::Relaxed) && (*(ss.__pc as *const u32)) & 0x1F == 31 {
++            // SplatNative: report who touched the watched address (once per thread arm).
++            eprintln!("[watch] hit at pc={} lr={} fault_addr={:#x}", symbolize(ss.__pc), symbolize(ss.__lr), (*info).si_addr as u64);
++            backtrace(ss.__fp);
+             disarm_current();
+             return;
+         }
+-- 
+2.56.1
+
