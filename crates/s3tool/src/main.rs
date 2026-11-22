@@ -46,6 +46,21 @@ enum Cmd {
         #[arg(long)]
         romfs: bool,
     },
+    /// List an NSO's dynamic symbols (defined and imported)
+    Symbols {
+        nso: PathBuf,
+        /// Only symbols whose demangled or mangled name contains this
+        #[arg(long)]
+        grep: Option<String>,
+    },
+    /// List an NSO's relocations, optionally only those whose target (addend) is in [lo, hi)
+    Relocs {
+        nso: PathBuf,
+        #[arg(long, value_parser = parse_hex)]
+        lo: Option<u64>,
+        #[arg(long, value_parser = parse_hex)]
+        hi: Option<u64>,
+    },
     Analyze {
         /// Directory with main, subsdk*, sdk, main.npdm
         exefs: PathBuf,
@@ -145,6 +160,29 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Analyze { exefs, mush8, prelude } => analyze::run(exefs, mush8, prelude)?,
+        Cmd::Relocs { nso, lo, hi } => {
+            let n = nxfs::nso::Nso::parse(&std::fs::read(nso)?)?;
+            let d = nxfs::module::parse(&n.image)?;
+            for r in &d.relocs {
+                let t = r.addend as u64;
+                if lo.is_some_and(|l| t < l) || hi.is_some_and(|h| t >= h) {
+                    continue;
+                }
+                let name = d.symbols.get(r.sym as usize).filter(|_| r.sym != 0).map(|s| nxfs::nso::demangle(&s.name)).unwrap_or_default();
+                println!("{:#010x}  kind {:<4} sym {:<5} -> {t:#x}  {name}", r.offset, r.kind, r.sym);
+            }
+        }
+        Cmd::Symbols { nso, grep } => {
+            let n = nxfs::nso::Nso::parse(&std::fs::read(nso)?)?;
+            for s in n.symbols() {
+                let d = nxfs::nso::demangle(&s.name);
+                if grep.as_ref().is_some_and(|g| !d.contains(g.as_str()) && !s.name.contains(g.as_str())) {
+                    continue;
+                }
+                let kind = if s.defined { format!("{:#010x}", s.value) } else { "    import".into() };
+                println!("{kind}  {d}  [{}]", s.name);
+            }
+        }
     }
     Ok(())
 }
@@ -180,6 +218,10 @@ fn write_file(s: &dyn Storage, offset: u64, size: u64, path: &Path) -> Result<()
         pos += n as u64;
     }
     Ok(())
+}
+
+fn parse_hex(s: &str) -> Result<u64, std::num::ParseIntError> {
+    u64::from_str_radix(s.trim_start_matches("0x"), 16)
 }
 
 fn xml_tag<'a>(x: &'a str, tag: &str) -> Option<&'a str> {

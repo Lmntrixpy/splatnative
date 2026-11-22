@@ -1,0 +1,119 @@
+From a9751be2436a82c210ef978064ee5f0a4141615b Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:23:11 +0100
+Subject: [PATCH 11/15] nxhost: time shared memory (IStaticService 20)
+
+Splatoon 3's nn::time::Initialize maps the time service's shared memory
+(GetSharedMemoryNativeHandle) and aborted on Mush8's stub. The shared
+memory now holds the documented lock-free contexts: steady clock (offset
+0, Mush8's source id), local and network system clock contexts, the user
+clock auto-correction flag and the continuous-adjustment time point.
+The steady clock is derived from the guest tick counter, which is what
+the SDK reads alongside the shared memory, so the IPC answers and the
+mapped contexts agree.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/services/time.rs | 66 ++++++++++++++++++++++++++++--
+ 1 file changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/crates/nxhost/src/services/time.rs b/crates/nxhost/src/services/time.rs
+index 081f823..8f0c7dc 100644
+--- a/crates/nxhost/src/services/time.rs
++++ b/crates/nxhost/src/services/time.rs
+@@ -2,7 +2,7 @@
+ // Constantin Clerc (c22dev) - 0.1
+ use crate::ipc::{Request, Response, Service, Stub, new_event, write_buffer};
+ use std::sync::Arc;
+-use std::time::{Instant, SystemTime, UNIX_EPOCH};
++use std::time::{SystemTime, UNIX_EPOCH};
+ 
+ const SOURCE_ID: [u8; 16] = *b"nxhost-steady-01";
+ 
+@@ -10,9 +10,44 @@ fn now_posix() -> i64 {
+     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+ }
+ 
++/// Steady clock seconds. SplatNative: derived from the guest tick counter, because newer
++/// SDKs read the steady clock from the time shared memory and compute it themselves as
++/// (ticks in ns + internal offset); the IPC answers must agree with that.
+ fn steady_seconds() -> i64 {
+-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+-    START.get_or_init(Instant::now).elapsed().as_secs() as i64
++    (crate::svc::system_tick() / nxabi::GUEST_TICK_HZ) as i64
++}
++
++/// Size of the time service's shared memory (IStaticService 20).
++const SHARED_MEMORY_SIZE: u64 = 0x1000;
++
++/// Time shared memory, as the SDK's nn::time::detail::SharedMemoryClient reads it. Every
++/// field is a lock-free pair { u32 counter; T storage[2] } and readers use storage[counter & 1]:
++///   0x000 SteadyClockContext   { u64 internal_offset_ns; UUID source }        storage at 0x008
++///   0x038 local SystemClockContext   { i64 offset; i64 time_point; UUID }     storage at 0x040
++///   0x080 network SystemClockContext                                         storage at 0x088
++///   0x0C8 bool user clock automatic correction                               storage at 0x0CC
++///   0x0D0 ContinuousAdjustmentTimePoint { i64 rtc_offset; i64 diff_scale; u32 shift; u32 pad;
++///         SystemClockContext }                                               storage at 0x0D8
++fn time_shared_memory() -> &'static std::sync::Arc<crate::kernel::SharedMemory> {
++    static SHM: std::sync::OnceLock<std::sync::Arc<crate::kernel::SharedMemory>> = std::sync::OnceLock::new();
++    SHM.get_or_init(|| {
++        let shm = std::sync::Arc::new(crate::shm::create(SHARED_MEMORY_SIZE).expect("time shared memory"));
++        let mem = unsafe { std::slice::from_raw_parts_mut(shm.host as *mut u8, SHARED_MEMORY_SIZE as usize) };
++        fill_shared_memory(mem);
++        shm
++    })
++}
++
++fn fill_shared_memory(mem: &mut [u8]) {
++    let mut ctx = Vec::new();
++    clock_context(&mut ctx);
++    mem[0x08..0x10].copy_from_slice(&0u64.to_le_bytes());
++    mem[0x10..0x20].copy_from_slice(&SOURCE_ID);
++    mem[0x40..0x60].copy_from_slice(&ctx);
++    mem[0x88..0xA8].copy_from_slice(&ctx);
++    mem[0xCC] = 0;
++    mem[0xD8..0xF0].fill(0);
++    mem[0xF0..0x110].copy_from_slice(&ctx);
+ }
+ 
+ fn time_point(out: &mut Vec<u8>) {
+@@ -36,6 +71,10 @@ impl Service for TimeService {
+             0 | 1 | 4 | 5 => rsp.objects.push(Arc::new(SystemClock)),
+             2 => rsp.objects.push(Arc::new(SteadyClock)),
+             3 => rsp.objects.push(Arc::new(TimeZone)),
++            20 => {
++                let h = crate::kernel::KERNEL.lock().add(crate::kernel::Obj::SharedMemory(time_shared_memory().clone()));
++                rsp.copy_handles.push(h);
++            }
+             30 | 31 => rsp.copy_handles.push(new_event(false)),
+             100 => rsp.data.push(1),
+             200 => rsp.data.push(1),
+@@ -139,3 +178,24 @@ impl Service for TimeZone {
+         0
+     }
+ }
++
++#[cfg(test)]
++mod shared_memory_tests {
++    use super::*;
++
++    #[test]
++    fn contexts_agree_with_the_steady_clock() {
++        let mut mem = vec![0u8; SHARED_MEMORY_SIZE as usize];
++        fill_shared_memory(&mut mem);
++        let i64_at = |o: usize| i64::from_le_bytes(mem[o..o + 8].try_into().unwrap());
++        // counters are 0, so storage[0] is current
++        assert_eq!(u32::from_le_bytes(mem[0..4].try_into().unwrap()), 0);
++        assert_eq!(&mem[0x10..0x20], &SOURCE_ID);
++        // local clock: offset + steady time point = now (same source id as the steady clock)
++        let posix = i64_at(0x40) + i64_at(0x48);
++        assert!((posix - now_posix()).abs() <= 1);
++        assert_eq!(&mem[0x50..0x60], &SOURCE_ID);
++        assert_eq!(&mem[0x88..0xA8], &mem[0x40..0x60]);
++        assert_eq!(&mem[0xF0..0x110], &mem[0x40..0x60]);
++    }
++}
+-- 
+2.56.1
+

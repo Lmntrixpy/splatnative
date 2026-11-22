@@ -1,0 +1,48 @@
+From fa74d636b5fcd3563b5afa10906590dacd313586 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:27:46 +0100
+Subject: [PATCH 12/15] nxhost: report an empty applet channel as am 2 for
+ non-MK8 games
+
+Splatoon 3's nn::oe::TryPopLaunchParameter accepts only 0x480 (am module
+128, description 2) as an empty channel (sdk 0x1eaddc) and aborts on
+Mush8's 0x2680. Non-MK8 games now get 0x480; MK8DX keeps the value it was
+tested with.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/services/am.rs | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/crates/nxhost/src/services/am.rs b/crates/nxhost/src/services/am.rs
+index 5ab5f69..3049bb6 100644
+--- a/crates/nxhost/src/services/am.rs
++++ b/crates/nxhost/src/services/am.rs
+@@ -8,6 +8,14 @@ use std::sync::{Arc, Mutex};
+ 
+ const NO_MESSAGES: u32 = 0x680;
+ const NO_DATA_IN_CHANNEL: u32 = 0x2680;
++
++/// am "no data in channel" (module 128, description 2). SplatNative: Splatoon 3's SDK
++/// (nn::oe::TryPopLaunchParameter -> sdk 0x1eaddc) accepts only 0x480 as an empty
++/// channel and aborts on anything else. MK8DX keeps Mush8's original value, which is
++/// what it was tested with.
++fn no_data_in_channel() -> u32 {
++    if crate::game::is_mk8() { NO_DATA_IN_CHANNEL } else { 0x480 }
++}
+ const NOT_AVAILABLE: u32 = 0x480;
+ const APPLET_ERROR: u32 = 0x0E;
+ const CONTROLLER_SUPPORT_CANCELED: u32 = 2;
+@@ -102,7 +110,7 @@ impl Service for ApplicationFunctions {
+         match req.cmd {
+             1 => {
+                 if req.u32(0) != 2 {
+-                    return NO_DATA_IN_CHANNEL;
++                    return no_data_in_channel();
+                 }
+                 let mut d = vec![0u8; 0x88];
+                 d[0..4].copy_from_slice(&0xC794_97CAu32.to_le_bytes());
+-- 
+2.56.1
+

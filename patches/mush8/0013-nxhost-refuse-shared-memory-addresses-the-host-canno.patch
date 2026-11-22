@@ -1,0 +1,68 @@
+From 16364e670cc6ff69798d49ff6618618be49d9bd2 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:27:46 +0100
+Subject: [PATCH 13/15] nxhost: refuse shared memory addresses the host cannot
+ map
+
+Guest shared memory is mapped with host mmap (16 KiB pages) while the guest
+picks 4 KiB-aligned addresses. Splatoon 3's 0x1000-byte time shared memory
+therefore failed with InvalidAddress three times out of four, and an
+aligned small mapping would also cover the rest of its host page.
+svcMapSharedMemory now returns InvalidCurrentMemory unless the address is
+host-page aligned and the whole host-page range is free guest memory; the
+SDK's SharedMemoryImplByHorizon::Map retries another address on exactly
+that result (up to 64 times).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/svc.rs | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/crates/nxhost/src/svc.rs b/crates/nxhost/src/svc.rs
+index 78a3c9e..1ccfda4 100644
+--- a/crates/nxhost/src/svc.rs
++++ b/crates/nxhost/src/svc.rs
+@@ -3,7 +3,7 @@
+ use crate::guest::{self, Frame};
+ use crate::ipc;
+ use crate::kernel::{self, KERNEL, Obj, rc};
+-use crate::mem::{Block, perm, state};
++use crate::mem::{self, Block, perm, state};
+ use std::sync::atomic::Ordering::Relaxed;
+ 
+ pub const PROGRAM_ID: u64 = 0x0100_1520_0002_2000;
+@@ -324,9 +324,30 @@ fn unmap_memory(dst: u64, src: u64, size: u64) -> u32 {
+     rc::OK
+ }
+ 
++/// Horizon's "invalid current memory": the requested region is not usable.
++const INVALID_CURRENT_MEMORY: u32 = 0xD401;
++
++/// SplatNative: guest shared memory is mapped with host mmap, whose pages are 16 KiB, while
++/// the guest picks 4 KiB-aligned addresses. A small mapping (Splatoon 3's time shared memory
++/// is 0x1000) at an unaligned address cannot be made, and even an aligned one covers the
++/// rest of its host page. The SDK (nn::os SharedMemoryImplByHorizon::Map) retries another
++/// address up to 64 times on InvalidCurrentMemory, so that is returned unless the address is
++/// host-page aligned and the whole host-page range is free guest memory.
++fn shared_memory_fits(addr: u64, size: u64) -> bool {
++    if addr % mem::PAGE != 0 || size == 0 {
++        return false;
++    }
++    let end = (addr + size).next_multiple_of(mem::PAGE);
++    let (start, len, b) = kernel::aspace().map.lock().unwrap().query(addr);
++    b.state == state::FREE && start <= addr && start + len >= end
++}
++
+ fn map_shared_memory(h: u32, addr: u64, size: u64) -> u32 {
+     let obj = KERNEL.lock().get(h);
+     let Some(Obj::SharedMemory(sm)) = obj else { return rc::INVALID_HANDLE };
++    if !shared_memory_fits(addr, size) {
++        return INVALID_CURRENT_MEMORY;
++    }
+     let r = unsafe {
+         libc::mmap(addr as *mut _, size as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_FIXED, sm.fd, 0)
+     };
+-- 
+2.56.1
+

@@ -26,8 +26,10 @@ Status: ✅ erledigt · ⏳ in Arbeit · ⛔ blockiert · ☐ offen
 5. ☐ Speicherlayout für Splatoon (NPDM-Heap, Applet-Ressourcen)
 6. ☐ ldrh-Jump-Tables: Basis weiter zurückverfolgen → Trampoline von 25 MiB verkleinern
 
-## Phase 5 – Start auf macOS bis Nintendo-Logo/Hauptmenü
-1. ☐ `nxhost` mit Splatoon auf macOS starten, `[hle] UNIMPL`/Stub-Log auswerten
+## Phase 5 – Start auf macOS bis Nintendo-Logo/Hauptmenü ⏳
+1. ⏳ `nxhost` mit Splatoon auf macOS starten, Stub-Log auswerten – SDK-Init komplett, `nnMain` läuft,
+   Metal-GPU initialisiert, Display/Account/HID-Dienste werden geöffnet
+   (Verlauf: `docs/SPLATOON3_PROFILE.md`, Boot-Protokoll; Mush8-Patches 0006–0015)
 2. ☐ Fehlende Dienste minimal und korrekt implementieren (pro Dienst Test in `services/`)
 3. ☐ Fehlende NVN-Procs, Shader-Opcodes ergänzen; erste Frames
 4. ☐ Pipeline-Liste für Splatoon aufzeichnen (`work/pipelines.tsv`) → AOT

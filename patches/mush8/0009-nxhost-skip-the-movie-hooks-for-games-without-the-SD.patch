@@ -1,0 +1,36 @@
+From fbb7eb0427bfc702521fbe668000d51e081b284a Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:19:35 +0100
+Subject: [PATCH 09/15] nxhost: skip the movie hooks for games without the SDK
+ movie library
+
+movie::init panicked when movie::MediaData was not linked. Splatoon 3 does
+not link the SDK movie library, so the decoder/extractor overrides are
+never used there; init now logs that and returns.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/movie.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/crates/nxhost/src/movie.rs b/crates/nxhost/src/movie.rs
+index 419ffd8..0eef845 100644
+--- a/crates/nxhost/src/movie.rs
++++ b/crates/nxhost/src/movie.rs
+@@ -30,6 +30,12 @@ struct Guest {
+ static GUEST: OnceLock<Guest> = OnceLock::new();
+ 
+ pub fn init(mods: &[crate::loader::Module]) {
++    // SplatNative: the movie overrides only run for games that link the SDK movie library
++    // (MK8DX does, Splatoon 3 does not). Without it there is nothing to hook up.
++    if crate::loader::symbol(mods, "_ZN5movie9MediaData9SetStringEPKcS2_").is_none() {
++        eprintln!("[movie] this game does not link the SDK movie library");
++        return;
++    }
+     let s = |n: &str| crate::loader::symbol(mods, n).unwrap_or_else(|| panic!("movie: guest symbol {n} not found"));
+     let _ = GUEST.set(Guest {
+         set_string: s("_ZN5movie9MediaData9SetStringEPKcS2_"),
+-- 
+2.56.1
+

@@ -1,0 +1,114 @@
+From 6062c4a051c4ee1e1af5ade6ab15582a3862712a Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:17:29 +0100
+Subject: [PATCH 07/15] nxhost: enter the five-argument nn::init::Start of
+ newer SDKs
+
+Splatoon 3's sdk exports nn::init::Start(u64, u64, void(*)(), void(*)(),
+void(*)()) instead of MK8DX's four-argument form. Its disassembly calls the
+third and fourth arguments where the old form calls init_done and
+init_modules, and the fifth only after the game's main returns (fini).
+Guest entry now loads x4 too; the host passes a no-op fini callback.
+MK8DX's four-argument entry is found and called as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/guest.rs  |  4 +++-
+ crates/nxhost/src/kernel.rs |  2 +-
+ crates/nxhost/src/main.rs   | 16 ++++++++++++++--
+ crates/nxhost/src/svc.rs    |  2 +-
+ 4 files changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/crates/nxhost/src/guest.rs b/crates/nxhost/src/guest.rs
+index fb3fbe4..71aadb8 100644
+--- a/crates/nxhost/src/guest.rs
++++ b/crates/nxhost/src/guest.rs
+@@ -82,7 +82,8 @@ const _: () = assert!(std::mem::size_of::<Frame>() == 0x320);
+ pub struct Entry {
+     pub pc: u64,
+     pub sp: u64,
+-    pub x: [u64; 4],
++    /// x0..x4 at entry. x4 is the fini callback of newer SDKs' nn::init::Start.
++    pub x: [u64; 5],
+ }
+ 
+ #[allow(improper_ctypes)]
+@@ -111,6 +112,7 @@ global_asm!(
+     "ldp x9, x10, [x0]",
+     "mov sp, x10",
+     "ldp x2, x3, [x0, #0x20]",
++    "ldr x4, [x0, #0x30]",
+     "ldp x0, x1, [x0, #0x10]",
+     "adr x30, 1f",
+     "br x9",
+diff --git a/crates/nxhost/src/kernel.rs b/crates/nxhost/src/kernel.rs
+index 4d8d5ef..1d568c8 100644
+--- a/crates/nxhost/src/kernel.rs
++++ b/crates/nxhost/src/kernel.rs
+@@ -479,7 +479,7 @@ pub fn thread(h: u32) -> Option<Arc<Thread>> {
+     }
+ }
+ 
+-pub fn start_thread(t: Arc<Thread>, args: [u64; 4]) -> std::io::Result<std::thread::JoinHandle<()>> {
++pub fn start_thread(t: Arc<Thread>, args: [u64; 5]) -> std::io::Result<std::thread::JoinHandle<()>> {
+     t.started.store(true, Relaxed);
+     {
+         let mut g = KERNEL.lock();
+diff --git a/crates/nxhost/src/main.rs b/crates/nxhost/src/main.rs
+index dd84587..5010fc2 100644
+--- a/crates/nxhost/src/main.rs
++++ b/crates/nxhost/src/main.rs
+@@ -36,6 +36,15 @@ static INITS: OnceLock<Vec<u64>> = OnceLock::new();
+ 
+ extern "C" fn init_done() {}
+ 
++/// Passed as the fifth argument of the newer nn::init::Start (Splatoon 3's SDK), which
++/// calls it after nnMain returns; the host exits when the main thread returns anyway.
++extern "C" fn fini_done() {}
++
++/// nn::init::Start as exported by the SDK: (handle, main base, init_done, init_modules)
++/// in MK8DX's SDK, plus a trailing fini callback in newer ones.
++const INIT_START_4: &str = "_ZN2nn4init5StartEmmPFvvES2_";
++const INIT_START_5: &str = "_ZN2nn4init5StartEmmPFvvES2_S2_";
++
+ extern "C" fn init_modules() {
+     for &f in INITS.get().unwrap() {
+         let f: extern "C" fn() = unsafe { std::mem::transmute(f as usize) };
+@@ -390,7 +399,7 @@ fn start(args: Args) -> Result<()> {
+     );
+     diag::start_watch(&mods.iter().map(|m| (m.name.clone(), m.base)).collect::<Vec<_>>());
+     let _ = INITS.set(mods.iter().filter_map(|m| m.dynamic.init.map(|i| m.base + i)).collect());
+-    let start = loader::symbol(&mods, "_ZN2nn4init5StartEmmPFvvES2_").context("nn::init::Start not found")?;
++    let start = loader::symbol(&mods, INIT_START_4).or_else(|| loader::symbol(&mods, INIT_START_5)).context("nn::init::Start not found")?;
+     let sdk = mods.iter().find(|m| m.name == "sdk").context("no sdk module")?;
+     nvn::init(sdk.base, &sdk.module_id)?;
+     if std::env::var_os("NX_PREWARM").is_some() {
+@@ -409,7 +418,10 @@ fn start(args: Args) -> Result<()> {
+     services::nexweb::start();
+     eprintln!("[host] main thread {h:#x}: prio {} core {} stack {stack_size:#x}; entering nn::init::Start", npdm.priority, npdm.core);
+     let main_base = mods[0].base;
+-    let j = kernel::start_thread(t, [h as u64, main_base, init_done as *const () as usize as u64, init_modules as *const () as usize as u64])?;
++    let j = kernel::start_thread(
++        t,
++        [h as u64, main_base, init_done as *const () as usize as u64, init_modules as *const () as usize as u64, fini_done as *const () as usize as u64],
++    )?;
+     std::thread::spawn(move || {
+         j.join().ok();
+         eprintln!("[host] main thread returned");
+diff --git a/crates/nxhost/src/svc.rs b/crates/nxhost/src/svc.rs
+index da073c0..78a3c9e 100644
+--- a/crates/nxhost/src/svc.rs
++++ b/crates/nxhost/src/svc.rs
+@@ -95,7 +95,7 @@ fn dispatch_inner(f: &mut Frame) {
+         },
+         0x09 => match kernel::thread(x[0] as u32) {
+             Some(t) => {
+-                let args = [t.arg, t.handle as u64, 0, 0];
++                let args = [t.arg, t.handle as u64, 0, 0, 0];
+                 match kernel::start_thread(t, args) {
+                     Ok(_) => rc::OK,
+                     Err(_) => 0xD201,
+-- 
+2.56.1
+

@@ -74,3 +74,21 @@ Dump stimmen mit den Katalog-Guards überein:
 | s3peername | 0x14dc80 | `F403002A` mov w20,w0 | `F4031F2A` mov w20,wzr |
 
 Beide wenden sich mit `nxpatch rewrite --patch` sauber an.
+
+## Boot-Protokoll auf macOS (M2), `nxhost` mit SplatNative-Patch-Serie
+
+Jeder Lauf ist auf 120–150 s begrenzt; Logs in `work/runN.log`.
+
+| Lauf | Erreicht | Abbruch | Lösung |
+|---|---|---|---|
+| 1 | Spiel erkannt, RomFS 10,06 GB direkt aus XCI+NSP, Adressraum | ungenutzter MK8-Movie-Override → Abbruch | Patch: nur `nvnBootstrapLoader` ist Pflicht |
+| 2 | Module geladen + relocated (528k RELR) | `nn::init::Start` (4 Argumente) fehlt | Patch: 5-Argument-`nn::init::Start` (Fini-Callback in x4) |
+| 3 | Einstiegspunkt gefunden | `nvn::init`: unbekannter sdk-Build | Patch: NVN-Treibertabellen für Splatoon-sdk (534 Procs, Format-Stride 0x30) |
+| 4 | NVN-Treibertabellen geladen | `movie::init`-Panic (Bibliothek fehlt) | Patch: Movie-Hooks überspringen |
+| 5 | **Gastcode läuft**: `nn::init::Start` → `nninitInitializeSdkModule` → `nn::lm::Initialize` | `sm:` Nachrichtentyp 16/17 (TIPC) | Patch: TIPC in `ipc.rs` |
+| 6 | sm: vergibt lm, apm, appletOE, aoc, ectx, pctl, time | `nn::time::Initialize`: `time:u` 20 (Shared Memory) nur Stub | Patch: Time-Shared-Memory |
+| 7 | Time ok; **`nnMain` läuft**, Metal erkennt Apple M2, GPU-Heap angelegt | `nn::oe::TryPopLaunchParameter`: leerer Kanal als 0x2680 statt 0x480 | Patch: am-Ergebnis 0x480 (nicht-MK8) |
+| 8 | – | `MapSharedMemory` 0xcc01 (zufällig, 3 von 4 Läufen) | Patch: 16-KiB-Host-Seiten → InvalidCurrentMemory, SDK versucht andere Adresse |
+| 9–13 | RomFS-Lesezugriffe, Sprache `de`, Version 11.3.0, Betriebsmodus | Hänger, 100 % CPU: `TryWaitSystemEvent` auf Handle 0, `IApplicationFunctions` 210 ohne Event | Patch: Event für cmd 210; Diagnose per `sample` + `NX_TRACE_SVC` |
+| 14 | nvdrv, vi:m/s/u, acc:u0, hid, `nvnDeviceInitialize` | SIGSEGV (Nullzeiger +0x20) in main+0x452c7b8 unter `nnMain+0x688`, nach hid-Stubs 1004/11 | offen |
+

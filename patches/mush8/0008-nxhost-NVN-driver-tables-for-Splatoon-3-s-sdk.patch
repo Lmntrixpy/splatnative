@@ -1,0 +1,101 @@
+From cf0f48ab1f540e74689dc9b4f32f8f59a59f974c Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:18:10 +0100
+Subject: [PATCH 08/15] nxhost: NVN driver tables for Splatoon 3's sdk
+
+nvn::init only knew MK8DX's sdk build. Splatoon 3 11.3.0's driver has 534
+procs and a 0x30-byte format-info entry (MK8DX: 477 and 0x34), so the
+stride is now part of DriverTables. Every offset of the new row was found
+in and checked against the binary (see the comment on the row): the
+driver's own binary-searching proc lookup, the relocated proc table, the
+stateless DeviceGetInteger constant helper with MK8DX's contract, and the
+GOT slot of the format table used by the texture layout code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/nvn/mod.rs | 47 +++++++++++++++++++++++++++---------
+ 1 file changed, 36 insertions(+), 11 deletions(-)
+
+diff --git a/crates/nxhost/src/nvn/mod.rs b/crates/nxhost/src/nvn/mod.rs
+index 0f8e08b..e748419 100644
+--- a/crates/nxhost/src/nvn/mod.rs
++++ b/crates/nxhost/src/nvn/mod.rs
+@@ -21,22 +21,46 @@ struct DriverTables {
+     count: usize,
+     property_helper: u64,
+     format_table_got: u64,
++    /// Size of one format-info entry (block width at +8, height at +9, bytes per block at +0x10).
++    format_stride: u64,
+ }
+ 
+-const DRIVERS: &[DriverTables] = &[DriverTables {
+-    module_id: "ba520906609c503227871a314a94fb5f6ccbe444",
+-    name_offsets: 0x81b5d0,
+-    names: 0x818360,
+-    procs: 0x9a1368,
+-    count: 477,
+-    property_helper: 0x2d3a68,
+-    format_table_got: 0x99b7f8,
+-}];
++const DRIVERS: &[DriverTables] = &[
++    DriverTables {
++        module_id: "ba520906609c503227871a314a94fb5f6ccbe444",
++        name_offsets: 0x81b5d0,
++        names: 0x818360,
++        procs: 0x9a1368,
++        count: 477,
++        property_helper: 0x2d3a68,
++        format_table_got: 0x99b7f8,
++        format_stride: 0x34,
++    },
++    // SplatNative: Splatoon 3 11.3.0 sdk. Found and checked against the binary:
++    // - the driver's proc lookup (0x4c6490) binary-searches 534 names (hi = 0x215) via
++    //   u32 offsets at 0x99f404 into the name blob at 0x99ba9d (names sorted, no "nvn" prefix);
++    // - its caller (0x4f6ce0) returns procs[i] from 0xb83608: 534 RELATIVE relocations into text;
++    // - nvnDeviceGetInteger (procs[DeviceGetInteger] = 0x4c3cf0) calls 0x4c7400, which first calls
++    //   the stateless constant helper 0x4b7160(prop, *out) -> 1, the same contract as MK8DX's;
++    // - the texture layout code (0x4d20e8) loads the format table from the GOT slot 0xb6c258
++    //   (RELATIVE -> 0xb817d8) and indexes it by format with stride 0x30, reading +8, +9, +0x10.
++    DriverTables {
++        module_id: "574284b40c06cf1821a44857939083bee5716820",
++        name_offsets: 0x99f404,
++        names: 0x99ba9d,
++        procs: 0xb83608,
++        count: 534,
++        property_helper: 0x4b7160,
++        format_table_got: 0xb6c258,
++        format_stride: 0x30,
++    },
++];
+ 
+ struct Driver {
+     procs: HashMap<String, u64>,
+     property_helper: u64,
+     format_table: u64,
++    format_stride: u64,
+ }
+ 
+ static DRIVER: OnceLock<Driver> = OnceLock::new();
+@@ -52,7 +76,7 @@ pub fn init(sdk_base: u64, module_id: &[u8]) -> anyhow::Result<()> {
+         procs.insert(format!("nvn{name}"), addr);
+     }
+     let format_table = unsafe { *((sdk_base + t.format_table_got) as *const u64) };
+-    let _ = DRIVER.set(Driver { procs, property_helper: sdk_base + t.property_helper, format_table });
++    let _ = DRIVER.set(Driver { procs, property_helper: sdk_base + t.property_helper, format_table, format_stride: t.format_stride });
+     Ok(())
+ }
+ 
+@@ -97,7 +121,8 @@ pub(crate) fn gfx_integer_block_format(format: u32) -> bool {
+ }
+ 
+ fn format_info(format: u32) -> (u32, u32, u32) {
+-    let e = DRIVER.get().unwrap().format_table + 0x34 * format as u64;
++    let d = DRIVER.get().unwrap();
++    let e = d.format_table + d.format_stride * format as u64;
+     let b = |o: u64| unsafe { *((e + o) as *const u8) } as u32;
+     (b(8).max(1), b(9).max(1), b(0x10).max(1))
+ }
+-- 
+2.56.1
+

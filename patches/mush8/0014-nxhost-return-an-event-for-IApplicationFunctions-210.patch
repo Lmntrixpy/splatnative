@@ -1,0 +1,36 @@
+From 1380b78b4889efa980cd80b8527972bec202bed4 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:36:09 +0100
+Subject: [PATCH 14/15] nxhost: return an event for IApplicationFunctions 210
+
+Splatoon 3's nn::oe::GetOperationMode initialization (sdk 0x408a7c) gets an
+event from IApplicationFunctions 210, attaches it to a system event and
+polls it with TryWaitSystemEvent. Mush8's stub returned no handle, and
+TryWait retries forever on InvalidHandle (sdk 0x148e64): nnMain spun at
+100% CPU. The command now returns an unsignaled event.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/services/am.rs | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/crates/nxhost/src/services/am.rs b/crates/nxhost/src/services/am.rs
+index 3049bb6..56c6ab0 100644
+--- a/crates/nxhost/src/services/am.rs
++++ b/crates/nxhost/src/services/am.rs
+@@ -131,6 +131,11 @@ impl Service for ApplicationFunctions {
+             50 => rsp.data.extend_from_slice(&pseudo_device_id()),
+             123 => rsp.push_u32(u32::MAX),
+             130 | 140 | 150 | 160 => rsp.copy_handles.push(new_event(false)),
++            // SplatNative: Splatoon 3's nn::oe::GetOperationMode initialization (sdk 0x408a7c)
++            // gets an event here and attaches it with AttachReadableHandleToSystemEvent, then
++            // polls it with TryWaitSystemEvent. Without a handle that poll retries forever on
++            // InvalidHandle. The event is never signaled: nothing changes behind the game's back.
++            210 => rsp.copy_handles.push(new_event(false)),
+             _ => return Stub(self.name()).call(req, rsp),
+         }
+         0
+-- 
+2.56.1
+

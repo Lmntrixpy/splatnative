@@ -1,0 +1,37 @@
+From 5e22db4f75f2c1ebc5c59b4cb195b58534043618 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:36:09 +0100
+Subject: [PATCH 15/15] nxhost: log failing WaitSynchronization calls under
+ NX_TRACE_SVC
+
+Each distinct (handles, result) pair other than OK/timeout is logged once.
+This found the handle-0 wait behind the GetOperationMode hang.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/svc.rs | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/crates/nxhost/src/svc.rs b/crates/nxhost/src/svc.rs
+index 1ccfda4..7ef7ff6 100644
+--- a/crates/nxhost/src/svc.rs
++++ b/crates/nxhost/src/svc.rs
+@@ -177,6 +177,14 @@ fn dispatch_inner(f: &mut Frame) {
+         0x18 => {
+             let handles = unsafe { std::slice::from_raw_parts(x[1] as *const u32, x[2] as usize) }.to_vec();
+             let (r, idx) = kernel::wait_synchronization(&handles, x[3] as i64);
++            if trace() && r != rc::OK && r != rc::TIMED_OUT {
++                static LOGGED: std::sync::Mutex<Vec<(Vec<u32>, u32)>> = std::sync::Mutex::new(Vec::new());
++                let mut l = LOGGED.lock().unwrap();
++                if !l.iter().any(|(h, rr)| *h == handles && *rr == r) {
++                    l.push((handles.clone(), r));
++                    eprintln!("[svc] WaitSynchronization {handles:x?} timeout {} -> {r:#x}", x[3] as i64);
++                }
++            }
+             f.x[1] = idx as u64;
+             r
+         }
+-- 
+2.56.1
+

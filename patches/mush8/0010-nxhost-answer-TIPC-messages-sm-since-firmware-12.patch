@@ -1,0 +1,118 @@
+From 23d87fe00654bfac17ef9906484cc72bec92562d Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:21:34 +0100
+Subject: [PATCH 10/15] nxhost: answer TIPC messages (sm: since firmware 12)
+
+Splatoon 3's SDK talks to sm: over TIPC: message type 16 + command id, raw
+data right after the HIPC header (no SFCI, no 16-byte alignment), and a
+reply whose raw data starts with the result. Mush8 only handled CMIF and
+rejected types 16/17, so nn::lm::Initialize aborted. TIPC messages now go
+to the session's service with the same Request/Response, returned objects
+become move handles. Unit test covers the request/reply layout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/ipc.rs | 75 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 75 insertions(+)
+
+diff --git a/crates/nxhost/src/ipc.rs b/crates/nxhost/src/ipc.rs
+index 4d73a04..d4d944b 100644
+--- a/crates/nxhost/src/ipc.rs
++++ b/crates/nxhost/src/ipc.rs
+@@ -363,6 +363,26 @@ pub fn handle(session: &Arc<Session>, handle: u32, buf: &mut [u8]) -> bool {
+                 eprintln!("[ipc] {} ({handle:#x}) control {} -> {result:#x}", session.name(), req.cmd);
+             }
+         }
++        16.. => {
++            // SplatNative: TIPC, used by sm: since firmware 12 (Splatoon 3's SDK). The command id
++            // is the message type minus 16, the raw data follows the header directly (no SFCI,
++            // no 16-byte padding), and the reply's raw data starts with the result.
++            req.cmd = kind - 16;
++            if !session.domain.lock().unwrap().is_none() {
++                eprintln!("[ipc] {}: TIPC message on a domain session", session.name());
++            }
++            let start = i * 4;
++            req.data = buf[start.min(raw_end)..raw_end.max(start)].to_vec();
++            result = session.root.call(&req, &mut rsp);
++            if trace() {
++                eprintln!("[ipc] {} ({handle:#x}) tipc {} in {:02x?} -> {result:#x} out {:02x?}", session.name(), req.cmd, &req.data[..req.data.len().min(16)], &rsp.data[..rsp.data.len().min(16)]);
++            }
++            for o in std::mem::take(&mut rsp.objects) {
++                rsp.move_handles.push(new_session_handle(o));
++            }
++            write_tipc_reply(buf, kind, result, &rsp);
++            return true;
++        }
+         _ => {
+             eprintln!("[ipc] {}: unsupported message type {kind}", session.name());
+             result = rc::UNKNOWN_COMMAND;
+@@ -415,6 +435,29 @@ fn control(session: &Arc<Session>, req: &Request, rsp: &mut Response) -> u32 {
+     }
+ }
+ 
++/// TIPC reply: HIPC header (+ special header with handles), then raw data = result, output.
++fn write_tipc_reply(buf: &mut [u8], kind: u32, result: u32, rsp: &Response) {
++    let mut data = rsp.data.clone();
++    while data.len() % 4 != 0 {
++        data.push(0);
++    }
++    let raw = 1 + data.len() / 4;
++    let has_hd = !rsp.copy_handles.is_empty() || !rsp.move_handles.is_empty();
++    let mut words: Vec<u32> = vec![kind, raw as u32 | if has_hd { 1 << 31 } else { 0 }];
++    if has_hd {
++        words.push(((rsp.copy_handles.len() as u32) << 1) | ((rsp.move_handles.len() as u32) << 5));
++        words.extend(&rsp.copy_handles);
++        words.extend(&rsp.move_handles);
++    }
++    words.push(result);
++    words.extend(data.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())));
++    for (i, w) in words.iter().enumerate() {
++        if i * 4 + 4 <= buf.len() {
++            buf[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
++        }
++    }
++}
++
+ fn write_reply(buf: &mut [u8], result: u32, rsp: &Response, domain_out: Option<u32>, out_objects: &[u32]) {
+     let mut words: Vec<u32> = Vec::new();
+     let has_hd = !rsp.copy_handles.is_empty() || !rsp.move_handles.is_empty();
+@@ -448,3 +491,35 @@ fn write_reply(buf: &mut [u8], result: u32, rsp: &Response, domain_out: Option<u
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tipc_tests {
++    use super::*;
++
++    struct Echo;
++    impl Service for Echo {
++        fn name(&self) -> String {
++            "echo".into()
++        }
++        fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
++            rsp.data.extend_from_slice(&(req.cmd as u64 * 0x100 + req.u64(0)).to_le_bytes());
++            0x1234
++        }
++    }
++
++    #[test]
++    fn tipc_request_and_reply_layout() {
++        // libnx tipcMakeRequest: type = 16 + cmd, raw data right after the 2-word header.
++        let mut buf = vec![0u8; 0x100];
++        let w = |b: &mut [u8], i: usize, v: u32| b[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
++        w(&mut buf, 0, 16 + 1);
++        w(&mut buf, 1, 2);
++        w(&mut buf, 2, 7);
++        w(&mut buf, 3, 0);
++        let session = Session::new(Arc::new(Echo));
++        assert!(handle(&session, 0, &mut buf));
++        assert_eq!(rd(&buf, 1), 3); // result + one u64
++        assert_eq!(rd(&buf, 2), 0x1234);
++        assert_eq!(rd(&buf, 3) as u64 | (rd(&buf, 4) as u64) << 32, 0x107);
++    }
++}
+-- 
+2.56.1
+

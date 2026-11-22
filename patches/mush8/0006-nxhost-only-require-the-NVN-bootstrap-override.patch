@@ -1,0 +1,39 @@
+From 333fbe4d3ae095efa9d4dbc6ad466029917e8b93 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 00:17:29 +0100
+Subject: [PATCH 06/15] nxhost: only require the NVN bootstrap override
+
+The loader failed when any host override was not imported. Overrides are
+per library (NVN, nn::diag abort variants, the SDK movie library) and
+Splatoon 3 imports neither movie::Decoder/Extractor nor VAbortImpl.
+nvnBootstrapLoader stays required; unused overrides are logged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/loader.rs | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/crates/nxhost/src/loader.rs b/crates/nxhost/src/loader.rs
+index c3e61e3..d1b7ec9 100644
+--- a/crates/nxhost/src/loader.rs
++++ b/crates/nxhost/src/loader.rs
+@@ -185,8 +185,14 @@ pub fn load(dir: &Path, names: &[&str], hle: &HashMap<&str, u64>) -> Result<Vec<
+             unsafe { p.write_unaligned(v) };
+         }
+     }
++    // SplatNative: overrides are per library (NVN, nn::diag, the SDK movie library), and not
++    // every game links every library. Only the NVN bootstrap is required; without it the
++    // game would talk to a GPU that is not there.
++    ensure!(used_hle.contains("nvnBootstrapLoader"), "no module imports nvnBootstrapLoader: this is not an NVN game");
+     for name in hle.keys() {
+-        ensure!(used_hle.contains(*name), "host override {name} is referenced by no module");
++        if !used_hle.contains(*name) {
++            eprintln!("[hle] override {} is not used by this game", nxfs::nso::demangle(name));
++        }
+     }
+ 
+     eprintln!("[loader] {} imports resolved to logging stubs", UNIMPL.lock().unwrap().len());
+-- 
+2.56.1
+
