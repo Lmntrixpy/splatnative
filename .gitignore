@@ -1,0 +1,6 @@
+/target/
+/rom/
+/work/
+/research/
+*.keys
+.DS_Store

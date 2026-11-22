@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+exclude = ["third_party", "research"]
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+nxfs = { path = "third_party/mush8/crates/nxfs" }
+nxabi = { path = "third_party/mush8/crates/nxabi" }
+
+[profile.release]
+debug = 1

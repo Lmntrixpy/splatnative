@@ -1,0 +1,13 @@
+[package]
+name = "s3tool"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "SplatNative host tool: inspect/extract Splatoon 3 dumps and measure what the runtime must provide"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+hex.workspace = true
+nxfs.workspace = true
+s3fs = { path = "../s3fs" }
