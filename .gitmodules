@@ -1,0 +1,6 @@
+[submodule "third_party/mush8"]
+	path = third_party/mush8
+	url = https://github.com/c22dev/mush8
+[submodule "third_party/Prelude-Nextendo"]
+	path = third_party/Prelude-Nextendo
+	url = https://git.nextendo.network/NextendoNetwork/Prelude-Nextendo
