@@ -1,0 +1,77 @@
+From f07fd2207dedea45d33bb445730bf5178f450845 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 05:36:00 +0100
+Subject: [PATCH 20/22] nxhost audio: effect StatusData<1> from renderer REV9
+
+The Splatoon 3 sdk reads effect output as StatusData<1> (0x90 bytes per
+effect, EffectManager::UpdateEffectOutStatus 0x2225f0) from REV9
+(SupportTags::EffectInfoVer2). With 0x10-byte entries the section size
+check failed and RequestUpdateAudioRenderer aborted with 0x5299.
+Input sections whose size does not match the parser's strides are reported
+once (REV15 voices are 0x188 bytes, not 0x170: still open).
+---
+ crates/nxhost/src/audio/mod.rs | 26 ++++++++++++++++++++++++--
+ 1 file changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/crates/nxhost/src/audio/mod.rs b/crates/nxhost/src/audio/mod.rs
+index 21bf16a..58578d3 100644
+--- a/crates/nxhost/src/audio/mod.rs
++++ b/crates/nxhost/src/audio/mod.rs
+@@ -58,6 +58,11 @@ const IN_SINK: usize = 0x140;
+ const OUT_POOL: usize = 0x10;
+ const OUT_VOICE: usize = 0x10;
+ const OUT_EFFECT: usize = 0x10;
++/// From REV9 (SupportTags::EffectInfoVer2 in sdk 574284b4) the client reads each effect's status
++/// as StatusData<1>: the state byte, then a 0x80-byte result state at +0x10 (0x90 per effect,
++/// EffectManager::UpdateEffectOutStatus 0x2225f0). The result state stays zero here.
++const OUT_EFFECT_V2: usize = 0x90;
++const REV_EFFECT_INFO_V2: u32 = 9;
+ const OUT_SINK: usize = 0x20;
+ const OUT_PERFORMANCE: usize = 0x10;
+ const OUT_BEHAVIOR: usize = 0xB0;
+@@ -319,6 +324,20 @@ impl Renderer {
+         }
+     }
+ 
++    /// Once per renderer: report input sections whose size is not count * the stride this parser
++    /// assumes (a revision whose layout it does not know). `count == 0` only checks divisibility.
++    fn check_strides(&self, sections: &[(usize, usize, usize, &str)]) {
++        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++        if REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
++            return;
++        }
++        for &(size, count, stride, name) in sections {
++            if (count != 0 && size != count * stride) || size % stride != 0 {
++                eprintln!("[audio] REV{}: {name} section is {size:#x} bytes for {count}, expected stride {stride:#x}", self.rev);
++            }
++        }
++    }
++
+     fn mapped(&self, addr: u64, size: u64) -> bool {
+         mapped(&self.pools, self.force_map, addr, size)
+     }
+@@ -348,6 +367,9 @@ impl Renderer {
+         let mixes_in = section(mixes_size);
+         let sinks_in = section(sinks_size);
+ 
++        let out_effect = if self.rev >= REV_EFFECT_INFO_V2 { OUT_EFFECT_V2 } else { OUT_EFFECT };
++        self.check_strides(&[(voices_size, self.voices.len(), IN_VOICE, "voice"), (effects_size, self.effects.len(), IN_EFFECT, "effect"),
++            (pools_size, 0, IN_POOL, "pool"), (sinks_size, self.sinks.len(), IN_SINK, "sink")]);
+         let mut o = Vec::with_capacity(out.len());
+         o.resize(IN_HEADER, 0);
+         fn put(o: &mut [u8], i: usize, v: usize) {
+@@ -412,9 +434,9 @@ impl Renderer {
+             let disabled = if active { e.usage == Usage::Disabled } else { e.usage != Usage::New };
+             let state: u8 = if disabled { 4 } else { 3 };
+             o.push(state);
+-            o.resize(o.len() + OUT_EFFECT - 1, 0);
++            o.resize(o.len() + out_effect - 1, 0);
+         }
+-        put(&mut o, 5, self.effects.len() * OUT_EFFECT);
++        put(&mut o, 5, self.effects.len() * out_effect);
+ 
+         let (mixes_in, dirty_only) = if self.rev >= 7 { (mixes_in.get(0x20..).unwrap_or(&[]), true) } else { (mixes_in, false) };
+         for (i, p) in mixes_in.chunks_exact(IN_MIX).enumerate() {
+-- 
+2.56.1
+

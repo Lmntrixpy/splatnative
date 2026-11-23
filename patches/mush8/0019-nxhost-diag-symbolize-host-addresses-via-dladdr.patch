@@ -1,0 +1,46 @@
+From 72d2ddd1e286cbe9523e14ec648b453c51cce081 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 05:36:00 +0100
+Subject: [PATCH 19/22] nxhost diag: symbolize host addresses via dladdr
+
+Crashes inside nxhost itself printed bare addresses; now the image, its
+base (for atos) and the nearest symbol are shown.
+---
+ crates/nxhost/src/diag.rs | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/crates/nxhost/src/diag.rs b/crates/nxhost/src/diag.rs
+index fa40821..3b55567 100644
+--- a/crates/nxhost/src/diag.rs
++++ b/crates/nxhost/src/diag.rs
+@@ -22,7 +22,26 @@ pub fn symbolize(addr: u64) -> String {
+             }
+         }
+     }
+-    format!("{addr:#x}")
++    host_symbol(addr).unwrap_or_else(|| format!("{addr:#x}"))
++}
++
++/// Host (Rust) code: the image and nearest symbol dyld knows, so a crash in nxhost itself can
++/// be resolved (`atos -o <image> -l <base> <addr>` with the printed base if there is no name).
++fn host_symbol(addr: u64) -> Option<String> {
++    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
++    if unsafe { libc::dladdr(addr as *const libc::c_void, &mut info) } == 0 || info.dli_fbase.is_null() {
++        return None;
++    }
++    let image = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
++    let image = image.rsplit('/').next().unwrap_or_default().to_string();
++    let base = info.dli_fbase as u64;
++    let sym = if info.dli_sname.is_null() {
++        String::new()
++    } else {
++        let n = unsafe { std::ffi::CStr::from_ptr(info.dli_sname) }.to_string_lossy();
++        format!(" {n}+{:#x}", addr - info.dli_saddr as u64)
++    };
++    Some(format!("{addr:#x} [{image} base {base:#x}]{sym}"))
+ }
+ 
+ pub fn backtrace(fp: u64) {
+-- 
+2.56.1
+

@@ -1,0 +1,43 @@
+From 8a5b93c83c5df25730bf5ffc905d13c139a47128 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 05:36:00 +0100
+Subject: [PATCH 18/22] nxhost am: ISelfController 44
+ CreateManagedDisplaySeparableLayer
+
+Returns (layer id 1, recording layer id 2). The Splatoon 3 sdk's
+nn::vi::CreateLayer (0x453870) takes the layer id from this call and fails
+on 0 without opening the layer, after which GetNativeWindow crashed.
+---
+ crates/nxhost/src/services/am.rs | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/crates/nxhost/src/services/am.rs b/crates/nxhost/src/services/am.rs
+index 56c6ab0..6ad0b75 100644
+--- a/crates/nxhost/src/services/am.rs
++++ b/crates/nxhost/src/services/am.rs
+@@ -43,11 +43,22 @@ static PROXY: &[(u32, Act)] = &[
+ static SELF_CONTROLLER: &[(u32, Act)] = &[
+     (9, Act::Event(true)),
+     (40, Act::U64(1)),
++    // CreateManagedDisplaySeparableLayer: (layer id, recording layer id). The SDK's
++    // nn::vi::CreateLayer (sdk 574284b4 0x453870) rejects layer id 0 before it opens the layer.
++    (44, Act::Data(&SEPARABLE_LAYERS)),
+     (69, Act::U32(0)),
+     (90, Act::U64(0)),
+     (91, Act::Event(false)),
+ ];
+ 
++/// The layer id is vi.rs's LAYER_ID (the one OpenLayer hands out a window for).
++static SEPARABLE_LAYERS: [u8; 16] = {
++    let mut b = [0u8; 16];
++    b[0] = 1;
++    b[8] = 2;
++    b
++};
++
+ const ONE_F32: [u8; 4] = 1.0f32.to_le_bytes();
+ static AUDIO: &[(u32, Act)] = &[(1, Act::Data(&ONE_F32)), (2, Act::Data(&ONE_F32))];
+ 
+-- 
+2.56.1
+

@@ -1,0 +1,697 @@
+From f216cb0170ed8b997ee10497b77ea3acc06ec714 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 05:36:00 +0100
+Subject: [PATCH 17/22] nxhost nvn: support the Splatoon 3 NVN driver
+
+The Splatoon 3 11.3.0 sdk (574284b4) ships a newer NVN driver than MK8DX:
+
+- nvnDeviceGetInteger API_MAJOR/MINOR_VERSION: the driver reports 55/15
+  (0x4c7400, switch table 0x99ba3a). The game requires major == 55 and
+  minor >= 15 before it creates its graphics system; with MK8's 53/105 it
+  skipped that and later dereferenced a null global. Now per driver table.
+- Builders and texture views have a different layout (texture builder
+  format at 0x38 instead of 0x30, sampler filters/wrap/compare packed into
+  0x2c..0x2f, views as a flag word). New abi.rs reads such a driver's
+  structs through its own leaf getter procs (each checked to be a
+  self-contained leaf by a control-flow walk before being called from the
+  host) and converts them to the MK8DX layout the rest of nxhost uses.
+  MK8DX keeps the raw reads (StructAbi::Native).
+- The driver's MemoryPool object differs (cpu 0x30, gpu 0x18, size 0x38),
+  so for getter drivers Map/GetBufferAddress/GetFlags/GetSize are answered
+  from the host pool table instead of passed through.
+- nvnProgramSetShadersExt: 0x18-byte entries whose first 16 bytes are the
+  NVNshaderData SetShaders takes (driver 0x4cbd60 splits them the same way).
+- nvnTexture{GetFlags,GetSamples,GetStride,GetDepthStencilMode,
+  GetMemoryPool,GetMemoryOffset,GetSwizzle} and nvnSamplerGet* were stubs
+  returning 0; they now answer from the stored canonical builder.
+- Host stubs also return their value in d0 (caller-saved), so float
+  getters (LodBias, MaxAnisotropy) work.
+---
+ crates/nxhost/src/nvn/abi.rs     | 330 +++++++++++++++++++++++++++++++
+ crates/nxhost/src/nvn/mod.rs     |  33 +++-
+ crates/nxhost/src/nvn/objects.rs | 113 +++++++++--
+ crates/nxhost/src/stubs.rs       |   3 +
+ 4 files changed, 451 insertions(+), 28 deletions(-)
+ create mode 100644 crates/nxhost/src/nvn/abi.rs
+
+diff --git a/crates/nxhost/src/nvn/abi.rs b/crates/nxhost/src/nvn/abi.rs
+new file mode 100644
+index 0000000..b5e0302
+--- /dev/null
++++ b/crates/nxhost/src/nvn/abi.rs
+@@ -0,0 +1,330 @@
++// SplatNative: driver-independent access to NVN builder and view structs.
++//
++// Mush8's NVN host code reads builders (TextureBuilder, SamplerBuilder, MemoryPoolBuilder,
++// BufferBuilder, WindowBuilder) and TextureViews as raw bytes in the layout of the MK8DX driver
++// (sdk ba520906): flags at 0x18, format at 0x30, sampler filters as plain u32 fields, ...
++// The rest of the host code (objects.rs, draw/*) keeps working on that "canonical" layout.
++//
++// Newer drivers lay these structs out differently. The Splatoon 3 11.3.0 driver (sdk 574284b4)
++// moves the texture builder fields (flags 0x20, format 0x38, stride 0x58, packaged layout 0x54),
++// packs sampler filters/wrap/compare into bitfields at 0x2c..0x2f and keeps texture views as a
++// flag word plus fields. Such a driver is read through its own public getter procs
++// (nvnTextureBuilderGetFormat, nvnSamplerBuilderGetWrapMode, ...), which are small leaf
++// functions in the guest sdk; each is checked to be a leaf before it is called from the host.
++// The getters' results are written into the canonical layout.
++//
++// `Native` keeps Mush8's original raw reads, so the MK8DX path is unchanged.
++
++use std::collections::HashMap;
++use std::sync::OnceLock;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum StructAbi {
++    /// The driver's structs are the canonical (MK8DX) layout: read raw.
++    Native,
++    /// Read every field through the driver's getter procs.
++    Getters,
++}
++
++macro_rules! getters {
++    ($($field:ident : $name:literal => fn($($arg:ty),*) $(-> $ret:ty)?;)*) => {
++        #[allow(dead_code)]
++        struct Getters {
++            $($field: extern "C" fn($($arg),*) $(-> $ret)?,)*
++        }
++
++        fn resolve(procs: &HashMap<String, u64>) -> anyhow::Result<Getters> {
++            Ok(Getters {
++                $($field: {
++                    let a = *procs.get($name).ok_or_else(|| anyhow::anyhow!("driver has no {}", $name))?;
++                    check_leaf($name, a)?;
++                    unsafe { std::mem::transmute::<usize, extern "C" fn($($arg),*) $(-> $ret)?>(a as usize) }
++                },)*
++            })
++        }
++    };
++}
++
++type P = *mut i32;
++type F = *mut f32;
++
++getters! {
++    tb_pool: "nvnTextureBuilderGetMemoryPool" => fn(u64) -> u64;
++    tb_offset: "nvnTextureBuilderGetMemoryOffset" => fn(u64) -> u64;
++    tb_flags: "nvnTextureBuilderGetFlags" => fn(u64) -> u32;
++    tb_target: "nvnTextureBuilderGetTarget" => fn(u64) -> u32;
++    tb_width: "nvnTextureBuilderGetWidth" => fn(u64) -> u32;
++    tb_height: "nvnTextureBuilderGetHeight" => fn(u64) -> u32;
++    tb_depth: "nvnTextureBuilderGetDepth" => fn(u64) -> u32;
++    tb_levels: "nvnTextureBuilderGetLevels" => fn(u64) -> u32;
++    tb_format: "nvnTextureBuilderGetFormat" => fn(u64) -> u32;
++    tb_samples: "nvnTextureBuilderGetSamples" => fn(u64) -> u32;
++    tb_swizzle: "nvnTextureBuilderGetSwizzle" => fn(u64, P, P, P, P);
++    tb_depth_stencil: "nvnTextureBuilderGetDepthStencilMode" => fn(u64) -> u32;
++    tb_packaged: "nvnTextureBuilderGetPackagedTextureLayout" => fn(u64, *mut u32) -> u32;
++    tb_stride: "nvnTextureBuilderGetStride" => fn(u64) -> u32;
++
++    sb_min_mag: "nvnSamplerBuilderGetMinMagFilter" => fn(u64, P, P);
++    sb_wrap: "nvnSamplerBuilderGetWrapMode" => fn(u64, P, P, P);
++    sb_lod_clamp: "nvnSamplerBuilderGetLodClamp" => fn(u64, F, F);
++    sb_lod_bias: "nvnSamplerBuilderGetLodBias" => fn(u64) -> f32;
++    sb_compare: "nvnSamplerBuilderGetCompare" => fn(u64, P, P);
++    sb_border: "nvnSamplerBuilderGetBorderColor" => fn(u64, F);
++    sb_aniso: "nvnSamplerBuilderGetMaxAnisotropy" => fn(u64) -> f32;
++    sb_reduction: "nvnSamplerBuilderGetReductionFilter" => fn(u64) -> u32;
++
++    mp_memory: "nvnMemoryPoolBuilderGetMemory" => fn(u64) -> u64;
++    mp_size: "nvnMemoryPoolBuilderGetSize" => fn(u64) -> u64;
++    mp_flags: "nvnMemoryPoolBuilderGetFlags" => fn(u64) -> u32;
++
++    bb_pool: "nvnBufferBuilderGetMemoryPool" => fn(u64) -> u64;
++    bb_offset: "nvnBufferBuilderGetMemoryOffset" => fn(u64) -> u64;
++    bb_size: "nvnBufferBuilderGetSize" => fn(u64) -> u64;
++
++    wb_num_textures: "nvnWindowBuilderGetNumTextures" => fn(u64) -> u32;
++    wb_texture: "nvnWindowBuilderGetTexture" => fn(u64, i32) -> u64;
++
++    tv_levels: "nvnTextureViewGetLevels" => fn(u64, P, P) -> u32;
++    tv_layers: "nvnTextureViewGetLayers" => fn(u64, P, P) -> u32;
++    tv_format: "nvnTextureViewGetFormat" => fn(u64, P) -> u32;
++    tv_swizzle: "nvnTextureViewGetSwizzle" => fn(u64, P, P, P, P) -> u32;
++    tv_target: "nvnTextureViewGetTarget" => fn(u64, P) -> u32;
++}
++
++static GETTERS: OnceLock<Getters> = OnceLock::new();
++
++pub(crate) fn init(abi: StructAbi, procs: &HashMap<String, u64>) -> anyhow::Result<()> {
++    if abi == StructAbi::Getters {
++        let _ = GETTERS.set(resolve(procs)?);
++    }
++    Ok(())
++}
++
++/// True when the driver's structs are read through getters (layout differs from MK8DX's).
++pub(crate) fn uses_getters() -> bool {
++    GETTERS.get().is_some()
++}
++
++/// A getter may only be called from the host if it is a self-contained leaf: every instruction
++/// reachable from its entry (following fall-through and conditional branches) must be an
++/// ordinary instruction or a plain `ret`; no calls, no unconditional branches (nxpatch reaches
++/// its trampolines through those), no system instructions, all within 64 instructions.
++fn check_leaf(name: &str, addr: u64) -> anyhow::Result<()> {
++    let words = unsafe { std::slice::from_raw_parts(addr as *const u32, LEAF_WINDOW) };
++    leaf_words(words).map_err(|i| anyhow::anyhow!("{name} at {addr:#x}: instruction {i} is not leaf-safe"))
++}
++
++const LEAF_WINDOW: usize = 64;
++const RET: u32 = 0xd65f_03c0;
++
++/// Ok if every reachable instruction is leaf-safe; Err(index) of the first one that is not
++/// (or that runs off the window).
++fn leaf_words(words: &[u32]) -> Result<(), usize> {
++    let mut seen = vec![false; words.len()];
++    let mut todo = vec![0i64];
++    while let Some(i) = todo.pop() {
++        let Some(&w) = usize::try_from(i).ok().and_then(|u| words.get(u)) else { return Err(i.max(0) as usize) };
++        if std::mem::replace(&mut seen[i as usize], true) {
++            continue;
++        }
++        let cond = if w & 0xff00_0010 == 0x5400_0000 || w & 0x7e00_0000 == 0x3400_0000 {
++            Some(sext((w >> 5) & 0x7ffff, 19)) // b.cond, cbz/cbnz
++        } else if w & 0x7e00_0000 == 0x3600_0000 {
++            Some(sext((w >> 5) & 0x3fff, 14)) // tbz/tbnz
++        } else {
++            None
++        };
++        if w == RET {
++            continue;
++        }
++        let unsafe_op = w & 0x7c00_0000 == 0x1400_0000 // b / bl
++            || w & 0xfe00_0000 == 0xd600_0000 // br / blr / ret xN / eret
++            || w & 0xffc0_0000 == 0xd500_0000 // system instructions (mrs/msr/barriers/hints)
++            || w & 0xff00_0000 == 0xd400_0000; // svc / hvc / smc / brk
++        if unsafe_op && w != 0xd503_201f {
++            return Err(i as usize);
++        }
++        if let Some(off) = cond {
++            todo.push(i + off);
++        }
++        todo.push(i + 1);
++    }
++    Ok(())
++}
++
++fn sext(v: u32, bits: u32) -> i64 {
++    ((v as i64) << (64 - bits)) >> (64 - bits)
++}
++
++fn g() -> Option<&'static Getters> {
++    GETTERS.get()
++}
++
++fn raw<const N: usize>(addr: u64) -> [u8; N] {
++    let mut b = [0u8; N];
++    unsafe { std::ptr::copy_nonoverlapping(addr as *const u8, b.as_mut_ptr(), N) };
++    b
++}
++
++fn rd<T: Copy>(addr: u64) -> T {
++    unsafe { (addr as *const T).read_unaligned() }
++}
++
++fn put<T: Copy, const N: usize>(b: &mut [u8; N], off: usize, v: T) {
++    unsafe { (b.as_mut_ptr().add(off) as *mut T).write_unaligned(v) };
++}
++
++/// Canonical texture builder: pool 0x08, offset 0x10, flags 0x18, target 0x1c, width 0x20,
++/// height 0x24, depth 0x28, levels 0x2c, format 0x30, samples 0x34, swizzle 0x38..0x48,
++/// depth-stencil mode 0x48, packaged layout 0x58 (bit 0 set, layout << 4), stride 0x5c.
++pub(crate) fn texture_builder(guest: u64) -> [u8; 0x68] {
++    let Some(g) = g() else { return raw(guest) };
++    let mut b = [0u8; 0x68];
++    put(&mut b, 0x08, (g.tb_pool)(guest));
++    put(&mut b, 0x10, (g.tb_offset)(guest));
++    let fields = [g.tb_flags, g.tb_target, g.tb_width, g.tb_height, g.tb_depth, g.tb_levels, g.tb_format, g.tb_samples];
++    for (i, f) in fields.iter().enumerate() {
++        put(&mut b, 0x18 + 4 * i, f(guest));
++    }
++    let mut s = [0i32; 4];
++    (g.tb_swizzle)(guest, &mut s[0], &mut s[1], &mut s[2], &mut s[3]);
++    for (i, v) in s.iter().enumerate() {
++        put(&mut b, 0x38 + 4 * i, *v);
++    }
++    put(&mut b, 0x48, (g.tb_depth_stencil)(guest));
++    let mut layout = 0u32;
++    if (g.tb_packaged)(guest, &mut layout) & 0xff != 0 {
++        put(&mut b, 0x58, (1 | layout << 4) as u16);
++    }
++    put(&mut b, 0x5c, (g.tb_stride)(guest));
++    b
++}
++
++/// Canonical sampler builder: min 0x08, mag 0x0c, wrap s/t/r 0x10..0x1c, lod clamp 0x1c/0x20,
++/// lod bias 0x24, compare mode 0x28, compare func 0x2c, border color 0x30..0x40, anisotropy 0x40.
++/// Drivers read through getters also get the reduction filter at 0x44 (SAMPLER_REDUCTION).
++pub(crate) fn sampler_builder(guest: u64) -> [u8; 0x60] {
++    let Some(g) = g() else { return raw(guest) };
++    let mut b = [0u8; 0x60];
++    let mut v = [0i32; 3];
++    (g.sb_min_mag)(guest, &mut v[0], &mut v[1]);
++    put(&mut b, 0x08, v[0]);
++    put(&mut b, 0x0c, v[1]);
++    (g.sb_wrap)(guest, &mut v[0], &mut v[1], &mut v[2]);
++    for (i, w) in v.iter().enumerate() {
++        put(&mut b, 0x10 + 4 * i, *w);
++    }
++    let mut f = [0f32; 4];
++    (g.sb_lod_clamp)(guest, &mut f[0], &mut f[1]);
++    put(&mut b, 0x1c, f[0]);
++    put(&mut b, 0x20, f[1]);
++    put(&mut b, 0x24, (g.sb_lod_bias)(guest));
++    (g.sb_compare)(guest, &mut v[0], &mut v[1]);
++    put(&mut b, 0x28, v[0]);
++    put(&mut b, 0x2c, v[1]);
++    (g.sb_border)(guest, f.as_mut_ptr());
++    for (i, c) in f.iter().enumerate() {
++        put(&mut b, 0x30 + 4 * i, *c);
++    }
++    put(&mut b, 0x40, (g.sb_aniso)(guest));
++    put(&mut b, SAMPLER_REDUCTION, (g.sb_reduction)(guest));
++    b
++}
++
++pub(crate) const SAMPLER_REDUCTION: usize = 0x44;
++
++/// (CPU memory, size, flags) of a memory pool builder.
++pub(crate) fn memory_pool_builder(guest: u64) -> (u64, u64, u32) {
++    match g() {
++        Some(g) => ((g.mp_memory)(guest), (g.mp_size)(guest), (g.mp_flags)(guest)),
++        None => (rd(guest + 8), rd(guest + 0x10), rd(guest + 0x18)),
++    }
++}
++
++/// (pool, offset, size) of a buffer builder.
++pub(crate) fn buffer_builder(guest: u64) -> (u64, u64, u64) {
++    match g() {
++        Some(g) => ((g.bb_pool)(guest), (g.bb_offset)(guest), (g.bb_size)(guest)),
++        None => (rd(guest + 8), rd(guest + 0x10), rd(guest + 0x18)),
++    }
++}
++
++/// The textures a window builder was given.
++pub(crate) fn window_textures(guest: u64) -> Vec<u64> {
++    match g() {
++        Some(g) => (0..(g.wb_num_textures)(guest) as i32).map(|i| (g.wb_texture)(guest, i)).collect(),
++        None => {
++            let (count, list): (u32, u64) = (rd(guest + 8), rd(guest + 0x10));
++            (0..count as u64).map(|i| rd::<u64>(list + 8 * i)).collect()
++        }
++    }
++}
++
++pub(crate) const VIEW_LEVELS: u8 = 1;
++pub(crate) const VIEW_LAYERS: u8 = 2;
++pub(crate) const VIEW_FORMAT: u8 = 4;
++pub(crate) const VIEW_SWIZZLE: u8 = 8;
++pub(crate) const VIEW_TARGET: u8 = 0x20;
++
++/// Canonical texture view: set-flags 0x00, base level 0x01, base layer 0x04 (u16), format 0x08,
++/// swizzle 0x0c..0x1c, target 0x20.
++pub(crate) fn texture_view(guest: u64) -> [u8; 0x24] {
++    let Some(g) = g() else { return raw(guest) };
++    let mut b = [0u8; 0x24];
++    let mut flags = 0u8;
++    let mut v = [0i32; 4];
++    if (g.tv_levels)(guest, &mut v[0], &mut v[1]) & 1 != 0 {
++        flags |= VIEW_LEVELS;
++        b[1] = v[0] as u8;
++    }
++    if (g.tv_layers)(guest, &mut v[0], &mut v[1]) & 1 != 0 {
++        flags |= VIEW_LAYERS;
++        put(&mut b, 4, v[0] as u16);
++    }
++    if (g.tv_format)(guest, &mut v[0]) & 1 != 0 {
++        flags |= VIEW_FORMAT;
++        put(&mut b, 8, v[0]);
++    }
++    if (g.tv_swizzle)(guest, &mut v[0], &mut v[1], &mut v[2], &mut v[3]) & 1 != 0 {
++        flags |= VIEW_SWIZZLE;
++        for (i, s) in v.iter().enumerate() {
++            put(&mut b, 0xc + 4 * i, *s);
++        }
++    }
++    if (g.tv_target)(guest, &mut v[0]) & 1 != 0 {
++        flags |= VIEW_TARGET;
++        put(&mut b, 0x20, v[0]);
++    }
++    b[0] = flags;
++    b
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn leaf_check_accepts_getters_and_rejects_calls() {
++        // nvnTextureBuilderGetStride (sdk 574284b4 0x4d18d0): ldr w0, [x0, #0x58]; ret
++        assert_eq!(leaf_words(&[0xb9405800, 0xd65f03c0]), Ok(()));
++        // nvnTextureBuilderGetPackagedTextureLayout's shape: b.eq to a second tail past the
++        // first ret (str wzr; ldrh; tst; b.eq +2; ret; and; and; ret)
++        assert_eq!(leaf_words(&[0xb900003f, 0x7940a808, 0x72000d1f, 0x54000040, 0xd65f03c0, 0x12001d08, 0x12000d00, 0xd65f03c0]), Ok(()));
++        // a branch out of the window, falling off the window, bl, blr x8, svc, unconditional b
++        assert_eq!(leaf_words(&[0x54000200, 0xd65f03c0]), Err(16));
++        assert_eq!(leaf_words(&[0xb9405800]), Err(1));
++        assert_eq!(leaf_words(&[0x94000010, 0xd65f03c0]), Err(0));
++        assert_eq!(leaf_words(&[0xd63f0100, 0xd65f03c0]), Err(0));
++        assert_eq!(leaf_words(&[0xd4000001, 0xd65f03c0]), Err(0));
++        assert_eq!(leaf_words(&[0x14000001, 0xd65f03c0]), Err(0));
++        // mrs x0, tpidrro_el0 (rewritten by nxpatch, never leaf-safe)
++        assert_eq!(leaf_words(&[0xd53bd060, 0xd65f03c0]), Err(0));
++    }
++
++    #[test]
++    fn sext_signs() {
++        assert_eq!(sext(0x7ffff, 19), -1);
++        assert_eq!(sext(2, 19), 2);
++        assert_eq!(sext(0x2000, 14), -0x2000);
++    }
++}
+diff --git a/crates/nxhost/src/nvn/mod.rs b/crates/nxhost/src/nvn/mod.rs
+index e748419..b8c7cd9 100644
+--- a/crates/nxhost/src/nvn/mod.rs
++++ b/crates/nxhost/src/nvn/mod.rs
+@@ -1,5 +1,6 @@
+ // Mush8 - mod.rs
+ // Constantin Clerc (c22dev) - 0.1
++mod abi;
+ mod cmd;
+ mod draw;
+ mod fx;
+@@ -23,6 +24,11 @@ struct DriverTables {
+     format_table_got: u64,
+     /// Size of one format-info entry (block width at +8, height at +9, bytes per block at +0x10).
+     format_stride: u64,
++    /// nvnDeviceGetInteger API_MAJOR_VERSION (0) / API_MINOR_VERSION (1) this driver reports;
++    /// games check them against the headers they were built with.
++    api_version: (i32, i32),
++    /// How the host reads builders and texture views (see abi.rs).
++    abi: abi::StructAbi,
+ }
+ 
+ const DRIVERS: &[DriverTables] = &[
+@@ -35,6 +41,8 @@ const DRIVERS: &[DriverTables] = &[
+         property_helper: 0x2d3a68,
+         format_table_got: 0x99b7f8,
+         format_stride: 0x34,
++        api_version: (53, 105),
++        abi: abi::StructAbi::Native,
+     },
+     // SplatNative: Splatoon 3 11.3.0 sdk. Found and checked against the binary:
+     // - the driver's proc lookup (0x4c6490) binary-searches 534 names (hi = 0x215) via
+@@ -43,7 +51,11 @@ const DRIVERS: &[DriverTables] = &[
+     // - nvnDeviceGetInteger (procs[DeviceGetInteger] = 0x4c3cf0) calls 0x4c7400, which first calls
+     //   the stateless constant helper 0x4b7160(prop, *out) -> 1, the same contract as MK8DX's;
+     // - the texture layout code (0x4d20e8) loads the format table from the GOT slot 0xb6c258
+-    //   (RELATIVE -> 0xb817d8) and indexes it by format with stride 0x30, reading +8, +9, +0x10.
++    //   (RELATIVE -> 0xb817d8) and indexes it by format with stride 0x30, reading +8, +9, +0x10;
++    // - 0x4c7400's switch (table 0x99ba3a) returns 0x37 for property 0 and 0xf for property 1.
++    //   The game requires major == 55 and minor >= 15 before it creates its graphics system;
++    // - builders and texture views have a different layout from MK8DX's (texture builder format
++    //   at 0x38, sampler filters packed at 0x2c..0x2f, views as a flag word): read via getters.
+     DriverTables {
+         module_id: "574284b40c06cf1821a44857939083bee5716820",
+         name_offsets: 0x99f404,
+@@ -53,6 +65,8 @@ const DRIVERS: &[DriverTables] = &[
+         property_helper: 0x4b7160,
+         format_table_got: 0xb6c258,
+         format_stride: 0x30,
++        api_version: (55, 15),
++        abi: abi::StructAbi::Getters,
+     },
+ ];
+ 
+@@ -61,6 +75,7 @@ struct Driver {
+     property_helper: u64,
+     format_table: u64,
+     format_stride: u64,
++    api_version: (i32, i32),
+ }
+ 
+ static DRIVER: OnceLock<Driver> = OnceLock::new();
+@@ -76,7 +91,8 @@ pub fn init(sdk_base: u64, module_id: &[u8]) -> anyhow::Result<()> {
+         procs.insert(format!("nvn{name}"), addr);
+     }
+     let format_table = unsafe { *((sdk_base + t.format_table_got) as *const u64) };
+-    let _ = DRIVER.set(Driver { procs, property_helper: sdk_base + t.property_helper, format_table, format_stride: t.format_stride });
++    abi::init(t.abi, &procs)?;
++    let _ = DRIVER.set(Driver { procs, property_helper: sdk_base + t.property_helper, format_table, format_stride: t.format_stride, api_version: t.api_version });
+     Ok(())
+ }
+ 
+@@ -91,7 +107,7 @@ fn is_driver_passthrough(name: &str) -> bool {
+     ];
+     let Some(rest) = name.strip_prefix("nvn") else { return false };
+     STATES.iter().any(|s| rest.starts_with(s))
+-        || matches!(rest, "MemoryPoolMap" | "MemoryPoolGetBufferAddress" | "MemoryPoolGetFlags" | "MemoryPoolGetSize")
++        || (!abi::uses_getters() && matches!(rest, "MemoryPoolMap" | "MemoryPoolGetBufferAddress" | "MemoryPoolGetFlags" | "MemoryPoolGetSize"))
+         || rest.starts_with("TextureView")
+         || (rest.contains("Builder") && (rest.contains("BuilderSet") || rest.contains("BuilderGet")))
+ }
+@@ -105,11 +121,12 @@ fn host_impl(name: &str) -> Option<HostFn> {
+     Some(match name {
+         "nvnDeviceInitialize" => |_| 1,
+         "nvnDeviceGetInteger" => device_get_integer,
+-        "nvnTextureBuilderGetStorageSize" => |a| texture_builder_storage(a.0[0]).0,
+-        "nvnTextureBuilderGetStorageAlignment" => |a| texture_builder_storage(a.0[0]).1,
++        // The game's builder is converted to the canonical layout first (abi.rs).
++        "nvnTextureBuilderGetStorageSize" => |a| texture_builder_storage(abi::texture_builder(a.0[0]).as_ptr() as u64).0,
++        "nvnTextureBuilderGetStorageAlignment" => |a| texture_builder_storage(abi::texture_builder(a.0[0]).as_ptr() as u64).1,
+         "nvnTextureBuilderGetZCullStorageSize" => |_| 0,
+         "nvnTextureBuilderGetStorageClass" => |a| {
+-            let b = TextureBuilder::read(a.0[0]);
++            let b = TextureBuilder::read(abi::texture_builder(a.0[0]).as_ptr() as u64);
+             if b.target == TARGET_BUFFER || b.flags & (FLAG_LINEAR | FLAG_LINEAR_RENDER_TARGET) != 0 { 0 } else { 0xFE }
+         },
+         _ => return None,
+@@ -225,8 +242,8 @@ pub(crate) fn texture_builder_storage(builder: u64) -> (u64, u64) {
+ fn device_get_integer(a: &Args) -> u64 {
+     let (prop, out) = (a.0[1] as i32, a.0[2] as *mut i32);
+     let v = match prop {
+-        0 => 53,
+-        1 => 105,
++        0 => DRIVER.get().unwrap().api_version.0,
++        1 => DRIVER.get().unwrap().api_version.1,
+         40..=42 | 46 | 47 | 50 | 66..=69 | 71..=76 | 87 | 97 => 1,
+         48 => 14,
+         49 => 5,
+diff --git a/crates/nxhost/src/nvn/objects.rs b/crates/nxhost/src/nvn/objects.rs
+index 15c489a..8a5e562 100644
+--- a/crates/nxhost/src/nvn/objects.rs
++++ b/crates/nxhost/src/nvn/objects.rs
+@@ -30,7 +30,7 @@ pub struct Texture {
+ }
+ 
+ impl Texture {
+-    fn u32(&self, off: usize) -> u32 {
++    pub(crate) fn u32(&self, off: usize) -> u32 {
+         u32::from_le_bytes(self.builder[off..off + 4].try_into().unwrap())
+     }
+     pub fn target(&self) -> u32 {
+@@ -90,6 +90,8 @@ pub fn apply_view(b: &mut [u8; 0x68], view: u64, keep_target: bool) {
+     if view == 0 {
+         return;
+     }
++    let canonical = super::abi::texture_view(view);
++    let view = canonical.as_ptr() as u64;
+     let flags = rd::<u8>(view);
+     if flags & 4 != 0 {
+         let from = u32::from_le_bytes(b[0x30..0x34].try_into().unwrap());
+@@ -194,13 +196,44 @@ impl State {
+ 
+ pub type HostFn = fn(&Args) -> u64;
+ 
++fn put32(addr: u64, v: u32) {
++    if addr != 0 {
++        unsafe { (addr as *mut u32).write_unaligned(v) };
++    }
++}
++
++fn u32_le(b: &[u8], o: usize) -> u32 {
++    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
++}
++
++/// Writes the sampler's canonical u32 fields at `offsets` to the out pointers in x1, x2, ...
++fn sampler_out(a: &Args, offsets: &[usize]) -> u64 {
++    if let Some(b) = sampler(a.0[0]) {
++        for (i, &o) in offsets.iter().enumerate() {
++            put32(a.0[1 + i], u32_le(&b, o));
++        }
++    }
++    0
++}
++
++fn set_shaders(a: &Args, stride: u64) -> u64 {
++    let entry = |i: u64| a.0[2] + stride * i;
++    let stages: Vec<(u64, u64)> = (0..a.0[1]).map(|i| (rd::<u64>(entry(i)), rd::<u64>(entry(i) + 8))).collect();
++    if std::env::var_os("NX_DUMP_SHADERS").is_some() {
++        dump_shaders(a.0[0], &stages);
++    }
++    state().programs.insert(a.0[0], stages);
++    1
++}
++
+ pub fn host_impl(name: &str) -> Option<HostFn> {
+     Some(match name {
+         "nvnMemoryPoolInitialize" => |a| {
+             let b = a.0[1];
+             static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+             let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+-            let p = MemoryPool { cpu: rd(b + 8), size: rd(b + 0x10), flags: rd(b + 0x18), generation };
++            let (cpu, size, flags) = super::abi::memory_pool_builder(b);
++            let p = MemoryPool { cpu, size, flags, generation };
+             init_pool_struct(a.0[0], &p);
+             crate::gfx::heap_touch(p.cpu, p.size);
+             state().pools.insert(a.0[0], p);
+@@ -213,6 +246,16 @@ pub fn host_impl(name: &str) -> Option<HostFn> {
+             }
+             0
+         },
++        // Drivers read through getters (abi.rs) have their own pool object layout, which
++        // init_pool_struct does not fill in; answer from the host pool table instead. As in the
++        // MK8DX path, the GPU address of pool memory is its CPU address. Map follows the driver
++        // (sdk 574284b4 0x4c9570): no pointer for CPU_NO_ACCESS (flag bit 0) pools.
++        "nvnMemoryPoolMap" if super::abi::uses_getters() => {
++            |a| state().pools.get(&a.0[0]).map_or(0, |p| if p.flags & 1 != 0 { 0 } else { p.cpu })
++        }
++        "nvnMemoryPoolGetBufferAddress" if super::abi::uses_getters() => |a| state().pools.get(&a.0[0]).map_or(0, |p| p.cpu),
++        "nvnMemoryPoolGetFlags" if super::abi::uses_getters() => |a| state().pools.get(&a.0[0]).map_or(0, |p| p.flags as u64),
++        "nvnMemoryPoolGetSize" if super::abi::uses_getters() => |a| state().pools.get(&a.0[0]).map_or(0, |p| p.size),
+         "nvnMemoryPoolFlushMappedRange" | "nvnMemoryPoolInvalidateMappedRange" | "nvnMemoryPoolSetDebugLabel" => |_| 0,
+         "nvnMemoryPoolMapVirtual" => |a| {
+             let mut s = state();
+@@ -230,7 +273,8 @@ pub fn host_impl(name: &str) -> Option<HostFn> {
+ 
+         "nvnBufferInitialize" => |a| {
+             let b = a.0[1];
+-            let buf = Buffer { pool: rd(b + 8), offset: rd(b + 0x10), size: rd(b + 0x18) };
++            let (pool, offset, size) = super::abi::buffer_builder(b);
++            let buf = Buffer { pool, offset, size };
+             unsafe {
+                 let o = a.0[0] as *mut u64;
+                 o.write_unaligned(BUFFER_MAGIC);
+@@ -264,8 +308,7 @@ pub fn host_impl(name: &str) -> Option<HostFn> {
+         "nvnBufferFlushMappedRange" | "nvnBufferInvalidateMappedRange" | "nvnBufferSetDebugLabel" => |_| 0,
+ 
+         "nvnTextureInitialize" => |a| {
+-            let mut builder = [0u8; 0x68];
+-            unsafe { std::ptr::copy_nonoverlapping(a.0[1] as *const u8, builder.as_mut_ptr(), 0x68) };
++            let builder = super::abi::texture_builder(a.0[1]);
+             unsafe {
+                 (a.0[0] as *mut u64).write_unaligned(TEXTURE_MAGIC);
+                 std::ptr::copy_nonoverlapping(builder.as_ptr(), (a.0[0] + 8) as *mut u8, 0x68);
+@@ -279,6 +322,42 @@ pub fn host_impl(name: &str) -> Option<HostFn> {
+         "nvnTextureGetTarget" => |a| texture(a.0[0]).map_or(0, |t| t.target() as u64),
+         "nvnTextureGetFormat" => |a| texture(a.0[0]).map_or(0, |t| t.format() as u64),
+         "nvnTextureGetLevels" => |a| texture(a.0[0]).map_or(0, |t| t.levels() as u64),
++        // SplatNative: the remaining getters, answered from the canonical builder the object
++        // keeps (abi.rs layout). Swizzle/pool/offset/flags are what the game set on its builder.
++        "nvnTextureGetFlags" => |a| texture(a.0[0]).map_or(0, |t| t.u32(0x18) as u64),
++        "nvnTextureGetSamples" => |a| texture(a.0[0]).map_or(0, |t| t.u32(0x34) as u64),
++        "nvnTextureGetStride" => |a| texture(a.0[0]).map_or(0, |t| t.u32(0x5c) as u64),
++        "nvnTextureGetDepthStencilMode" => |a| texture(a.0[0]).map_or(0, |t| t.u32(0x48) as u64),
++        "nvnTextureGetMemoryPool" => |a| texture(a.0[0]).map_or(0, |t| u64::from_le_bytes(t.builder[8..16].try_into().unwrap())),
++        "nvnTextureGetMemoryOffset" => |a| texture(a.0[0]).map_or(0, |t| u64::from_le_bytes(t.builder[16..24].try_into().unwrap())),
++        "nvnTextureGetSwizzle" => |a| {
++            if let Some(t) = texture(a.0[0]) {
++                for i in 0..4 {
++                    put32(a.0[1 + i], t.u32(0x38 + 4 * i));
++                }
++            }
++            0
++        },
++        "nvnSamplerGetMinMagFilter" => |a| sampler_out(a, &[0x08, 0x0c]),
++        "nvnSamplerGetWrapMode" => |a| sampler_out(a, &[0x10, 0x14, 0x18]),
++        "nvnSamplerGetLodClamp" => |a| sampler_out(a, &[0x1c, 0x20]),
++        "nvnSamplerGetCompare" => |a| sampler_out(a, &[0x28, 0x2c]),
++        "nvnSamplerGetBorderColor" => |a| {
++            if let Some(b) = sampler(a.0[0]) {
++                unsafe { std::ptr::copy_nonoverlapping(b.as_ptr().add(0x30), a.0[1] as *mut u8, 16) };
++            }
++            0
++        },
++        "nvnSamplerGetLodBias" => |a| sampler(a.0[0]).map_or(0, |b| u32_le(&b, 0x24) as u64),
++        "nvnSamplerGetMaxAnisotropy" => |a| sampler(a.0[0]).map_or(0, |b| u32_le(&b, 0x40) as u64),
++        // Only drivers read through getters carry the reduction filter (abi.rs); otherwise it
++        // stays the previous stub answer 0 (NVN_SAMPLER_REDUCTION_AVERAGE).
++        "nvnSamplerGetReductionFilter" => |a| {
++            if !super::abi::uses_getters() {
++                return 0;
++            }
++            sampler(a.0[0]).map_or(0, |b| u32_le(&b, super::abi::SAMPLER_REDUCTION) as u64)
++        },
+         "nvnTextureGetStorageSize" => |a| {
+             let b = texture(a.0[0]).map(|t| t.builder);
+             b.map_or(0, |b| super::texture_builder_storage(b.as_ptr() as u64).0)
+@@ -312,8 +391,7 @@ pub fn host_impl(name: &str) -> Option<HostFn> {
+         "nvnTextureCompare" => |a| same_object(a.0[0], a.0[1], TEXTURE_MAGIC, TEXTURE_FIELDS) as u64,
+         "nvnSamplerCompare" => |a| same_object(a.0[0], a.0[1], SAMPLER_MAGIC, &[0..0x40]) as u64,
+         "nvnSamplerInitialize" => |a| {
+-            let mut b = [0u8; 0x60];
+-            unsafe { std::ptr::copy_nonoverlapping(a.0[1] as *const u8, b.as_mut_ptr(), 0x60) };
++            let b = super::abi::sampler_builder(a.0[1]);
+             unsafe {
+                 (a.0[0] as *mut u64).write_unaligned(SAMPLER_MAGIC);
+                 std::ptr::copy_nonoverlapping(b.as_ptr().add(8), (a.0[0] + 8) as *mut u8, 0x40);
+@@ -339,8 +417,7 @@ pub fn host_impl(name: &str) -> Option<HostFn> {
+             0
+         },
+         "nvnSamplerPoolRegisterSamplerBuilder" => |a| {
+-            let mut b = [0u8; 0x60];
+-            unsafe { std::ptr::copy_nonoverlapping(a.0[2] as *const u8, b.as_mut_ptr(), 0x60) };
++            let b = super::abi::sampler_builder(a.0[2]);
+             state().registered_samplers.insert((a.0[0], a.0[1] as u32), b);
+             0
+         },
+@@ -361,9 +438,7 @@ pub fn host_impl(name: &str) -> Option<HostFn> {
+         "nvnQueueSubmitCommands" => super::cmd::submit,
+         "nvnQueuePresentTexture" => super::cmd::present,
+         "nvnWindowInitialize" => |a| {
+-            let b = a.0[1];
+-            let (count, list): (u32, u64) = (rd(b + 8), rd(b + 0x10));
+-            let textures = (0..count as u64).map(|i| rd::<u64>(list + 8 * i)).collect();
++            let textures = super::abi::window_textures(a.0[1]);
+             state().windows.insert(a.0[0], (textures, 0));
+             1
+         },
+@@ -407,14 +482,12 @@ pub fn host_impl(name: &str) -> Option<HostFn> {
+             state().programs.remove(&a.0[0]);
+             0
+         },
+-        "nvnProgramSetShaders" => |a| {
+-            let stages: Vec<(u64, u64)> = (0..a.0[1]).map(|i| (rd::<u64>(a.0[2] + 16 * i), rd::<u64>(a.0[2] + 16 * i + 8))).collect();
+-            if std::env::var_os("NX_DUMP_SHADERS").is_some() {
+-                dump_shaders(a.0[0], &stages);
+-            }
+-            state().programs.insert(a.0[0], stages);
+-            1
+-        },
++        "nvnProgramSetShaders" => |a| set_shaders(a, 16),
++        // SplatNative: the Ext variant takes 0x18-byte entries. The driver (sdk 574284b4
++        // 0x4cbd60) splits each into the 16-byte NVNshaderData {code address, control} that
++        // nvnProgramSetShaders takes plus one extra pointer it passes separately, then runs the
++        // same routine (0x4cb6f0); the shader stages are therefore the first 16 bytes.
++        "nvnProgramSetShadersExt" => |a| set_shaders(a, 0x18),
+ 
+         "nvnDeviceSetWindowOriginMode" => |a| {
+             eprintln!("[nvn] window origin mode {}", a.0[1]);
+diff --git a/crates/nxhost/src/stubs.rs b/crates/nxhost/src/stubs.rs
+index 5ada555..573b341 100644
+--- a/crates/nxhost/src/stubs.rs
++++ b/crates/nxhost/src/stubs.rs
+@@ -77,6 +77,9 @@ std::arch::global_asm!(
+     "mov x0, x16",
+     "add x1, sp, #0x10",
+     "bl {f}",
++    // SplatNative: also return the value in d0, so host functions with a float result
++    // (f32::to_bits) work; d0 is caller-saved, integer callers never read it.
++    "fmov d0, x0",
+     "ldp x29, x30, [sp], #0x90",
+     "ldr x17, [sp]",
+     "mov sp, x17",
+-- 
+2.56.1
+

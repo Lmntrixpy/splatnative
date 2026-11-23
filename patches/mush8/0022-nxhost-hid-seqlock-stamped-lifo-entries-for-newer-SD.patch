@@ -1,0 +1,131 @@
+From 0a79816ecb697f879cf202a9339e17b5d56a8cb0 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 05:36:00 +0100
+Subject: [PATCH 22/22] nxhost hid: seqlock-stamped lifo entries for newer SDKs
+
+The Splatoon 3 sdk reads npad (0x5099d0), six-axis (0x50cb24) and touch
+(0x5111e4) lifo entries as a seqlock: the leading u64 must be even when
+stable and unchanged across the copy. Mush8 stored the sampling number
+there, odd every other sample, so multi-entry reads retried forever.
+Per-game flag Game::lifo_seqlock; MK8DX's writer is unchanged.
+---
+ crates/nxhost/src/game.rs         | 13 +++++++++++-
+ crates/nxhost/src/services/hid.rs | 34 ++++++++++++++++++++++++++++---
+ 2 files changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/crates/nxhost/src/game.rs b/crates/nxhost/src/game.rs
+index b291815..d713515 100644
+--- a/crates/nxhost/src/game.rs
++++ b/crates/nxhost/src/game.rs
+@@ -10,15 +10,26 @@ pub struct Game {
+     pub title_id: u64,
+     pub name: &'static str,
+     pub versions: &'static [(&'static str, &'static str)],
++    /// The game's SDK reads hid lifo entries as a seqlock: the entry's leading u64 must be even
++    /// when stable (odd = being written) and unchanged across the copy. Splatoon 3's sdk
++    /// (574284b4) does for npad (detail::GetNpadStates 0x5099d0), six-axis (0x50cb24) and touch
++    /// (0x5111e4) entries: `tbnz #0` retry, re-check after the copy. MK8DX's writer is unchanged.
++    pub lifo_seqlock: bool,
+ }
+ 
+ pub const MK8DX: Game = Game {
+     title_id: 0x0100_1520_0002_2000,
+     name: "Mario Kart 8 Deluxe",
+     versions: &[("158c0c7399aabd7bf83795c2ef3484c7", "4.0.1"), ("fe941ed5ba14be5d505698da1bbf4fe7", "3.0.5")],
++    lifo_seqlock: false,
+ };
+ 
+-pub const SPLATOON3: Game = Game { title_id: 0x0100_C250_0FC2_0000, name: "Splatoon 3", versions: &[("28c4287aee36f7499da60f3e68b54c70", "11.3.0")] };
++pub const SPLATOON3: Game = Game {
++    title_id: 0x0100_C250_0FC2_0000,
++    name: "Splatoon 3",
++    versions: &[("28c4287aee36f7499da60f3e68b54c70", "11.3.0")],
++    lifo_seqlock: true,
++};
+ 
+ pub const GAMES: &[&Game] = &[&MK8DX, &SPLATOON3];
+ 
+diff --git a/crates/nxhost/src/services/hid.rs b/crates/nxhost/src/services/hid.rs
+index a405c10..bc6760f 100644
+--- a/crates/nxhost/src/services/hid.rs
++++ b/crates/nxhost/src/services/hid.rs
+@@ -84,9 +84,34 @@ fn lifo_commit(lifo: u64, sampling: u64, tail: u64) {
+     write(lifo + 0x18, (read::<u64>(lifo + 0x18) + 1).min(LIFO_ENTRIES));
+ }
+ 
++/// Seqlock stamps for an entry written as sample `sampling` (>= 1): odd while writing, even after.
++fn seq_stamps(sampling: u64) -> (u64, u64) {
++    (2 * sampling - 1, 2 * sampling)
++}
++
++/// Starts writing a lifo entry whose leading u64 is its sequence word. Without the seqlock
++/// protocol this is Mush8's original single store of the sampling number.
++fn entry_begin(e: u64, sampling: u64) -> bool {
++    let seqlock = crate::game::current().lifo_seqlock;
++    if seqlock {
++        write(e, seq_stamps(sampling).0);
++        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
++    } else {
++        write(e, sampling);
++    }
++    seqlock
++}
++
++fn entry_end(e: u64, sampling: u64, seqlock: bool) {
++    if seqlock {
++        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
++        write(e, seq_stamps(sampling).1);
++    }
++}
++
+ fn push_generic(lifo: u64, sampling: u64, p: &PadState, attributes: u32) {
+     let (tail, e) = lifo_slot(lifo, GENERIC_ENTRY);
+-    write(e, sampling);
++    let seqlock = entry_begin(e, sampling);
+     write(e + 0x08, sampling);
+     write(e + 0x10, p.buttons);
+     write(e + 0x18, p.left.0);
+@@ -94,13 +119,14 @@ fn push_generic(lifo: u64, sampling: u64, p: &PadState, attributes: u32) {
+     write(e + 0x20, p.right.0);
+     write(e + 0x24, p.right.1);
+     write(e + 0x28, attributes);
++    entry_end(e, sampling, seqlock);
+     lifo_commit(lifo, sampling, tail);
+ }
+ 
+ fn push_touch(lifo: u64, sampling: u64, touches: &[(u32, f32, f32, u32)]) {
+     let (tail, e) = lifo_slot(lifo, TOUCH_ENTRY);
+     let touches = &touches[..touches.len().min(16)];
+-    write(e, sampling);
++    let seqlock = entry_begin(e, sampling);
+     write(e + 0x08, sampling);
+     write(e + 0x10, touches.len() as i32);
+     write(e + 0x14, 0u32);
+@@ -116,6 +142,7 @@ fn push_touch(lifo: u64, sampling: u64, touches: &[(u32, f32, f32, u32)]) {
+         write(t + 0x20, 0u32);
+         write(t + 0x24, 0u32);
+     }
++    entry_end(e, sampling, seqlock);
+     lifo_commit(lifo, sampling, tail);
+ }
+ 
+@@ -124,7 +151,7 @@ static AT_REST: [std::sync::atomic::AtomicBool; crate::input::MAX_PLAYERS] = [co
+ fn push_sixaxis(lifo: u64, sampling: u64, m: Option<&crate::input::Motion>, fused: &crate::motion::Orientation) {
+     let (tail, e) = lifo_slot(lifo, SIXAXIS_ENTRY);
+     let (accel, gyro) = m.map_or(([0.0, 0.0, -1.0], [0.0; 3]), |m| (m.accel, fused.gyro(m.gyro.map(|r| r / std::f32::consts::TAU))));
+-    write(e, sampling);
++    let seqlock = entry_begin(e, sampling);
+     write(e + 0x08, 5_000_000u64);
+     write(e + 0x10, sampling);
+     write(e + 0x18, accel);
+@@ -132,6 +159,7 @@ fn push_sixaxis(lifo: u64, sampling: u64, m: Option<&crate::input::Motion>, fuse
+     write(e + 0x30, fused.rotation());
+     write(e + 0x3c, fused.orientation());
+     write(e + 0x60, m.is_some() as u32);
++    entry_end(e, sampling, seqlock);
+     lifo_commit(lifo, sampling, tail);
+ }
+ 
+-- 
+2.56.1
+

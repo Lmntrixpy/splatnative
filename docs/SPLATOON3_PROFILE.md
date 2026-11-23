@@ -90,12 +90,30 @@ Jeder Lauf ist auf 120–150 s begrenzt; Logs in `work/runN.log`.
 | 7 | Time ok; **`nnMain` läuft**, Metal erkennt Apple M2, GPU-Heap angelegt | `nn::oe::TryPopLaunchParameter`: leerer Kanal als 0x2680 statt 0x480 | Patch: am-Ergebnis 0x480 (nicht-MK8) |
 | 8 | – | `MapSharedMemory` 0xcc01 (zufällig, 3 von 4 Läufen) | Patch: 16-KiB-Host-Seiten → InvalidCurrentMemory, SDK versucht andere Adresse |
 | 9–13 | RomFS-Lesezugriffe, Sprache `de`, Version 11.3.0, Betriebsmodus | Hänger, 100 % CPU: `TryWaitSystemEvent` auf Handle 0, `IApplicationFunctions` 210 ohne Event | Patch: Event für cmd 210; Diagnose per `sample` + `NX_TRACE_SVC` |
-| 14–15 | nvdrv, vi:m/s/u, acc:u0, hid, `nvnDeviceInitialize` | SIGSEGV (Nullzeiger +0x20) in main+0x452c7b8 unter `nnMain+0x688`, nach hid-Stubs 1004/11 | offen, siehe unten |
+| 14–15 | nvdrv, vi:m/s/u, acc:u0, hid, `nvnDeviceInitialize` | SIGSEGV (Nullzeiger +0x20) in main+0x452c7b8 unter `nnMain+0x688` | Ursache: `nvnDeviceGetInteger` API-Version 53/105 (MK8) statt 55/15 → Spiel überspringt den Aufbau seines Grafiksystems |
+| 16 | Grafiksystem wird aufgebaut (Queue, Pools, Sampler) | `nn::vi::GetNativeWindow` auf Null-Layer | Patch 0017: API-Version pro Treiber (55/15, aus `0x4c7400`) |
+| 17–18 | `ISelfController` 44 liefert Layer 0 → `CreateLayer` bricht vor `OpenLayer` ab | | Patch 0018: Layer-IDs (1, 2) |
+| 19–20 | Fenster, 53 Pools, 98 Buffer, 36 Texturen | Host-SIGBUS in `nvnWindowInitialize` | Patch 0017: neue NVN-Strukturlayouts über Treiber-Getter (`nvn/abi.rs`); Patch 0019 Host-Symbole |
+| 21 | Shader-Programme | `nvnProgramSetShadersExt` nur Stub | Patch 0017: Ext = SetShaders mit 0x18-Einträgen |
+| 22 | Audio-Renderer REV15 | `RequestUpdateAudioRenderer` 0x5299 | Patch 0020: Effekt-Status v2 (0x90) ab REV9 |
+| 23 | bcat, nifm | SIGSEGV in `nn::os::SetDyingMessageRegion` | Patch 0021: GetInfo 20 (User-Exception-Context) |
+| 24–26 | Kein Absturz mehr; Hauptthread pollt Eingaben | Endlosschleife in `nn::hid::detail::GetNpadStates`/`GetSixAxisSensorStates` | Patch 0022: Seqlock-Stempel in den HID-Lifos |
+| 27 | Command-Buffer werden aufgezeichnet, Textur-/Sampler-Getter echt | Hauptthread wartet dauerhaft (`WaitLightEvent`) im Job-System des Spiels, noch kein Present | offen, siehe unten |
 
-### Offener Befund (Lauf 15)
-- Gelesen wird der globale Zeiger `main+0x61e2150` (bss) mit Funktionszeigern bei +0x20/+0x30/+0x48.
-- Einziger Schreiber: `main+0x4529ca8` (speichert ein neu allokiertes 0x1e8-Byte-Objekt).
-- `NX_WATCH=main+0x61e2150`: **kein Schreibzugriff vor dem Absturz** → ein Init-Schritt läuft nicht oder zu spät.
-- Absturzpfad: `nnMain+0x688` → main+0x452be0c (`blr [x20->vtable+0x60]`, nachdem ein 0x298-Objekt nach x20+0x38 gelegt wurde) → main+0x452a600 (`+0xc0`) → Leser.
-- Nächster Schritt: Aufrufer des Schreibers dynamisch bestimmen (Watch auf dessen vtable-Slot bzw. Trace der virtuellen Aufrufe) und prüfen, welcher Stub-Rückgabewert (hid 1004/11, acc 160, ISelfController 44, nvdrv 3/8/13) den Init-Pfad abkürzt.
+### Gelöst: Befund aus Lauf 15
+Der Schreiber `main+0x4529ca8` liegt in der Grafik-Initialisierung hinter der Prüfung
+`nvnDeviceGetInteger(API_MAJOR) == 55 && API_MINOR >= 15` (main+0x4529bf4). Mush8 lieferte die
+Werte des MK8-Treibers; der Splatoon-Treiber meldet 55/15.
 
+### Offener Befund (Lauf 27)
+- Kein Absturz, ~1 GB Gastspeicher; Command-Buffer werden aufgezeichnet, aber noch kein
+  `nvnQueuePresentTexture` (kein Frame in `work/frame/` mit `NX_DUMP_AT`).
+- Hauptthread: `nnMain+0x688` → … → main+0x4ad1ebc `nn::os::WaitLightEvent` in einer
+  Job-Warteschleife (main+0x4ad1e20). Worker 0x6d führt einen Job (main+0x4cd6898) aus, der
+  selbst auf eine Job-Gruppe wartet (main+0x4ad6ca0); 0x6e/0x6f warten ebenfalls im Job-System.
+- Host-Seite geprüft: kein Deadlock, Adress-Arbiter (Signal-Typen 0–2) entspricht Horizon.
+- Nächster Schritt: herausfinden, welche externe Fertigmeldung (GPU-Sync, Datei, Dienst-Event)
+  der innerste Job erwartet.
+
+### Bekannt offen (nicht blockierend)
+- Audio REV15: Voice-Eingabe ist 0x188 statt 0x170 Byte pro Voice; Mush8s Parser nimmt 0x170.

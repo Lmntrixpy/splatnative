@@ -1,0 +1,47 @@
+From b3e432ccebcfe4c6753601ec8606b024b1376ccb Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 05:36:00 +0100
+Subject: [PATCH 21/22] nxhost svc: GetInfo 20 returns a user exception context
+
+Like Horizon, one 0x200-byte thread-local-region slot, allocated on first
+use. nn::os::SetDyingMessageRegion writes +0x1c0 of it; with 0 it crashed.
+---
+ crates/nxhost/src/kernel.rs | 8 ++++++++
+ crates/nxhost/src/svc.rs    | 2 +-
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/crates/nxhost/src/kernel.rs b/crates/nxhost/src/kernel.rs
+index 1d568c8..6bbd418 100644
+--- a/crates/nxhost/src/kernel.rs
++++ b/crates/nxhost/src/kernel.rs
+@@ -472,6 +472,14 @@ pub fn create_thread(entry: u64, arg: u64, stack_top: u64, prio: i32, core: i32)
+     Ok(h)
+ }
+ 
++/// SplatNative: the process's user exception context (GetInfo 20), like Horizon one 0x200-byte
++/// slot of the thread-local region, allocated on first use. The SDK stores e.g. its dying
++/// message region in it (nn::os::SetDyingMessageRegion writes +0x1c0).
++pub fn user_exception_context() -> u64 {
++    static ADDR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *ADDR.get_or_init(|| KERNEL.lock().alloc_tlr().expect("thread-local region for the user exception context"))
++}
++
+ pub fn thread(h: u32) -> Option<Arc<Thread>> {
+     match KERNEL.lock().get(h)? {
+         Obj::Thread(t) => Some(t),
+diff --git a/crates/nxhost/src/svc.rs b/crates/nxhost/src/svc.rs
+index 7ef7ff6..22cc9e7 100644
+--- a/crates/nxhost/src/svc.rs
++++ b/crates/nxhost/src/svc.rs
+@@ -402,7 +402,7 @@ fn get_info(f: &mut Frame, id0: u32, handle: u32, id1: u64) -> u32 {
+         15 => a.layout.stack_size,
+         16 | 17 => 0,
+         18 => PROGRAM_ID,
+-        20 => 0,
++        20 => kernel::user_exception_context(),
+         23 => 1,
+         24 => 200,
+         25 | 0xF000_0002 => 0,
+-- 
+2.56.1
+
