@@ -1,0 +1,117 @@
+From 4f427192241944f8eda2b207a1e47042c4595190 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 21:19:22 +0100
+Subject: [PATCH 32/33] nxhost kernel: SignalToAddress modify-by-waiting-count
+ as Horizon computes it
+
+SignalAndModifyByWaitingCountIfEqual subtracted 2 for count <= 0, added 1
+for a single waiter and subtracted 1 while further waiters stayed blocked.
+An auto-clear nn::os::LightEvent (0 clear, 1 waiters, 2 signaled) with two
+waiters then dropped to 0 although one waiter still slept; later signals
+only stored 2 without a syscall, so that waiter never woke. Splatoon 3's
+FileDataCacheSystem waits on such an event for free cache pages, which
+hung the loading screen in roughly one boot out of five.
+
+The new value now follows Atmosphere's KAddressArbiter: +1 without
+waiters, -1 when all further waiters are woken as well, else unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/kernel.rs | 66 ++++++++++++++++++++++++++++++-------
+ 1 file changed, 54 insertions(+), 12 deletions(-)
+
+diff --git a/crates/nxhost/src/kernel.rs b/crates/nxhost/src/kernel.rs
+index 6bbd418..1c72985 100644
+--- a/crates/nxhost/src/kernel.rs
++++ b/crates/nxhost/src/kernel.rs
+@@ -712,6 +712,26 @@ pub fn wait_for_address(addr: u64, kind: u32, value: i32, timeout_ns: i64) -> u3
+     }
+ }
+ 
++/// New value for SignalToAddress(SignalAndModifyByWaitingCountIfEqual), as Horizon's
++/// KAddressArbiter computes it: +1 without waiters; with waiters -1 when every waiter after
++/// the first is woken too (count <= 0, or fewer than `count` further waiters), else unchanged.
++///
++/// SplatNative: Mush8 subtracted 2 for count <= 0, added 1 for a single waiter and subtracted
++/// 1 while further waiters stayed asleep. nn::os::LightEvent (auto clear: 0 clear, 1 waiters,
++/// 2 signaled) then dropped to 0 with a waiter still blocked; later signals only set 2 without
++/// a syscall, so that waiter slept forever. Splatoon 3's file data cache waits on such an event
++/// for free pages, which hung loading screens in about one boot out of five.
++fn modify_by_waiting_count(value: i32, count: i32, waiting: i32) -> i32 {
++    if waiting == 0 {
++        return value.wrapping_add(1);
++    }
++    if count <= 0 {
++        return value.wrapping_sub(1);
++    }
++    let further = (waiting - 1).min(count);
++    if further < count { value.wrapping_sub(1) } else { value }
++}
++
+ pub fn signal_to_address(addr: u64, kind: u32, value: i32, count: i32) -> u32 {
+     let mut g = KERNEL.lock();
+     let a = atomic32(addr);
+@@ -724,18 +744,7 @@ pub fn signal_to_address(addr: u64, kind: u32, value: i32, count: i32) -> u32 {
+             }
+         }
+         2 => {
+-            let others = (waiting - 1).min(count.saturating_add(1));
+-            let new = if waiting == 0 {
+-                value.wrapping_add(1)
+-            } else if count <= 0 {
+-                value.wrapping_sub(2)
+-            } else if others == 0 {
+-                value.wrapping_add(1)
+-            } else if others <= count {
+-                value.wrapping_sub(1)
+-            } else {
+-                value
+-            };
++            let new = modify_by_waiting_count(value, count, waiting);
+             if a.compare_exchange(value as u32, new as u32, AcqRel, Acquire).is_err() {
+                 return rc::INVALID_STATE;
+             }
+@@ -808,6 +817,39 @@ mod tests {
+         })
+     }
+ 
++    #[test]
++    fn modify_by_waiting_count_matches_horizon() {
++        // LightEvent (auto clear) signal: value 1 = waiters present, count 1.
++        assert_eq!(modify_by_waiting_count(1, 1, 0), 2, "no waiter: becomes signaled");
++        assert_eq!(modify_by_waiting_count(1, 1, 1), 0, "only waiter woken: cleared");
++        assert_eq!(modify_by_waiting_count(1, 1, 2), 1, "a waiter stays blocked: still 'waiters'");
++        assert_eq!(modify_by_waiting_count(1, 1, 5), 1);
++        assert_eq!(modify_by_waiting_count(1, 2, 2), 0, "both woken");
++        assert_eq!(modify_by_waiting_count(1, 2, 3), 1, "two woken, one stays blocked");
++        assert_eq!(modify_by_waiting_count(1, 2, 4), 1);
++        assert_eq!(modify_by_waiting_count(1, 0, 3), 0, "count <= 0 wakes all");
++        assert_eq!(modify_by_waiting_count(1, -1, 0), 2);
++    }
++
++    /// Two threads wait on an auto-clear LightEvent; two signals must wake both.
++    #[test]
++    fn light_event_two_waiters_two_signals() {
++        // Model of the SDK protocol (nn::os::SignalLightEvent/WaitLightEvent, auto clear).
++        let mut state = 1; // both waiters registered, state "waiters"
++        let mut waiting = 2;
++        for _ in 0..2 {
++            match state {
++                0 => state = 2,
++                1 => {
++                    state = modify_by_waiting_count(state, 1, waiting);
++                    waiting -= 1;
++                }
++                _ => {}
++            }
++        }
++        assert_eq!(waiting, 0, "a waiter was left blocked (state {state})");
++    }
++
+     fn admit(k: &Kernel, t: &Arc<Thread>) {
+         let mut g = k.lock();
+         g.threads.push(t.clone());
+-- 
+2.56.1
+

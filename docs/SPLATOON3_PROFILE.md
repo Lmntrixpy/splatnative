@@ -103,6 +103,7 @@ Jeder Lauf ist auf 120–150 s begrenzt; Logs in `work/runN.log`.
 | 40–56 | **Erstes Bild: 3D-Szene des Erststart-Bildschirms mit UI, 60 fps** | wartet auf Eingabe | Patch 0026: Zähler-Reports wie der Treiber (Zeitstempel nur im Zeitstempel-Feld), bedingtes Rendern ausgewertet, Clears mit Scissor/Kanalmaske |
 | 57–64 | Eingabe per `NX_AUTOINPUT` wirkt; **Texte und Menüs sichtbar** („Wähle einen Style!“) | — | Patch 0027: nxshader übersetzt `BRX`, `ICMP`, `R2P` (≈25 Programme, u. a. Layout-Text); 0028 `NX_TRACE_UBO` |
 | 65–71 | **Style gewählt, Charakter erstellt, Spielstand geschrieben; spielbares Tutorial** (Laufen, Schwimmen, Schießen per Skript) | Tutorial-Parcours braucht gezielte Steuerung | Patch 0029 `LEA.HI`; 0030 Halten/Stick in `NX_AUTOINPUT`; 0031 `NX_BACKGROUND`, protokollierte Beenden-Pfade |
+| 72–st75 | Ladebildschirm hängt sporadisch (~1 von 5 Starts, auch beim Nutzer) | — | Patch 0032: `SignalToAddress` (ModifyByWaitingCount) wie Horizon; 0033 `NX_THREAD_DUMP_AT`, sichere Probes. Danach 15/15 Starts ohne Hänger |
 
 ### Gelöst: Befund aus Lauf 15
 Der Schreiber `main+0x4529ca8` liegt in der Grafik-Initialisierung hinter der Prüfung
@@ -131,11 +132,24 @@ und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen 
 - Stand Lauf 71: Speicherdaten vorhanden (`work/save-0100c2500fc20000`), das Spiel startet im Tutorial.
   Nächster Schritt: Tutorial durchspielen (manuell oder per Skript) bis zur Stadt/zum Hauptmenü.
 
-### Sporadisch: Lade-Hänger im Datei-Cache
-- In ~2 von 8 Läufen bleibt der Ladethread in `FileDataCacheSystem::ReserveFreePagesByGatherCompaction`
-  (Cache 1 MiB = 63 Seiten à 16 KiB, Anfrage bis 57 Seiten). Mit `NX_PROBE` gemessen: alle
-  Reservierungen werden committet, Wartepfad wird normalerweise wieder geweckt. Ursache des seltenen
-  Dauerwartens noch offen (Kandidat: Wake/Scheduling im Host).
+### Gelöst: Lade-Hänger im Datei-Cache (Läufe 72–st75)
+- Symptom: Ladebildschirm (Tinten-Animation) läuft endlos; ein Ladethread wartet in
+  `FileDataCacheSystem::ReserveFreePagesByGatherCompaction` (sdk+0x10a328) auf das `LightEvent` bei
+  Cache+0x68, bis andere Threads reservierte Seiten committen (`CommitCachePages` signalisiert immer).
+- `NX_THREAD_DUMP_AT` zeigte: kein anderer Thread im Cache, alle Speicher-Lesezugriffe erfolgreich
+  (Probe hinter `IStorage::Read`) → verlorenes Wecken, nicht verlorene Reservierung.
+- Das SDK-`LightEvent` (Auto-Clear) nutzt den Zustand 0 = frei, 1 = Wartende, 2 = signalisiert und
+  `SignalToAddress(SignalAndModifyByWaitingCountIfEqual, 1, count 1)`. Horizon (Atmosphere
+  `KAddressArbiter`): ohne Wartende +1, sonst −1 nur wenn alle weiteren Wartenden mit geweckt werden,
+  sonst unverändert. Mush8 setzte bei zwei Wartenden 0 und weckte nur einen → der zweite schlief für
+  immer, spätere Signale setzten nur 2 ohne Syscall.
+- Patch 0032 rechnet wie Horizon (Unit-Tests inkl. Zwei-Wartende-Szenario).
+
+### Beobachtet, noch nicht umgesetzt: Kernzuordnung
+- Threads mit idealem Kern −2 („Prozesswert“) behalten im Host −2, obwohl das Spiel später Masken 0x2/0x4
+  setzt; der Host-Scheduler (`sched_core`) ordnet sie alle Kern 0 zu. Horizon löst −2 beim Erzeugen auf
+  den Prozesskern auf und wählt bei `SetThreadCoreMask(-3, Maske)` einen Kern aus der Maske. Kein Hänger,
+  aber weniger Parallelität; Korrektur später (betrifft Leistung, v. a. auf dem iPad).
 
 ### Bekannt offen (nicht blockierend)
 - Audio REV15: Voice-Eingabe ist 0x188 statt 0x170 Byte pro Voice; Mush8s Parser nimmt 0x170.

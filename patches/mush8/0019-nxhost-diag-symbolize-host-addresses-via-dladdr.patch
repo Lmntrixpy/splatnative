@@ -1,7 +1,7 @@
 From 72d2ddd1e286cbe9523e14ec648b453c51cce081 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 05:36:00 +0100
-Subject: [PATCH 19/31] nxhost diag: symbolize host addresses via dladdr
+Subject: [PATCH 19/33] nxhost diag: symbolize host addresses via dladdr
 
 Crashes inside nxhost itself printed bare addresses; now the image, its
 base (for atos) and the nearest symbol are shown.

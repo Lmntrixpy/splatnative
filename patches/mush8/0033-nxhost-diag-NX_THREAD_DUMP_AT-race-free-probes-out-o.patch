@@ -1,0 +1,220 @@
+From abfc2943e3a31a49e4b701ce09d2a0397103c26f Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 21:19:22 +0100
+Subject: [PATCH 33/33] nxhost diag: NX_THREAD_DUMP_AT, race-free probes,
+ out-of-range storage reads logged
+
+- NX_THREAD_DUMP_AT=seconds,... prints each guest thread's scheduling
+  state, the SVC it is blocked in and its guest backtrace (sampling
+  profilers often cannot unwind through guest frames).
+- Probe patches are serialized; a thread faulting on the code page while
+  it is briefly writable, or trapping on a probe another thread already
+  restored, retries the instruction instead of being reported as a crash.
+- fs IStorage reads beyond the storage size are logged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/diag.rs        | 31 +++++++++++++++
+ crates/nxhost/src/kernel.rs      | 67 ++++++++++++++++++++++++++++++++
+ crates/nxhost/src/main.rs        |  1 +
+ crates/nxhost/src/services/fs.rs |  1 +
+ crates/nxhost/src/svc.rs         |  2 +
+ 5 files changed, 102 insertions(+)
+
+diff --git a/crates/nxhost/src/diag.rs b/crates/nxhost/src/diag.rs
+index cabcd72..be6f4fc 100644
+--- a/crates/nxhost/src/diag.rs
++++ b/crates/nxhost/src/diag.rs
+@@ -104,11 +104,21 @@ struct Probe {
+ 
+ static PROBES: OnceLock<Vec<Probe>> = OnceLock::new();
+ 
++/// SplatNative: code page currently writable for a probe patch (0 if none). Another guest
++/// thread executing in that page meanwhile faults on the non-executable page; the signal
++/// handler then waits for the patch and retries the instruction instead of reporting a crash.
++static PATCHING_PAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static PATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
++
+ fn patch_word(addr: u64, word: u32) {
++    use std::sync::atomic::Ordering::SeqCst;
+     let page = addr & !(crate::mem::PAGE - 1);
++    let _serialized = PATCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
++    PATCHING_PAGE.store(page, SeqCst);
+     let _ = crate::mem::protect(page, crate::mem::PAGE, crate::mem::perm::RW);
+     unsafe { (addr as *mut u32).write_volatile(word) };
+     let _ = crate::mem::protect(page, crate::mem::PAGE, crate::mem::perm::RX);
++    PATCHING_PAGE.store(0, SeqCst);
+     unsafe extern "C" {
+         fn sys_icache_invalidate(start: *mut libc::c_void, len: usize);
+     }
+@@ -181,6 +191,27 @@ extern "C" fn on_signal(sig: i32, info: *mut libc::siginfo_t, uc: *mut libc::c_v
+         if sig == libc::SIGTRAP && handle_probe(ss.__pc, &ss.__x, ss.__lr, ss.__fp) {
+             return;
+         }
++        // Another thread hit the same probe trap first and already restored the original
++        // instruction (or the re-arm trap): run it again.
++        if sig == libc::SIGTRAP
++            && PROBES.get().is_some_and(|ps| ps.iter().any(|p| p.addr == ss.__pc || p.addr + 4 == ss.__pc))
++            && (*(ss.__pc as *const u32)) & 0xFFE0_001F != 0xD420_0000
++        {
++            return;
++        }
++        if (sig == libc::SIGBUS || sig == libc::SIGSEGV) && (*info).si_addr as u64 == ss.__pc {
++            let page = ss.__pc & !(crate::mem::PAGE - 1);
++            let probe_page = PROBES.get().is_some_and(|ps| ps.iter().any(|p| p.addr & !(crate::mem::PAGE - 1) == page));
++            thread_local! {
++                static RETRIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
++            }
++            if probe_page && RETRIES.with(|r| r.replace(r.get() + 1)) < 1000 {
++                while PATCHING_PAGE.load(std::sync::atomic::Ordering::SeqCst) == page {
++                    std::hint::spin_loop();
++                }
++                return;
++            }
++        }
+         eprintln!(
+             "[fatal] signal {sig} at pc={} lr={} fault_addr={:#x}",
+             symbolize(ss.__pc),
+diff --git a/crates/nxhost/src/kernel.rs b/crates/nxhost/src/kernel.rs
+index 1c72985..eba9140 100644
+--- a/crates/nxhost/src/kernel.rs
++++ b/crates/nxhost/src/kernel.rs
+@@ -41,6 +41,10 @@ pub struct Thread {
+     ready_seq: AtomicU64,
+     seen: AtomicU64,
+     cv: Condvar,
++    /// SplatNative diagnostics (NX_THREAD_DUMP_AT): guest frame pointer and number of the SVC
++    /// the thread is currently in (0 while it runs guest code).
++    diag_fp: AtomicU64,
++    diag_svc: AtomicU32,
+ }
+ 
+ impl Thread {
+@@ -463,6 +467,8 @@ pub fn create_thread(entry: u64, arg: u64, stack_top: u64, prio: i32, core: i32)
+         ready_seq: AtomicU64::new(0),
+         seen: AtomicU64::new(u64::MAX),
+         cv: Condvar::new(),
++        diag_fp: AtomicU64::new(0),
++        diag_svc: AtomicU32::new(0),
+     });
+     let h = g.add(Obj::Thread(t));
+     debug_assert_eq!(h, handle);
+@@ -762,6 +768,65 @@ pub fn signal_to_address(addr: u64, kind: u32, value: i32, count: i32) -> u32 {
+     rc::OK
+ }
+ 
++/// SplatNative: records the SVC the current guest thread enters (`svc` = number + 1, 0 on exit)
++/// for NX_THREAD_DUMP_AT. Uses the thread-local kernel thread cache, so it costs two relaxed
++/// stores per SVC and nothing before the thread's first scheduling point.
++pub fn note_svc(svc: u32, fp: u64) {
++    KTHREAD.with(|k| {
++        if let Some(t) = k.borrow().as_deref() {
++            t.diag_fp.store(fp, Relaxed);
++            t.diag_svc.store(svc, Relaxed);
++        }
++    });
++}
++
++/// SplatNative: NX_THREAD_DUMP_AT=seconds,... prints every guest thread's scheduling state, the
++/// SVC it is blocked in and its guest backtrace at those times after start. Meant for hangs
++/// where a sampling profiler cannot unwind through guest frames.
++pub fn start_thread_dumps() {
++    let Ok(spec) = std::env::var("NX_THREAD_DUMP_AT") else { return };
++    let mut times: Vec<f32> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
++    times.sort_by(f32::total_cmp);
++    let start = Instant::now();
++    std::thread::spawn(move || {
++        for t in times {
++            let due = start + Duration::from_secs_f32(t);
++            std::thread::sleep(due.saturating_duration_since(Instant::now()));
++            dump_threads(t);
++        }
++    });
++}
++
++fn dump_threads(at: f32) {
++    let g = KERNEL.lock();
++    eprintln!("[threads] at {at}s: {} guest threads", g.threads.len());
++    for t in &g.threads {
++        let svc = t.diag_svc.load(Relaxed);
++        let state = if !t.runnable.load(Relaxed) {
++            "blocked"
++        } else if g.is_scheduled(t) {
++            "running"
++        } else {
++            "ready (not scheduled)"
++        };
++        let where_ = if svc == 0 { "guest code".to_string() } else { format!("svc {:#x}", svc - 1) };
++        eprintln!(
++            "[threads] {:#x} (id {:#x}) prio {} core {} sched core {} mask {:#x}: {state}, in {where_}",
++            t.handle,
++            t.id,
++            t.prio.load(Relaxed),
++            t.core.load(Relaxed),
++            t.sched_core(),
++            t.affinity.load(Relaxed)
++        );
++        if svc != 0 {
++            for l in crate::diag::backtrace_lines(t.diag_fp.load(Relaxed)).iter().take(12) {
++                eprintln!("[threads]     at {l}");
++            }
++        }
++    }
++}
++
+ pub fn notify_all() {
+     let g = KERNEL.lock();
+     KERNEL.wake_all(&g);
+@@ -814,6 +879,8 @@ mod tests {
+             ready_seq: AtomicU64::new(0),
+             seen: AtomicU64::new(u64::MAX),
+             cv: Condvar::new(),
++            diag_fp: AtomicU64::new(0),
++            diag_svc: AtomicU32::new(0),
+         })
+     }
+ 
+diff --git a/crates/nxhost/src/main.rs b/crates/nxhost/src/main.rs
+index 5010fc2..d8b7a7e 100644
+--- a/crates/nxhost/src/main.rs
++++ b/crates/nxhost/src/main.rs
+@@ -397,6 +397,7 @@ fn start(args: Args) -> Result<()> {
+             })
+             .collect(),
+     );
++    kernel::start_thread_dumps();
+     diag::start_watch(&mods.iter().map(|m| (m.name.clone(), m.base)).collect::<Vec<_>>());
+     let _ = INITS.set(mods.iter().filter_map(|m| m.dynamic.init.map(|i| m.base + i)).collect());
+     let start = loader::symbol(&mods, INIT_START_4).or_else(|| loader::symbol(&mods, INIT_START_5)).context("nn::init::Start not found")?;
+diff --git a/crates/nxhost/src/services/fs.rs b/crates/nxhost/src/services/fs.rs
+index f190459..4fea561 100644
+--- a/crates/nxhost/src/services/fs.rs
++++ b/crates/nxhost/src/services/fs.rs
+@@ -166,6 +166,7 @@ impl Service for Storage {
+                 let Some(b) = req.b.first() else { return rc::OUT_OF_RANGE };
+                 let size = size.min(b.size);
+                 if off + size > self.s.size() {
++                    eprintln!("[fs] {} read {off:#x}+{size:#x} beyond size {:#x}", self.name, self.s.size());
+                     return rc::OUT_OF_RANGE;
+                 }
+                 let dst = unsafe { std::slice::from_raw_parts_mut(b.addr as *mut u8, size as usize) };
+diff --git a/crates/nxhost/src/svc.rs b/crates/nxhost/src/svc.rs
+index e20c9ff..90f6b1d 100644
+--- a/crates/nxhost/src/svc.rs
++++ b/crates/nxhost/src/svc.rs
+@@ -42,9 +42,11 @@ pub extern "C" fn dispatch(f: &mut Frame) {
+     } else {
+         kernel::yield_backoff(None);
+     }
++    kernel::note_svc(f.x[16] as u32 + 1, f.x[29]);
+     kernel::sched_point();
+     dispatch_inner(f);
+     kernel::sched_point();
++    kernel::note_svc(0, 0);
+ }
+ 
+ fn dispatch_inner(f: &mut Frame) {
+-- 
+2.56.1
+
