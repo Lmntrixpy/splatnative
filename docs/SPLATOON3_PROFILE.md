@@ -105,6 +105,7 @@ Jeder Lauf ist auf 120–150 s begrenzt; Logs in `work/runN.log`.
 | 65–71 | **Style gewählt, Charakter erstellt, Spielstand geschrieben; spielbares Tutorial** (Laufen, Schwimmen, Schießen per Skript) | Tutorial-Parcours braucht gezielte Steuerung | Patch 0029 `LEA.HI`; 0030 Halten/Stick in `NX_AUTOINPUT`; 0031 `NX_BACKGROUND`, protokollierte Beenden-Pfade |
 | 72–st75 | Ladebildschirm hängt sporadisch (~1 von 5 Starts, auch beim Nutzer) | — | Patch 0032: `SignalToAddress` (ModifyByWaitingCount) wie Horizon; 0033 `NX_THREAD_DUMP_AT`, sichere Probes. Danach 15/15 Starts ohne Hänger |
 | 86–94 | **Zielen per Bewegungssteuerung ohne Gyro-Controller**: Spiel liest den virtuellen Sensor, Kamera folgt (hoch/runter, links/rechts geprüft) | — | Patch 0035: virtueller Sechsachsensensor (Maus/I-K), vollständige Tastenbelegung (`docs/STEUERUNG.md`); 0036 `NX_TRACE_MOTION` |
+| 95–116 | **Tutorial ohne Geometriefehler** (keine flachen Keile/Balken mehr), alle Compute-Shader laufen | Beine/Arme der Figur fehlen; 2 Shader mit >16 Texturen | Patch 0037: Compute-Programmkopf, `LDS`/`STS`, unausgerichtete Vertex-Attribute; 0038/0039 Draw-Diagnose (`NX_DUMP_EACH_DRAW`, `NX_DUMP_DRAW_BUFFERS`) |
 
 ### Gelöst: Befund aus Lauf 15
 Der Schreiber `main+0x4529ca8` liegt in der Grafik-Initialisierung hinter der Prüfung
@@ -173,6 +174,29 @@ und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen 
 - Der Ablauf der Erststart-Sequenz schwankt zwischen Läufen stark (Lauf 86 blieb bei
   „Gefällst du dir?“, Lauf 87 erreichte die Ballons nach 140 s); ohne Eingaben läuft das Tutorial
   teils von selbst weiter (Läufe 88/89).
+
+### Shader- und Geometriefehler (Läufe 95–116)
+- **Compute-Shader:** Splatoon 3 nutzt fünf Compute-Programme. Ihr Code beginnt mit einem 0x100-Byte-Kopf
+  (Magic 0x12345679, sonst Nullen); Mush8 (für MK8DX gebaut, dort ohne Kopf) übersetzte den Kopf als
+  Code → „invalid instruction 0 at 0x8“. Jetzt wird der Kopf übersprungen; zwei der Programme nutzen
+  Shared Memory (`LDS`/`STS`, ohne `BAR`), das auf ein Threadgroup-Feld (32 KiB) abgebildet wird.
+- **Flache Keile/dunkle Balken im Tutorial:** Mit `NX_DUMP_EACH_DRAW` (Farb- und Tiefenpuffer nach jedem
+  Draw) gefunden: Gelände-Meshes (VS `a5e31b877f634132`) haben 69 Byte Vertex-Abstand. Die meisten Positionen
+  liegen dadurch nicht auf 4-Byte-Grenzen; Wortladen von solchen Adressen lieferte auf der Apple-GPU falsche
+  Werte (auf der CPU gelesen waren die Positionen korrekt). Riesige Dreiecke schrieben nur Tiefe (Vorpass),
+  der Farbpass mit Tiefentest EQUAL traf sie nie → alter Bildinhalt blieb stehen. `fetch_attr` sammelt
+  unausgerichtete Attribute jetzt byteweise; das Tutorial wird sauber dargestellt.
+- Der Shader-Cache-Schlüssel enthält jetzt den Prelude-Hash, damit geänderte Hilfsfunktionen nicht mit
+  alten Bibliotheken gemischt werden.
+- **Fehlende Beine/Arme (offen):** Kein Draw schreibt dort Tiefe. Der Körper-Draw (VS `9661f455…`/`7532a2e0…`,
+  3204 Indizes) nutzt laut ausgelesenen Puffern (`NX_DUMP_DRAW_BUFFERS`) nur die Knochen 26/27, die das Spiel
+  selbst auf 1 % skaliert (so blendet Splatoon verdeckte Körperteile aus); auf der CPU nachgerechnet landen
+  die Vertices zusammengefallen im Beinbereich. Kein Übersetzungsfehler in diesem Draw; welcher Draw die
+  sichtbaren Beine liefern müsste, ist noch nicht gefunden. Ausgeschlossen: bedingtes Rendern, Culling,
+  Tiefentest EQUAL, fehlgeschlagene Draws.
+- **Offen:** Zwei Fragment-Shader (`a791e3bcb93355bb`, `11c0b56ba2312e14`, ab ca. 200 s) nutzen mehr als 16
+  Texturen; Metal erlaubt 16 Sampler pro Stufe, die Draws fallen aus. Lösung braucht Sampler im
+  Argument-Buffer.
 
 ### Beobachtet, noch nicht umgesetzt: Kernzuordnung
 - Threads mit idealem Kern −2 („Prozesswert“) behalten im Host −2, obwohl das Spiel später Masken 0x2/0x4

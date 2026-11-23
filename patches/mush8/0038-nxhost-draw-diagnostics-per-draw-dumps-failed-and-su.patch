@@ -1,0 +1,134 @@
+From 8c7d9165c3a30517109a17798d5bab35f680a535 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 23:36:59 +0100
+Subject: [PATCH 38/39] nxhost draw diagnostics: per-draw dumps, failed and
+ suppressed draws, vertex streams
+
+With NX_TRACE_AT/NX_TRACE_FRAME, the trace now also reports draws that
+fail or are suppressed by conditional rendering, each draw's vertex
+streams (address, size, stride), attribute offsets, index buffer and the
+first positions read from guest memory. NX_DUMP_EACH_DRAW=WxH saves color
+target 0 and the depth target after every traced draw into a target of
+that size (work/frame/draws/).
+---
+ crates/nxhost/src/nvn/draw/exec.rs | 34 +++++++++++++++++++++++
+ crates/nxhost/src/nvn/draw/mod.rs  | 44 +++++++++++++++++++++++++++++-
+ 2 files changed, 77 insertions(+), 1 deletion(-)
+
+diff --git a/crates/nxhost/src/nvn/draw/exec.rs b/crates/nxhost/src/nvn/draw/exec.rs
+index 4de3e4d..e128909 100644
+--- a/crates/nxhost/src/nvn/draw/exec.rs
++++ b/crates/nxhost/src/nvn/draw/exec.rs
+@@ -15,6 +15,9 @@ fn rd<T: Copy>(addr: u64) -> T {
+ impl Replay<'_> {
+     pub(super) fn draw(&mut self, d: &super::Draw) -> Result<(), &'static str> {
+         if d.count == 0 || d.instances == 0 || self.e.st.rasterizer_discard || !self.e.st.render_enable {
++            if !self.e.st.render_enable && super::TRACE_DRAWS.load(Relaxed) {
++                eprintln!("[frame] draw suppressed by conditional rendering: count {} inst {}", d.count, d.instances);
++            }
+             return Ok(());
+         }
+         let st = self.e.st;
+@@ -120,6 +123,37 @@ impl Replay<'_> {
+         if super::TRACE_DRAWS.load(Relaxed) {
+             let attrs: Vec<String> = (0..16).filter(|&i| st.attribs[i] & 0x40 != 0).map(|i| format!("{i}:{}", (st.attribs[i] >> 21) & 0x3FF)).collect();
+             eprintln!("[frame]   attributes {attrs:?}");
++            // SplatNative: streams, indices and the first positions as the guest memory holds them.
++            let streams: Vec<String> = (0..16)
++                .filter(|&s| (0..16).any(|i| st.attribs[i] & 0x40 != 0 && (st.attribs[i] & 0x1F) as usize % 16 == s))
++                .map(|s| format!("{s}: {:#x}+{:#x} stride {} div {}", st.vbufs[s].0, st.vbufs[s].1, st.streams[s].0, st.streams[s].1))
++                .collect();
++            let offsets: Vec<String> = (0..16).filter(|&i| st.attribs[i] & 0x40 != 0).map(|i| format!("{i}@{}:{}", st.attribs[i] & 0x1F, (st.attribs[i] >> 7) & 0x3FFF)).collect();
++            eprintln!("[frame]   streams {streams:?} offsets {offsets:?} index {:?} first {} base_vertex {}", d.index.map(|(t, a)| (t, format!("{a:#x}"))), d.first, d.base_vertex);
++            let a0 = st.attribs[0];
++            if a0 & 0x40 != 0 && (a0 >> 21) & 0x3FF == 34 {
++                let s = (a0 & 0x1F) as usize % 16;
++                let (base, size, stride) = (st.vbufs[s].0, st.vbufs[s].1, st.streams[s].0 as u64);
++                let vids: Vec<i64> = (0..3u64)
++                    .map(|k| {
++                        let i = match d.index {
++                            Some((0, a)) => rd::<u8>(a + d.first as u64 + k) as i64,
++                            Some((1, a)) => rd::<u16>(a + 2 * (d.first as u64 + k)) as i64,
++                            Some((_, a)) => rd::<u32>(a + 4 * (d.first as u64 + k)) as i64,
++                            None => (d.first as u64 + k) as i64,
++                        };
++                        i + d.base_vertex as i64
++                    })
++                    .collect();
++                let pos: Vec<String> = vids
++                    .iter()
++                    .map(|&v| {
++                        let off = v as u64 * stride + ((a0 >> 7) & 0x3FFF) as u64;
++                        if base == 0 || off + 12 > size { format!("v{v}: out of range") } else { format!("v{v}: {:?}", rd::<[f32; 3]>(base + off)) }
++                    })
++                    .collect();
++                eprintln!("[frame]   positions {pos:?}");
++            }
+             let rt: Vec<String> = self.e.colors.iter().map(|c| c.as_ref().and_then(|b| super::textures::TexKey::of(b)).map_or("-".into(), |k| format!("{:#x}/{}/{}x{}", k.addr, k.format, k.width, k.height))).collect();
+             let tex: Vec<String> = bound.iter().map(|(f, b, t, _, _)| format!("{}{b}:{}x{}/{}", if *f { "f" } else { "v" }, t.0.width(), t.0.height(), t.0.pixelFormat().0)).collect();
+             eprintln!(
+diff --git a/crates/nxhost/src/nvn/draw/mod.rs b/crates/nxhost/src/nvn/draw/mod.rs
+index 0fecc64..5af37bf 100644
+--- a/crates/nxhost/src/nvn/draw/mod.rs
++++ b/crates/nxhost/src/nvn/draw/mod.rs
+@@ -339,7 +339,16 @@ impl Replay<'_> {
+                 Cmd::Draw(d) => {
+                     self.e.draws += 1;
+                     self.draws_since_commit += 1;
+-                    if self.draw(d).is_err_and(|e| e.ends_with("compiling")) {
++                    let r = self.draw(d);
++                    if let Err(e) = r
++                        && TRACE_DRAWS.load(Relaxed)
++                    {
++                        eprintln!("[frame] draw failed: {e} (count {} inst {})", d.count, d.instances);
++                    }
++                    if r.is_ok() && TRACE_DRAWS.load(Relaxed) {
++                        self.dump_after_draw();
++                    }
++                    if r.is_err_and(|e| e.ends_with("compiling")) {
+                         self.e.skipped += 1;
+                     }
+                 }
+@@ -387,6 +396,39 @@ impl Replay<'_> {
+         enc.endEncoding();
+     }
+ 
++    /// SplatNative diagnostics: NX_DUMP_EACH_DRAW=WxH saves color target 0 after every traced
++    /// draw into a target of that size (work/frame/draws/NNNN.png), so a broken draw can be found.
++    fn dump_after_draw(&mut self) {
++        static WANT: LazyLock<Option<(u32, u32)>> = LazyLock::new(|| {
++            let v = std::env::var("NX_DUMP_EACH_DRAW").ok()?;
++            let (w, h) = v.split_once('x')?;
++            Some((w.parse().ok()?, h.parse().ok()?))
++        });
++        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++        let Some(want) = *WANT else { return };
++        if self.pass.as_ref().is_none_or(|p| p.size != want) {
++            return;
++        }
++        let Some(b) = self.e.colors.first().cloned().flatten() else { return };
++        let Some((_, t)) = self.e.textures.get(&b, true) else { return };
++        let depth = self.e.depth.clone().and_then(|b| self.e.textures.get(&b, true)).map(|(_, t)| t);
++        let n = N.fetch_add(1, Relaxed);
++        if n >= 1500 {
++            return;
++        }
++        self.end_pass();
++        let Some(next) = gfx::gpu().queue.0.commandBuffer() else { return };
++        let done = std::mem::replace::<Retained<gfx::CommandBuffer>>(&mut self.cb, next);
++        commit(&done);
++        done.waitUntilCompleted();
++        let _ = std::fs::create_dir_all("work/frame/draws");
++        gfx::dump_png(&t.0, &format!("work/frame/draws/{n:04}.png"));
++        if let Some(d) = depth {
++            gfx::dump_png(&d.0, &format!("work/frame/draws/{n:04}_depth.png"));
++        }
++        eprintln!("[frame] draw dump {n:04}");
++    }
++
+     fn end_pass(&mut self) {
+         if let Some(p) = self.pass.take() {
+             p.enc.endEncoding();
+-- 
+2.56.1
+

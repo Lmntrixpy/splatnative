@@ -30,7 +30,7 @@ Status: ✅ erledigt · ⏳ in Arbeit · ⛔ blockiert · ☐ offen
 1. ⏳ `nxhost` mit Splatoon auf macOS starten, Stub-Log auswerten – SDK-Init komplett, `nnMain` läuft,
    Metal-GPU initialisiert, Display/Account/HID-Dienste werden geöffnet, Grafiksystem und
    Audio-Renderer laufen an, Assets laden, **erstes Bild: Erststart-Szene mit UI, 60 fps**
-   (Verlauf: `docs/SPLATOON3_PROFILE.md`, Boot-Protokoll; Mush8-Patches 0006–0036)
+   (Verlauf: `docs/SPLATOON3_PROFILE.md`, Boot-Protokoll; Mush8-Patches 0006–0039)
 2. ⏳ Fehlende Dienste minimal und korrekt implementieren: ISelfController 44, GetInfo 20,
    HID-Seqlock, Audio-Effektstatus v2 erledigt; Address-Arbiter (`SignalToAddress`) wie Horizon
    → sporadischer Lade-Hänger behoben (Patch 0032)
@@ -39,6 +39,8 @@ Status: ✅ erledigt · ⏳ in Arbeit · ⛔ blockiert · ☐ offen
 3a. ✅ NVN-Treiber des Splatoon-SDK: API-Version, Strukturlayouts über Getter (`nvn/abi.rs`),
    SetShadersExt, Textur-/Sampler-Getter
 3. ✅ Erste Frames, Texte/Menüs (Shader-Opcodes `BRX`/`ICMP`/`R2P` ergänzt)
+3b. ⏳ Darstellungsfehler: Compute-Shader, Shared Memory, unausgerichtete Vertex-Attribute behoben (Patch 0037);
+   offen: Beine/Arme der Figur, Shader mit mehr als 16 Texturen
 4. ☐ Pipeline-Liste für Splatoon aufzeichnen (`work/pipelines.tsv`) → AOT
 5. ☐ Savedata, Controller, Audio verifizieren; Hauptmenü erreichen
 

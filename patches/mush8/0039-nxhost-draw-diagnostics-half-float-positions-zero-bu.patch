@@ -1,0 +1,117 @@
+From 4ab9095d14c13b5127438781b3205f85c91db784 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Tue, 24 Nov 2026 00:08:18 +0100
+Subject: [PATCH 39/39] nxhost draw diagnostics: half-float positions,
+ zero-buffer flag, several NX_TRACE_UBO specs, NX_DUMP_DRAW_BUFFERS
+
+The position trace also decodes RGBA16F positions and 8-bit index
+attributes; NX_TRACE_UBO takes several specs separated by ';' and says
+when a binding falls back to the zero buffer; NX_DUMP_DRAW_BUFFERS=vs-hash
+writes a draw's vertex streams, index buffer and stage-0 uniform buffers
+to work/frame/buffers/ for offline analysis.
+---
+ crates/nxhost/src/nvn/draw/exec.rs | 59 ++++++++++++++++++++++++++++--
+ 1 file changed, 55 insertions(+), 4 deletions(-)
+
+diff --git a/crates/nxhost/src/nvn/draw/exec.rs b/crates/nxhost/src/nvn/draw/exec.rs
+index e128909..8d63f8c 100644
+--- a/crates/nxhost/src/nvn/draw/exec.rs
++++ b/crates/nxhost/src/nvn/draw/exec.rs
+@@ -99,6 +99,7 @@ impl Replay<'_> {
+             r.attr_offset[i] = (a >> 7) & 0x3FFF;
+             r.attr_stream[i] = stream as u32;
+         }
++
+         for s in 0..16 {
+             r.vb[s] = if st.vbufs[s].0 != 0 { self.gpu_range(st.vbufs[s].0, st.vbufs[s].1, false) } else { gfx::gpu().zeros.0.gpuAddress() };
+             r.vb_stride[s] = st.streams[s].0;
+@@ -130,8 +131,35 @@ impl Replay<'_> {
+                 .collect();
+             let offsets: Vec<String> = (0..16).filter(|&i| st.attribs[i] & 0x40 != 0).map(|i| format!("{i}@{}:{}", st.attribs[i] & 0x1F, (st.attribs[i] >> 7) & 0x3FFF)).collect();
+             eprintln!("[frame]   streams {streams:?} offsets {offsets:?} index {:?} first {} base_vertex {}", d.index.map(|(t, a)| (t, format!("{a:#x}"))), d.first, d.base_vertex);
++            // NX_DUMP_DRAW_BUFFERS=vs-hash writes that draw's vertex streams, index buffer and
++            // stage-0 uniform buffers to work/frame/buffers/ for offline analysis.
++            if std::env::var("NX_DUMP_DRAW_BUFFERS").is_ok_and(|v| u64::from_str_radix(&v, 16) == Ok(vs.hash)) {
++                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++                let n = N.fetch_add(1, Relaxed);
++                let dir = format!("work/frame/buffers/{n:03}");
++                let _ = std::fs::create_dir_all(&dir);
++                let save = |name: String, addr: u64, size: u64| {
++                    if addr != 0 && size > 0 && size <= 0x100_0000 {
++                        let b = unsafe { std::slice::from_raw_parts(addr as *const u8, size as usize) };
++                        let _ = std::fs::write(format!("{dir}/{name}"), b);
++                    }
++                };
++                for s in 0..16 {
++                    save(format!("stream{s}_stride{}.bin", st.streams[s].0), st.vbufs[s].0, st.vbufs[s].1);
++                }
++                for (i, &(addr, size)) in st.ubos[0].iter().enumerate() {
++                    save(format!("ubo{i}.bin"), addr, size);
++                }
++                if let Some((t, a)) = d.index {
++                    save(format!("index_t{t}_first{}_count{}.bin", d.first, d.count), a, (d.first as u64 + d.count as u64) * [1, 2, 4][t.min(2) as usize]);
++                }
++                let attrs: Vec<String> = (0..16).filter(|&i| st.attribs[i] & 0x40 != 0).map(|i| format!("{i} {} {} {}", st.attribs[i] & 0x1F, (st.attribs[i] >> 7) & 0x3FFF, (st.attribs[i] >> 21) & 0x3FF)).collect();
++                let _ = std::fs::write(format!("{dir}/attribs.txt"), attrs.join("\n"));
++                eprintln!("[frame]   buffers dumped to {dir}");
++            }
+             let a0 = st.attribs[0];
+-            if a0 & 0x40 != 0 && (a0 >> 21) & 0x3FF == 34 {
++            let fmt0 = (a0 >> 21) & 0x3FF;
++            if a0 & 0x40 != 0 && (fmt0 == 34 || fmt0 == 41) {
+                 let s = (a0 & 0x1F) as usize % 16;
+                 let (base, size, stride) = (st.vbufs[s].0, st.vbufs[s].1, st.streams[s].0 as u64);
+                 let vids: Vec<i64> = (0..3u64)
+@@ -149,7 +177,28 @@ impl Replay<'_> {
+                     .iter()
+                     .map(|&v| {
+                         let off = v as u64 * stride + ((a0 >> 7) & 0x3FFF) as u64;
+-                        if base == 0 || off + 12 > size { format!("v{v}: out of range") } else { format!("v{v}: {:?}", rd::<[f32; 3]>(base + off)) }
++                        let raw: Vec<u8> = (0..16).map(|k| rd::<u8>(base + off + k)).collect();
++                        let extra: Vec<String> = (1..16)
++                            .filter(|&i| st.attribs[i] & 0x40 != 0 && (st.attribs[i] >> 21) & 0x3FF == 3)
++                            .map(|i| {
++                                let s = (st.attribs[i] & 0x1F) as usize % 16;
++                                let o = v as u64 * st.streams[s].0 as u64 + ((st.attribs[i] >> 7) & 0x3FFF) as u64;
++                                format!("a{i}={}", if o < st.vbufs[s].1 { rd::<u8>(st.vbufs[s].0 + o) as i64 } else { -1 })
++                            })
++                            .collect();
++                        if base == 0 || off + 12 > size {
++                            format!("v{v}: out of range")
++                        } else if fmt0 == 41 {
++                            let h = |k: usize| {
++                                let b = u16::from_le_bytes([raw[2 * k], raw[2 * k + 1]]) as u32;
++                                let (sign, exp, man) = (b >> 15, (b >> 10) & 0x1f, b & 0x3ff);
++                                let m = if exp == 0 { man as f32 / 1024.0 * 2f32.powi(-14) } else { (1.0 + man as f32 / 1024.0) * 2f32.powi(exp as i32 - 15) };
++                                if sign != 0 { -m } else { m }
++                            };
++                            format!("v{v}: [{}, {}, {}, {}] {extra:?}", h(0), h(1), h(2), h(3))
++                        } else {
++                            format!("v{v}: {:?}", rd::<[f32; 3]>(base + off))
++                        }
+                     })
+                     .collect();
+                 eprintln!("[frame]   positions {pos:?}");
+@@ -160,7 +209,7 @@ impl Replay<'_> {
+                 "[frame] draw rt {rt:?} vs {:016x} fs {:016x} poly {:#x} mode {} count {} inst {} vp {:?} sc {:?} ds {:#x} cs {:#x} mask {:#x} tex {tex:?}",
+                 vs.hash, fs.hash, st.polygon, d.mode, d.count, d.instances, st.viewport, st.scissor, st.depth_stencil, st.color_state, st.channel_mask
+             );
+-            if let Ok(spec) = std::env::var("NX_TRACE_UBO") {
++            for spec in std::env::var("NX_TRACE_UBO").ok().iter().flat_map(|v| v.split(';').map(str::to_string).collect::<Vec<_>>()) {
+                 // NX_TRACE_UBO=stage:index:first:count[:vs-hash] (32-bit words), e.g. 0:0:16:12
+                 let parts: Vec<&str> = spec.split(':').collect();
+                 let f: Vec<usize> = parts.iter().take(4).filter_map(|v| v.parse().ok()).collect();
+@@ -174,7 +223,9 @@ impl Replay<'_> {
+                     let words: Vec<String> = (first..first + count)
+                         .map(|i| if src == 0 || (4 * i as u64) >= size.max(0x10000) { "-".into() } else { format!("{:.4}", f32::from_bits(unsafe { ((src + 4 * i as u64) as *const u32).read_unaligned() })) })
+                         .collect();
+-                    eprintln!("[frame]   ubo {stage}:{index} {addr:#x}+{size:#x} [{first}..] {}", words.join(" "));
++                    let gpu = if addr == 0 { 0 } else { self.gpu_range(addr, size, true) };
++                    let zero = gpu == gfx::gpu().zeros.0.gpuAddress();
++                    eprintln!("[frame]   ubo {stage}:{index} {addr:#x}+{size:#x} gpu {gpu:#x}{} [{first}..] {}", if zero { " (ZERO BUFFER)" } else { "" }, words.join(" "));
+                 }
+             }
+         }
+-- 
+2.56.1
+
