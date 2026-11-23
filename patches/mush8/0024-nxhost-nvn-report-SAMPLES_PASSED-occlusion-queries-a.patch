@@ -1,0 +1,68 @@
+From 68acb20be28fad175076fbcac4bc60e72b8804dc Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 06:27:36 +0100
+Subject: [PATCH 24/25] nxhost nvn: report SAMPLES_PASSED occlusion queries as
+ visible
+
+Counter type 1 (SAMPLES_PASSED) was written as 0. Nothing here measures
+occlusion and SetRenderEnableConditional is treated as always enabled, so
+every query now reports u32::MAX samples (visible), consistent with that.
+NX_NVN_LOG logs the first use of each counter type (Splatoon 3: 0, 1, 16).
+---
+ crates/nxhost/src/nvn/cmd.rs      |  9 +++++++++
+ crates/nxhost/src/nvn/draw/mod.rs | 12 +++++++++++-
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/crates/nxhost/src/nvn/cmd.rs b/crates/nxhost/src/nvn/cmd.rs
+index 8de87a5..012b4fa 100644
+--- a/crates/nxhost/src/nvn/cmd.rs
++++ b/crates/nxhost/src/nvn/cmd.rs
+@@ -335,6 +335,15 @@ pub fn host_impl(name: &str) -> Option<fn(&Args) -> u64> {
+             0
+         },
+         "nvnCommandBufferReportCounter" => |a| {
++            if std::env::var_os("NX_NVN_LOG").is_some() {
++                static SEEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
++                let mut seen = SEEN.lock().unwrap();
++                let bit = 1u64 << (a.0[1] as u32).min(63);
++                if *seen & bit == 0 {
++                    *seen |= bit;
++                    eprintln!("[nvn] ReportCounter type {} first used (addr {:#x})", a.0[1] as u32, a.0[2]);
++                }
++            }
+             push(a.0[0], Cmd::ReportCounter { counter: a.0[1] as u32, addr: a.0[2] });
+             0
+         },
+diff --git a/crates/nxhost/src/nvn/draw/mod.rs b/crates/nxhost/src/nvn/draw/mod.rs
+index eb96d09..206e973 100644
+--- a/crates/nxhost/src/nvn/draw/mod.rs
++++ b/crates/nxhost/src/nvn/draw/mod.rs
+@@ -233,7 +233,14 @@ impl Replay<'_> {
+                 Cmd::ReportCounter { counter, addr } => {
+                     static T0: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+                     let ns = T0.elapsed().as_nanos() as u64;
+-                    let value = if matches!(*counter, 0 | 16) { ns } else { 0 };
++                    // SplatNative: SAMPLES_PASSED (1) is an occlusion query. Nothing here measures
++                    // occlusion and conditional rendering is always enabled, so report every
++                    // query as visible; 0 made Splatoon 3's occlusion culling drop its whole scene.
++                    let value = match *counter {
++                        0 | 16 => ns,
++                        COUNTER_SAMPLES_PASSED => SAMPLES_PASSED_VISIBLE,
++                        _ => 0,
++                    };
+                     if *addr != 0 {
+                         unsafe {
+                             (*addr as *mut u64).write_unaligned(value);
+@@ -877,6 +884,9 @@ fn commit(cb: &gfx::CommandBuffer) {
+     cb.commit();
+ }
+ 
++const COUNTER_SAMPLES_PASSED: u32 = 1;
++const SAMPLES_PASSED_VISIBLE: u64 = u32::MAX as u64;
++
+ static FPS: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NX_FPS").is_some());
+ static GPU_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ 
+-- 
+2.56.1
+

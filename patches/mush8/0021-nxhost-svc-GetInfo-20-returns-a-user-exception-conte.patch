@@ -1,7 +1,7 @@
 From b3e432ccebcfe4c6753601ec8606b024b1376ccb Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 05:36:00 +0100
-Subject: [PATCH 21/22] nxhost svc: GetInfo 20 returns a user exception context
+Subject: [PATCH 21/25] nxhost svc: GetInfo 20 returns a user exception context
 
 Like Horizon, one 0x200-byte thread-local-region slot, allocated on first
 use. nn::os::SetDyingMessageRegion writes +0x1c0 of it; with 0 it crashed.

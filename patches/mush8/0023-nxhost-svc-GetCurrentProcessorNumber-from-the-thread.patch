@@ -1,0 +1,73 @@
+From b0d3df2075397d4d0eaa0482f56dff350a89e621 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 06:27:36 +0100
+Subject: [PATCH 23/25] nxhost svc: GetCurrentProcessorNumber from the thread's
+ affinity
+
+Always answering core 0 deadlocked Splatoon 3 before its first frame: its
+job system (main+0x4ad6ca0) hands a job to the worker whose affinity mask
+is 1 << current core and waits for it, which picked another worker that
+was itself waiting. Horizon runs a thread only on cores in its mask, so a
+pinned thread reports its core; otherwise the ideal core if allowed, else
+the lowest core of the mask. With this the game loads its assets, builds
+its render pipeline and presents at 60 fps.
+---
+ crates/nxhost/src/svc.rs | 30 +++++++++++++++++++++++++++++-
+ 1 file changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/crates/nxhost/src/svc.rs b/crates/nxhost/src/svc.rs
+index 22cc9e7..e20c9ff 100644
+--- a/crates/nxhost/src/svc.rs
++++ b/crates/nxhost/src/svc.rs
+@@ -145,8 +145,14 @@ fn dispatch_inner(f: &mut Frame) {
+             }
+             None => rc::INVALID_HANDLE,
+         },
++        // SplatNative: GetCurrentProcessorNumber. Horizon runs a thread only on cores in its
++        // affinity mask, so a thread pinned to one core always reports that core. Answering 0
++        // for every thread made the Splatoon 3 job system (main+0x4ad6ca0: hand the job to the
++        // worker whose mask is 1 << current core, then wait for it) wait on another worker
++        // that was itself waiting, before the first frame. The ideal core is reported when the
++        // mask allows it, otherwise the lowest core in the mask.
+         0x10 => {
+-            f.x[0] = 0;
++            f.x[0] = kernel::thread(guest::current().handle).map_or(0, |t| reported_core(t.core.load(Relaxed), t.affinity.load(Relaxed)));
+             return;
+         }
+         0x11 | 0x12 | 0x17 => {
+@@ -377,6 +383,14 @@ fn send_sync_request(h: u32, buf: u64, size: usize) -> u32 {
+     rc::OK
+ }
+ 
++fn reported_core(ideal: i32, affinity: u64) -> u64 {
++    match ideal {
++        0..=63 if affinity & (1 << ideal) != 0 => ideal as u64,
++        _ if affinity != 0 => affinity.trailing_zeros() as u64,
++        _ => 0,
++    }
++}
++
+ fn get_info(f: &mut Frame, id0: u32, handle: u32, id1: u64) -> u32 {
+     let a = kernel::aspace();
+     let v = match id0 {
+@@ -419,3 +433,17 @@ fn get_info(f: &mut Frame, id0: u32, handle: u32, id1: u64) -> u32 {
+ fn getrandom(b: &mut [u8]) -> bool {
+     unsafe { libc::getentropy(b.as_mut_ptr() as *mut _, b.len()) == 0 }
+ }
++
++#[cfg(test)]
++mod core_tests {
++    use super::reported_core;
++
++    #[test]
++    fn pinned_threads_report_their_core() {
++        assert_eq!(reported_core(2, 0b0100), 2);
++        assert_eq!(reported_core(0, 0b1000), 3);
++        assert_eq!(reported_core(-2, 0b0110), 1);
++        assert_eq!(reported_core(1, 0b0111), 1);
++        assert_eq!(reported_core(-1, 0), 0);
++    }
++}
+-- 
+2.56.1
+

@@ -98,22 +98,34 @@ Jeder Lauf ist auf 120–150 s begrenzt; Logs in `work/runN.log`.
 | 22 | Audio-Renderer REV15 | `RequestUpdateAudioRenderer` 0x5299 | Patch 0020: Effekt-Status v2 (0x90) ab REV9 |
 | 23 | bcat, nifm | SIGSEGV in `nn::os::SetDyingMessageRegion` | Patch 0021: GetInfo 20 (User-Exception-Context) |
 | 24–26 | Kein Absturz mehr; Hauptthread pollt Eingaben | Endlosschleife in `nn::hid::detail::GetNpadStates`/`GetSixAxisSensorStates` | Patch 0022: Seqlock-Stempel in den HID-Lifos |
-| 27 | Command-Buffer werden aufgezeichnet, Textur-/Sampler-Getter echt | Hauptthread wartet dauerhaft (`WaitLightEvent`) im Job-System des Spiels, noch kein Present | offen, siehe unten |
+| 27 | Command-Buffer werden aufgezeichnet, Textur-/Sampler-Getter echt | Hauptthread wartet dauerhaft (`WaitLightEvent`) im Job-System | Ursache: `GetCurrentProcessorNumber` lieferte für jeden Thread Kern 0 |
+| 28–39 | **Assets laden (972 Texturen, ~2,5 GB), 3D-Renderpipeline läuft (Schatten, HDR, Blur), 60 fps Present** | Ausgabe schwarz | Patch 0023 (Kern aus Affinität), 0024 (Occlusion-Queries „sichtbar“), 0025 (Diagnose); Bild offen, siehe unten |
 
 ### Gelöst: Befund aus Lauf 15
 Der Schreiber `main+0x4529ca8` liegt in der Grafik-Initialisierung hinter der Prüfung
 `nvnDeviceGetInteger(API_MAJOR) == 55 && API_MINOR >= 15` (main+0x4529bf4). Mush8 lieferte die
 Werte des MK8-Treibers; der Splatoon-Treiber meldet 55/15.
 
-### Offener Befund (Lauf 27)
-- Kein Absturz, ~1 GB Gastspeicher; Command-Buffer werden aufgezeichnet, aber noch kein
-  `nvnQueuePresentTexture` (kein Frame in `work/frame/` mit `NX_DUMP_AT`).
-- Hauptthread: `nnMain+0x688` → … → main+0x4ad1ebc `nn::os::WaitLightEvent` in einer
-  Job-Warteschleife (main+0x4ad1e20). Worker 0x6d führt einen Job (main+0x4cd6898) aus, der
-  selbst auf eine Job-Gruppe wartet (main+0x4ad6ca0); 0x6e/0x6f warten ebenfalls im Job-System.
-- Host-Seite geprüft: kein Deadlock, Adress-Arbiter (Signal-Typen 0–2) entspricht Horizon.
-- Nächster Schritt: herausfinden, welche externe Fertigmeldung (GPU-Sync, Datei, Dienst-Event)
-  der innerste Job erwartet.
+### Gelöst: Befund aus Lauf 27
+Das Job-System (main+0x4ad6ca0) übergibt Jobs an den Worker mit Affinitätsmaske `1 << aktueller Kern`
+und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen selbst wartenden Worker.
+
+### Offener Befund (Läufe 32–39): schwarzes Bild
+- Gemessen mit `NX_DUMP_RT_AT`/`NX_TRACE_AT` (Render-Targets eines Frames) und einem PNG-Auswerter:
+  Texturen der Spieldaten sind korrekt dekodiert; Tiefen-Prepass (`LESS`, Maske 0) und Farbpass
+  (`EQUAL`) laufen, 3D-Szene mit ~480 Draws; der HDR-Puffer (R11G11B10F, 960×540) bleibt aber 0.
+- Ausgeschlossen: Zustandskodierung (Blend/ChannelMask/DepthStencil/Polygon/VertexAttrib stimmt mit dem
+  Treiber überein), fehlgeschlagene Shader (keiner der Draws nutzt einen), Tiefen-Gleichheit
+  (Experiment `EQUAL`→`LEQUAL` ändert nichts), Occlusion-Queries (Patch 0024), Dump-Format.
+- Nächste Kandidaten: Uniform-/Konstantenpuffer-Inhalte (UpdateUniformBuffer, 760k Aufrufe/90 s),
+  Speicher-Pool-Adressierung der Splatoon-Puffer, Shader-Übersetzung von Bindless-Zugriffen.
+
+### Sporadisch: Lade-Hänger im Datei-Cache
+- In ~2 von 8 Läufen bleibt der Ladethread in `FileDataCacheSystem::ReserveFreePagesByGatherCompaction`
+  (Cache 1 MiB = 63 Seiten à 16 KiB, Anfrage bis 57 Seiten). Mit `NX_PROBE` gemessen: alle
+  Reservierungen werden committet, Wartepfad wird normalerweise wieder geweckt. Ursache des seltenen
+  Dauerwartens noch offen (Kandidat: Wake/Scheduling im Host).
 
 ### Bekannt offen (nicht blockierend)
+- Shader-Übersetzung: `Brx`, `R2p`, `IcmpI/IcmpC` fehlen in nxshader (≈25 Shader, nicht in den gemessenen Draws).
 - Audio REV15: Voice-Eingabe ist 0x188 statt 0x170 Byte pro Voice; Mush8s Parser nimmt 0x170.

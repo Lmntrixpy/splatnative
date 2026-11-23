@@ -1,0 +1,196 @@
+From 45a8de6cdf172b1cb6df88a3a77cb00c98ab4cae Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 06:27:36 +0100
+Subject: [PATCH 25/25] nxhost diag: non-fatal probes, register memory dumps,
+ fuller traces
+
+- NX_PROBE=module+off,...: log registers each time an instruction runs and
+  continue (brk, restore, re-arm on the next instruction); NX_PROBE_MAX,
+  NX_PROBE_BT.
+- NX_DUMP_REGS=x19:0x80,...: hex-dump guest memory at registers in probe
+  and fatal reports.
+- NX_BRK no longer required for the probe setup; NX_TRACE_SYMS prints six
+  arguments; NX_EXIT_AT prints the NVN call summary.
+---
+ crates/nxhost/src/diag.rs    | 95 ++++++++++++++++++++++++++++++++++++
+ crates/nxhost/src/gfx/mod.rs |  1 +
+ crates/nxhost/src/loader.rs  | 17 ++++++-
+ 3 files changed, 111 insertions(+), 2 deletions(-)
+
+diff --git a/crates/nxhost/src/diag.rs b/crates/nxhost/src/diag.rs
+index 3b55567..cabcd72 100644
+--- a/crates/nxhost/src/diag.rs
++++ b/crates/nxhost/src/diag.rs
+@@ -69,6 +69,97 @@ pub fn backtrace_lines(mut fp: u64) -> Vec<String> {
+     out
+ }
+ 
++/// SplatNative: NX_DUMP_REGS="x19:0x80,x0:0x40" hex-dumps guest memory at those registers in a
++/// fatal report (e.g. at an NX_BRK breakpoint), when the range is mapped readable.
++fn dump_register_memory(x: &[u64; 29]) {
++    let Ok(spec) = std::env::var("NX_DUMP_REGS") else { return };
++    for item in spec.split(',') {
++        let Some((reg, len)) = item.trim().split_once(':') else { continue };
++        let (Some(r), Ok(len)) = (reg.trim_start_matches('x').parse::<usize>().ok().filter(|&r| r < 29), u64::from_str_radix(len.trim_start_matches("0x"), 16)) else { continue };
++        let addr = x[r];
++        if !crate::kernel::aspace().readable(addr, len) {
++            eprintln!("        x{r} -> {addr:#x}: not readable");
++            continue;
++        }
++        for off in (0..len).step_by(16) {
++            let words: Vec<String> = (0..4).map(|k| format!("{:08x}", unsafe { ((addr + off + 4 * k) as *const u32).read_unaligned() })).collect();
++            eprintln!("        x{r}+{off:#05x}: {}", words.join(" "));
++        }
++    }
++}
++
++// SplatNative: non-fatal probes. A probe is `brk #(PROBE_BASE + i)` at its address; when it
++// traps, the original instruction is put back, `brk #(REARM_BASE + i)` replaces the next
++// instruction, and execution resumes at the original one. The re-arm trap restores the next
++// instruction and sets the probe again. Not for addresses whose instruction is a branch.
++const PROBE_BASE: u32 = 0x100;
++const REARM_BASE: u32 = 0x180;
++
++struct Probe {
++    addr: u64,
++    orig: u32,
++    next: u32,
++    hits: std::sync::atomic::AtomicU32,
++}
++
++static PROBES: OnceLock<Vec<Probe>> = OnceLock::new();
++
++fn patch_word(addr: u64, word: u32) {
++    let page = addr & !(crate::mem::PAGE - 1);
++    let _ = crate::mem::protect(page, crate::mem::PAGE, crate::mem::perm::RW);
++    unsafe { (addr as *mut u32).write_volatile(word) };
++    let _ = crate::mem::protect(page, crate::mem::PAGE, crate::mem::perm::RX);
++    unsafe extern "C" {
++        fn sys_icache_invalidate(start: *mut libc::c_void, len: usize);
++    }
++    unsafe { sys_icache_invalidate(addr as *mut _, 4) };
++}
++
++fn brk(imm: u32) -> u32 {
++    0xD420_0000 | (imm & 0xFFFF) << 5
++}
++
++pub fn arm_probes(addrs: &[u64]) {
++    let probes = addrs
++        .iter()
++        .map(|&a| Probe { addr: a, orig: unsafe { *(a as *const u32) }, next: unsafe { *((a + 4) as *const u32) }, hits: 0.into() })
++        .collect();
++    let probes = PROBES.get_or_init(|| probes);
++    for (i, p) in probes.iter().enumerate() {
++        patch_word(p.addr, brk(PROBE_BASE + i as u32));
++    }
++}
++
++/// Handles a probe or re-arm trap; false if the trap is not one of ours.
++fn handle_probe(pc: u64, x: &[u64; 29], lr: u64, fp: u64) -> bool {
++    let Some(probes) = PROBES.get() else { return false };
++    let imm = (unsafe { *(pc as *const u32) } >> 5) & 0xFFFF;
++    if (PROBE_BASE..REARM_BASE).contains(&imm) {
++        let Some(p) = probes.get((imm - PROBE_BASE) as usize).filter(|p| p.addr == pc) else { return false };
++        let n = p.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        static MAX: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| std::env::var("NX_PROBE_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(200));
++        if n < *MAX {
++            let t = crate::guest::current().handle;
++            eprintln!("[probe] #{} hit {n} at {} lr={} thread {t:#x}", imm - PROBE_BASE, symbolize(pc), symbolize(lr));
++            eprintln!("        x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x19={:#x} x20={:#x}", x[0], x[1], x[2], x[3], x[4], x[19], x[20]);
++            dump_register_memory(x);
++            if std::env::var_os("NX_PROBE_BT").is_some() {
++                backtrace(fp);
++            }
++        }
++        patch_word(p.addr + 4, brk(REARM_BASE + imm - PROBE_BASE));
++        patch_word(p.addr, p.orig);
++        return true;
++    }
++    if (REARM_BASE..REARM_BASE + 0x80).contains(&imm) {
++        let Some(p) = probes.get((imm - REARM_BASE) as usize).filter(|p| p.addr + 4 == pc) else { return false };
++        patch_word(pc, p.next);
++        patch_word(p.addr, brk(PROBE_BASE + imm - REARM_BASE));
++        return true;
++    }
++    false
++}
++
+ pub fn report_and_exit(msg: &str) -> ! {
+     eprintln!("[fatal] {msg}");
+     crate::nvn::summary();
+@@ -87,6 +178,9 @@ extern "C" fn on_signal(sig: i32, info: *mut libc::siginfo_t, uc: *mut libc::c_v
+             disarm_current();
+             return;
+         }
++        if sig == libc::SIGTRAP && handle_probe(ss.__pc, &ss.__x, ss.__lr, ss.__fp) {
++            return;
++        }
+         eprintln!(
+             "[fatal] signal {sig} at pc={} lr={} fault_addr={:#x}",
+             symbolize(ss.__pc),
+@@ -101,6 +195,7 @@ extern "C" fn on_signal(sig: i32, info: *mut libc::siginfo_t, uc: *mut libc::c_v
+             eprintln!("        {line}");
+         }
+         eprintln!("        fp={:#x} sp={:#x}", ss.__fp, ss.__sp);
++        dump_register_memory(&ss.__x);
+         crate::kernel::describe_current_thread();
+         backtrace(ss.__fp);
+         crate::nvn::summary();
+diff --git a/crates/nxhost/src/gfx/mod.rs b/crates/nxhost/src/gfx/mod.rs
+index ca6ba0f..92cf0a8 100644
+--- a/crates/nxhost/src/gfx/mod.rs
++++ b/crates/nxhost/src/gfx/mod.rs
+@@ -800,6 +800,7 @@ fn next_frame() -> bool {
+     }
+     if EXIT.is_some_and(|e| t >= e) {
+         eprintln!("[host] NX_EXIT_AT reached");
++        crate::nvn::summary();
+         std::process::exit(0);
+     }
+     TURBO_UNTIL.is_some_and(|u| t < u)
+diff --git a/crates/nxhost/src/loader.rs b/crates/nxhost/src/loader.rs
+index d1b7ec9..a12fff3 100644
+--- a/crates/nxhost/src/loader.rs
++++ b/crates/nxhost/src/loader.rs
+@@ -53,7 +53,7 @@ fn traced(idx: u64, a: &crate::stubs::Args) -> u64 {
+     let (name, real) = TRACED.lock().unwrap()[idx as usize].clone();
+     let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(real as usize) };
+     let r = f(a.0[0], a.0[1], a.0[2], a.0[3], a.0[4], a.0[5], a.0[6], a.0[7]);
+-    eprintln!("[trace] {name}({:#x}, {:#x}, {:#x}, {:#x}) -> {r:#x}", a.0[0], a.0[1], a.0[2], a.0[3]);
++    eprintln!("[trace] {name}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) -> {r:#x}", a.0[0], a.0[1], a.0[2], a.0[3], a.0[4], a.0[5]);
+     if std::env::var_os("NX_TRACE_SYMS_BT").is_some() {
+         let (fp, lr) = unsafe { (*(a as *const _ as *const u64).sub(2), *(a as *const _ as *const u64).sub(1)) };
+         eprintln!("        at {}", crate::diag::symbolize(lr));
+@@ -265,7 +265,7 @@ fn net_mode() -> u8 {
+ }
+ 
+ fn debug_breakpoints(mods: &[Module]) -> Result<()> {
+-    let Ok(list) = std::env::var("NX_BRK") else { return Ok(()) };
++    let list = std::env::var("NX_BRK").unwrap_or_default();
+     for (i, spec) in list.split(',').filter(|s| !s.is_empty()).enumerate() {
+         let (name, off) = spec.trim().split_once('+').with_context(|| format!("NX_BRK: {spec}: expected module+offset"))?;
+         let off = u64::from_str_radix(off.trim_start_matches("0x"), 16).with_context(|| format!("NX_BRK: {spec}"))?;
+@@ -278,6 +278,19 @@ fn debug_breakpoints(mods: &[Module]) -> Result<()> {
+         icache_flush(page, PAGE);
+         eprintln!("[loader] NX_BRK #{i} at {spec}");
+     }
++    // SplatNative: NX_PROBE=module+offset,... logs registers (and NX_DUMP_REGS memory) each
++    // time the instruction runs, then continues (diag.rs).
++    if let Ok(list) = std::env::var("NX_PROBE") {
++        let mut addrs = Vec::new();
++        for spec in list.split(',').filter(|s| !s.is_empty()) {
++            let (name, off) = spec.trim().split_once('+').with_context(|| format!("NX_PROBE: {spec}: expected module+offset"))?;
++            let off = u64::from_str_radix(off.trim_start_matches("0x"), 16).with_context(|| format!("NX_PROBE: {spec}"))?;
++            let m = mods.iter().find(|m| m.name == name).with_context(|| format!("NX_PROBE: no module {name}"))?;
++            addrs.push(m.base + off);
++            eprintln!("[loader] NX_PROBE #{} at {spec}", addrs.len() - 1);
++        }
++        crate::diag::arm_probes(&addrs);
++    }
+     Ok(())
+ }
+ 
+-- 
+2.56.1
+
