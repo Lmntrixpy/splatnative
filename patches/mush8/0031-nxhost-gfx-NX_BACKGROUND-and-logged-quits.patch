@@ -1,0 +1,82 @@
+From 673d1810e98923f1bdddecac959950a33c94ae7b Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 10:51:11 +0100
+Subject: [PATCH 31/31] nxhost gfx: NX_BACKGROUND and logged quits
+
+NX_BACKGROUND=1 opens the window behind others without activating the
+app, so automated runs do not take keyboard focus. Cmd-Q/W, closing the
+window and the end of the run loop now say so before exiting; they were
+silent.
+---
+ crates/nxhost/src/gfx/mod.rs | 27 +++++++++++++++++++++++----
+ 1 file changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/crates/nxhost/src/gfx/mod.rs b/crates/nxhost/src/gfx/mod.rs
+index 92cf0a8..c1c57f7 100644
+--- a/crates/nxhost/src/gfx/mod.rs
++++ b/crates/nxhost/src/gfx/mod.rs
+@@ -353,7 +353,13 @@ pub fn run_app(title: &str, width: f64, height: f64) -> ! {
+     window.center();
+     overlay::set_game_window(&window);
+     window.setCollectionBehavior(objc2_app_kit::NSWindowCollectionBehavior::FullScreenPrimary);
+-    window.makeKeyAndOrderFront(None);
++    // SplatNative: NX_BACKGROUND=1 (automated runs) opens the window behind the others without
++    // activating the app, so it does not take keyboard focus from the user.
++    if background() {
++        window.orderBack(None);
++    } else {
++        window.makeKeyAndOrderFront(None);
++    }
+     if std::env::var_os("NX_WINDOWED").is_none() {
+         window.toggleFullScreen(None);
+     }
+@@ -362,14 +368,20 @@ pub fn run_app(title: &str, width: f64, height: f64) -> ! {
+         let ev = unsafe { e.as_ref() };
+         if ev.modifierFlags().contains(objc2_app_kit::NSEventModifierFlags::Command) && ev.r#type() == objc2_app_kit::NSEventType::KeyDown {
+             match ev.charactersIgnoringModifiers().map(|c| c.to_string().to_lowercase()).as_deref() {
+-                Some("q" | "w") => std::process::exit(0),
++                Some("q" | "w") => {
++                    eprintln!("[host] quit by Cmd-Q/W");
++                    std::process::exit(0)
++                }
+                 Some("f") if !ev.isARepeat() => win.toggleFullScreen(None),
+                 _ => {}
+             }
+         }
+         if keyboard::typing() { e.as_ptr() } else { std::ptr::null_mut() }
+     });
+-    let close = block2::RcBlock::new(|_: std::ptr::NonNull<objc2_foundation::NSNotification>| std::process::exit(0));
++    let close = block2::RcBlock::new(|_: std::ptr::NonNull<objc2_foundation::NSNotification>| {
++        eprintln!("[host] window closed");
++        std::process::exit(0)
++    });
+     let observer = unsafe {
+         objc2_foundation::NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+             Some(objc2_app_kit::NSWindowWillCloseNotification),
+@@ -395,8 +407,11 @@ pub fn run_app(title: &str, width: f64, height: f64) -> ! {
+     };
+     std::mem::forget(monitor);
+     #[allow(deprecated)]
+-    app.activateIgnoringOtherApps(true);
++    if !background() {
++        app.activateIgnoringOtherApps(true);
++    }
+     app.run();
++    eprintln!("[host] app run loop ended");
+     std::process::exit(0)
+ }
+ 
+@@ -783,6 +798,10 @@ fn env_secs(k: &str) -> Option<f32> {
+     std::env::var(k).ok().and_then(|v| v.parse().ok())
+ }
+ 
++fn background() -> bool {
++    std::env::var("NX_BACKGROUND").is_ok_and(|v| v == "1")
++}
++
+ pub fn clock() -> f32 {
+     if TURBO_UNTIL.is_some() { FRAMES.load(std::sync::atomic::Ordering::Relaxed) as f32 / 60.0 } else { START.elapsed().as_secs_f32() }
+ }
+-- 
+2.56.1
+

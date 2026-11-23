@@ -102,6 +102,7 @@ Jeder Lauf ist auf 120–150 s begrenzt; Logs in `work/runN.log`.
 | 28–39 | **Assets laden (972 Texturen, ~2,5 GB), 3D-Renderpipeline läuft (Schatten, HDR, Blur), 60 fps Present** | Ausgabe schwarz | Patch 0023 (Kern aus Affinität), 0024 (Occlusion-Queries „sichtbar“), 0025 (Diagnose); Bild offen, siehe unten |
 | 40–56 | **Erstes Bild: 3D-Szene des Erststart-Bildschirms mit UI, 60 fps** | wartet auf Eingabe | Patch 0026: Zähler-Reports wie der Treiber (Zeitstempel nur im Zeitstempel-Feld), bedingtes Rendern ausgewertet, Clears mit Scissor/Kanalmaske |
 | 57–64 | Eingabe per `NX_AUTOINPUT` wirkt; **Texte und Menüs sichtbar** („Wähle einen Style!“) | — | Patch 0027: nxshader übersetzt `BRX`, `ICMP`, `R2P` (≈25 Programme, u. a. Layout-Text); 0028 `NX_TRACE_UBO` |
+| 65–71 | **Style gewählt, Charakter erstellt, Spielstand geschrieben; spielbares Tutorial** (Laufen, Schwimmen, Schießen per Skript) | Tutorial-Parcours braucht gezielte Steuerung | Patch 0029 `LEA.HI`; 0030 Halten/Stick in `NX_AUTOINPUT`; 0031 `NX_BACKGROUND`, protokollierte Beenden-Pfade |
 
 ### Gelöst: Befund aus Lauf 15
 Der Schreiber `main+0x4529ca8` liegt in der Grafik-Initialisierung hinter der Prüfung
@@ -127,7 +128,8 @@ und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen 
 - Vermeintlicher UI-Skalierungsfehler geklärt: die schrägen Tafeln links oben sind das Layout des Spiels
   (Positionen aus den Konstantenpuffern nachgerechnet); es fehlten Texte, weil ihre Shader `BRX`/`ICMP`/`R2P`
   enthielten (Patch 0027).
-- Nächster Schritt: Erststart-Ablauf (Style, Charaktererstellung, Einführung) per Eingabe bis zum Hauptmenü.
+- Stand Lauf 71: Speicherdaten vorhanden (`work/save-0100c2500fc20000`), das Spiel startet im Tutorial.
+  Nächster Schritt: Tutorial durchspielen (manuell oder per Skript) bis zur Stadt/zum Hauptmenü.
 
 ### Sporadisch: Lade-Hänger im Datei-Cache
 - In ~2 von 8 Läufen bleibt der Ladethread in `FileDataCacheSystem::ReserveFreePagesByGatherCompaction`

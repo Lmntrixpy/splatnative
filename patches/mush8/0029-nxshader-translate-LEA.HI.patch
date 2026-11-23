@@ -1,0 +1,46 @@
+From da408dba9ab22eb7e738d189bde702998365f5b1 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 10:32:23 +0100
+Subject: [PATCH 29/31] nxshader: translate LEA.HI
+
+Rd = base + low32(((Rc:Ra), negated with .NEG) >> (32 - scale)), base Rb
+or a constant. Three Splatoon 3 tutorial shaders use it for addresses; the
+.X carry, CC and predicate-output forms are rejected explicitly.
+---
+ crates/nxshader/src/msl.rs | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/crates/nxshader/src/msl.rs b/crates/nxshader/src/msl.rs
+index 71f3fab..32dd498 100644
+--- a/crates/nxshader/src/msl.rs
++++ b/crates/nxshader/src/msl.rs
+@@ -672,6 +672,26 @@ impl<'a> Gen<'a> {
+                 self.setp(dpi, format!("bop({bop}u, !c, {p})"));
+                 self.line("}");
+             }
++            // SplatNative: LEA.HI Rd = base + low32(((Rc:Ra), negated if .NEG) >> (32 - scale)),
++            // base Rb or a constant; the .X carry, CC and predicate-output forms are rejected.
++            Op::LeaHiR | Op::LeaHiC => {
++                let (d, lo, hi, base, scale, neg, x, cc, dp) = match i.op {
++                    Op::LeaHiR => {
++                        let o = op!(InstLeaHiR);
++                        (o.dest(), self.r(o.src_a()), self.r(o.src_c()), self.r(o.src_b()), o.imm_u5(), o.neg_a(), o.x(), o.write_cc(), o.dest_pred())
++                    }
++                    _ => {
++                        let o = op!(InstLeaHiC);
++                        (o.dest(), self.r(o.src_a()), self.r(o.src_c()), self.cb(o.cbuf_slot(), o.cbuf_offset()), o.imm_u5(), o.neg_a(), o.x(), o.write_cc(), o.dest_pred())
++                    }
++                };
++                if x || cc || dp != 7 {
++                    bail!("LEA.HI with carry, CC or predicate output at {:#x}", i.addr);
++                }
++                let off = format!("((ulong({hi}) << 32) | ulong({lo}))");
++                let off = if neg { format!("(0ul - {off})") } else { off };
++                self.set(d, format!("({base} + uint({off} >> {}u))", 32 - scale));
++            }
+             // SplatNative: ICMP Rd = (Rc <cmp> 0) ? Ra : Rb.
+             Op::IcmpR | Op::IcmpI | Op::IcmpC => {
+                 let (d, a, b, c, cmp, sg) = match i.op {
+-- 
+2.56.1
+

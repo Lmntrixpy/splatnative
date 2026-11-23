@@ -1,0 +1,92 @@
+From 618e4d191dc6078d73fa21b548ec79f4b251bb45 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 10:51:11 +0100
+Subject: [PATCH 30/31] nxhost input: held buttons and stick directions in
+ NX_AUTOINPUT
+
+NX_AUTOINPUT="t:NAME[*seconds][@player],..." now takes a hold duration
+(default 0.15 s as before) and stick directions LUP/LDOWN/LLEFT/LRIGHT,
+RUP/RDOWN/RLEFT/RRIGHT, for scripted runs through Splatoon 3's tutorial.
+---
+ crates/nxhost/src/input.rs | 48 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/crates/nxhost/src/input.rs b/crates/nxhost/src/input.rs
+index 4469ae4..a5ea8f3 100644
+--- a/crates/nxhost/src/input.rs
++++ b/crates/nxhost/src/input.rs
+@@ -23,20 +23,57 @@ const STICK_DIRS: u32 = 16;
+ 
+ const STICK_MAX: f32 = 32767.0;
+ 
+-fn scripted(player: usize) -> u64 {
+-    static SCRIPT: std::sync::LazyLock<Vec<(f32, u64, usize)>> = std::sync::LazyLock::new(|| {
++/// NX_AUTOINPUT="t:NAME[*seconds][@player],...": NAME is a button (A, B, ..., DOWN) or, added by
++/// SplatNative, a stick direction (LUP, LDOWN, LLEFT, LRIGHT, RUP, RDOWN, RLEFT, RRIGHT), held from
++/// game time t for `seconds` (default 0.15).
++struct Scripted {
++    at: f32,
++    until: f32,
++    buttons: u64,
++    stick: (usize, f32, f32),
++    player: usize,
++}
++
++fn script() -> &'static [Scripted] {
++    static SCRIPT: std::sync::LazyLock<Vec<Scripted>> = std::sync::LazyLock::new(|| {
+         let names = [
+             ("A", A), ("B", B), ("X", X), ("Y", Y), ("L", L), ("R", R), ("ZL", ZL), ("ZR", ZR), ("PLUS", PLUS),
+             ("MINUS", MINUS), ("LSTICK", STICK_L), ("RSTICK", STICK_R), ("LEFT", LEFT), ("UP", UP), ("RIGHT", RIGHT), ("DOWN", DOWN),
+         ];
++        let sticks = [
++            ("LUP", (1, 0.0, 1.0)), ("LDOWN", (1, 0.0, -1.0)), ("LLEFT", (1, -1.0, 0.0)), ("LRIGHT", (1, 1.0, 0.0)),
++            ("RUP", (2, 0.0, 1.0)), ("RDOWN", (2, 0.0, -1.0)), ("RLEFT", (2, -1.0, 0.0)), ("RRIGHT", (2, 1.0, 0.0)),
++        ];
+         std::env::var("NX_AUTOINPUT").unwrap_or_default().split(',').filter_map(|e| {
+             let (t, b) = e.trim().split_once(':')?;
+             let (b, player) = b.split_once('@').map_or(Some((b, 1)), |(b, p)| Some((b, p.parse().ok()?)))?;
+-            Some((t.parse().ok()?, names.iter().find(|(n, _)| n.eq_ignore_ascii_case(b))?.1, player))
++            let (b, dur) = b.split_once('*').map_or(Some((b, 0.15)), |(b, d)| Some((b, d.parse().ok()?)))?;
++            let at: f32 = t.parse().ok()?;
++            let (buttons, stick) = match names.iter().find(|(n, _)| n.eq_ignore_ascii_case(b)) {
++                Some(&(_, bit)) => (bit, (0, 0.0, 0.0)),
++                None => (0, sticks.iter().find(|(n, _)| n.eq_ignore_ascii_case(b))?.1),
++            };
++            Some(Scripted { at, until: at + dur, buttons, stick, player })
+         }).collect()
+     });
++    &SCRIPT
++}
++
++fn scripted(player: usize) -> u64 {
++    let t = crate::gfx::clock();
++    script().iter().filter(|s| s.player == player + 1 && t >= s.at && t < s.until).fold(0, |m, s| m | s.buttons)
++}
++
++/// Scripted stick deflection (left x, left y, right x, right y) for `player` at the current time.
++fn scripted_sticks(player: usize) -> [f32; 4] {
+     let t = crate::gfx::clock();
+-    SCRIPT.iter().filter(|(at, _, p)| *p == player + 1 && t >= *at && t < at + 0.15).fold(0, |m, (_, b, _)| m | b)
++    let mut v = [0.0; 4];
++    for s in script().iter().filter(|s| s.player == player + 1 && t >= s.at && t < s.until && s.stick.0 != 0) {
++        let k = 2 * (s.stick.0 - 1);
++        v[k] += s.stick.1;
++        v[k + 1] += s.stick.2;
++    }
++    v
+ }
+ 
+ pub const MAX_PLAYERS: usize = 8;
+@@ -474,7 +511,8 @@ impl Pads {
+             let mut virtual_left = self.extra;
+             let phone = &mut self.phone;
+             for (i, slot) in self.slots.iter().enumerate() {
+-                let mut acc = Acc { buttons: scripted(i), ..Default::default() };
++                let [slx, sly, srx, sry] = scripted_sticks(i);
++                let mut acc = Acc { buttons: scripted(i), lx: slx, ly: sly, rx: srx, ry: sry, ..Default::default() };
+                 match slot {
+                     Some(Ctl::Apple(c)) => {
+                         if let Some(g) = c.extendedGamepad() {
+-- 
+2.56.1
+
