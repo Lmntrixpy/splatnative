@@ -1,7 +1,7 @@
 From ad4a8be62f2d6c942ae32db875cbdd108fa0f81e Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:03:28 +0100
-Subject: [PATCH 03/34] nxhost: take the module list from the prepared layouts
+Subject: [PATCH 03/36] nxhost: take the module list from the prepared layouts
 
 main.rs, loader.rs and build.rs hardcoded [main, subsdk0, sdk] (MK8DX).
 Splatoon 3 ships main and sdk only. loader::module_names() now returns the

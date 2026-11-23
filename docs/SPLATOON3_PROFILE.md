@@ -104,6 +104,7 @@ Jeder Lauf ist auf 120–150 s begrenzt; Logs in `work/runN.log`.
 | 57–64 | Eingabe per `NX_AUTOINPUT` wirkt; **Texte und Menüs sichtbar** („Wähle einen Style!“) | — | Patch 0027: nxshader übersetzt `BRX`, `ICMP`, `R2P` (≈25 Programme, u. a. Layout-Text); 0028 `NX_TRACE_UBO` |
 | 65–71 | **Style gewählt, Charakter erstellt, Spielstand geschrieben; spielbares Tutorial** (Laufen, Schwimmen, Schießen per Skript) | Tutorial-Parcours braucht gezielte Steuerung | Patch 0029 `LEA.HI`; 0030 Halten/Stick in `NX_AUTOINPUT`; 0031 `NX_BACKGROUND`, protokollierte Beenden-Pfade |
 | 72–st75 | Ladebildschirm hängt sporadisch (~1 von 5 Starts, auch beim Nutzer) | — | Patch 0032: `SignalToAddress` (ModifyByWaitingCount) wie Horizon; 0033 `NX_THREAD_DUMP_AT`, sichere Probes. Danach 15/15 Starts ohne Hänger |
+| 86–94 | **Zielen per Bewegungssteuerung ohne Gyro-Controller**: Spiel liest den virtuellen Sensor, Kamera folgt (hoch/runter, links/rechts geprüft) | — | Patch 0035: virtueller Sechsachsensensor (Maus/I-K), vollständige Tastenbelegung (`docs/STEUERUNG.md`); 0036 `NX_TRACE_MOTION` |
 
 ### Gelöst: Befund aus Lauf 15
 Der Schreiber `main+0x4529ca8` liegt in der Grafik-Initialisierung hinter der Prüfung
@@ -157,6 +158,21 @@ und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen 
   ist nicht reproduzierbar.
 - Offen: Mush8s Speicher-Dateisystem schreibt direkt in die Datei, `Commit` ist ein No-op (Horizon:
   transaktional). Bei Abbruch während eines Schreibvorgangs könnte der Spielstand beschädigt werden.
+
+### Bewegungssteuerung (Läufe 86–94)
+- Splatoon 3 startet den Sensor des Pro Controllers (`StartSixAxisSensor`, Handle 0x00020003) und
+  liest ihn über `nn::hid::detail::GetSixAxisSensorStates` (sdk+0x50bf60) aus dem Lifo bei 0x1758
+  im Npad-Block – dieselben Offsets und dasselbe Seqlock-Format, die Mush8 schreibt.
+- Ohne Bewegungsdaten driftete die Kamera in Lauf 87 im Ballon-Abschnitt (t245); mit dem
+  virtuellen Sensor blieb sie stabil.
+- Vorzeichen im Spiel geprüft: Drehrate um +x neigt die Kamera nach **unten** (Lauf 92: „Langsam
+  nach oben neigen.“ nach skriptiertem Hochzielen mit der ersten Vorzeichenwahl), um +z nach
+  **links**. Nach Korrektur (Lauf 93/94) führt `AIMUP` die Kamera nach oben, `AIMRIGHT` dreht wie
+  `RRIGHT` nach rechts. 0,45 rad Neigung reichen schon für die Hinweisanzeige „zu weit“: das Spiel
+  setzt Sensor-Drehung etwa 1:1 oder stärker in Kamera-Drehung um.
+- Der Ablauf der Erststart-Sequenz schwankt zwischen Läufen stark (Lauf 86 blieb bei
+  „Gefällst du dir?“, Lauf 87 erreichte die Ballons nach 140 s); ohne Eingaben läuft das Tutorial
+  teils von selbst weiter (Läufe 88/89).
 
 ### Beobachtet, noch nicht umgesetzt: Kernzuordnung
 - Threads mit idealem Kern −2 („Prozesswert“) behalten im Host −2, obwohl das Spiel später Masken 0x2/0x4

@@ -1,0 +1,392 @@
+From 338678314ecc5e7ddbefd20fb0fc86ded411cabd Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 22:49:41 +0100
+Subject: [PATCH 35/36] nxhost input: virtual motion sensor, mouse aiming, full
+ keyboard layout
+
+The keyboard player now reports an emulated six-axis sensor unless a real
+controller supplies motion (NX_KEY_GYRO=0 turns it off). Mouse movement
+while captured (M in the game window, Esc or focus loss releases) and the
+I/K keys turn it; the turn is spread over ~12 ms so games reading one
+sample per frame still see all of it. Gravity follows the virtual pitch.
+Axis signs checked in Splatoon 3: +x aims down, +z turns left.
+
+Captured mouse buttons: left ZR, right R, middle right-stick click. New
+keys: Space B, left Shift ZL, F right-stick click, G left-stick click.
+NX_AUTOINPUT gains AIMUP/AIMDOWN/AIMLEFT/AIMRIGHT. Tunables:
+NX_MOUSE_SENS (rad per point, 0.003), NX_KEY_GYRO_RATE (rad/s, 1.5).
+---
+ crates/nxhost/src/gfx/mod.rs |  72 ++++++++++++++++-
+ crates/nxhost/src/input.rs   | 153 +++++++++++++++++++++++++++++++++--
+ 2 files changed, 217 insertions(+), 8 deletions(-)
+
+diff --git a/crates/nxhost/src/gfx/mod.rs b/crates/nxhost/src/gfx/mod.rs
+index c1c57f7..1ffa60d 100644
+--- a/crates/nxhost/src/gfx/mod.rs
++++ b/crates/nxhost/src/gfx/mod.rs
+@@ -375,6 +375,13 @@ pub fn run_app(title: &str, width: f64, height: f64) -> ! {
+                 Some("f") if !ev.isARepeat() => win.toggleFullScreen(None),
+                 _ => {}
+             }
++        } else if ev.r#type() == objc2_app_kit::NSEventType::KeyDown && !ev.isARepeat() && !keyboard::typing() {
++            // SplatNative: M toggles mouse aiming, Esc releases it (kVK_ANSI_M, kVK_Escape).
++            match ev.keyCode() {
++                0x2e => set_mouse_aim(&win, !crate::input::MOUSE_AIM.load(std::sync::atomic::Ordering::Relaxed)),
++                0x35 => set_mouse_aim(&win, false),
++                _ => {}
++            }
+         }
+         if keyboard::typing() { e.as_ptr() } else { std::ptr::null_mut() }
+     });
+@@ -391,6 +398,19 @@ pub fn run_app(title: &str, width: f64, height: f64) -> ! {
+         )
+     };
+     std::mem::forget(observer);
++    let released = window.clone();
++    let resign = block2::RcBlock::new(move |_: std::ptr::NonNull<objc2_foundation::NSNotification>| set_mouse_aim(&released, false));
++    let observer = unsafe {
++        objc2_foundation::NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
++            Some(objc2_app_kit::NSWindowDidResignKeyNotification),
++            Some(&window),
++            None,
++            &resign,
++        )
++    };
++    std::mem::forget(observer);
++    window.setAcceptsMouseMovedEvents(true);
++    eprintln!("[input] press M in the game window to aim with the mouse (Esc releases it)");
+     let monitor = unsafe {
+         objc2_app_kit::NSEvent::addLocalMonitorForEventsMatchingMask_handler(objc2_app_kit::NSEventMask::KeyDown | objc2_app_kit::NSEventMask::KeyUp, &swallow)
+     };
+@@ -398,12 +418,16 @@ pub fn run_app(title: &str, width: f64, height: f64) -> ! {
+     let held = std::cell::Cell::new(false);
+     let game = window.clone();
+     let mouse = block2::RcBlock::new(move |e: std::ptr::NonNull<objc2_app_kit::NSEvent>| -> *mut objc2_app_kit::NSEvent {
++        if mouse_aim(unsafe { e.as_ref() }) {
++            return std::ptr::null_mut();
++        }
+         mouse_touch(&game, unsafe { e.as_ref() }, &held);
+         e.as_ptr()
+     });
+     let monitor = unsafe {
+         use objc2_app_kit::NSEventMask as M;
+-        objc2_app_kit::NSEvent::addLocalMonitorForEventsMatchingMask_handler(M::LeftMouseDown | M::LeftMouseDragged | M::LeftMouseUp, &mouse)
++        let aim = M::MouseMoved | M::RightMouseDown | M::RightMouseDragged | M::RightMouseUp | M::OtherMouseDown | M::OtherMouseDragged | M::OtherMouseUp;
++        objc2_app_kit::NSEvent::addLocalMonitorForEventsMatchingMask_handler(M::LeftMouseDown | M::LeftMouseDragged | M::LeftMouseUp | aim, &mouse)
+     };
+     std::mem::forget(monitor);
+     #[allow(deprecated)]
+@@ -762,6 +786,52 @@ pub fn on_screen((x, y): (f32, f32)) -> bool {
+     (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y)
+ }
+ 
++/// SplatNative: captures (hides and pins) the cursor for mouse aiming, or releases it. While
++/// captured, mouse movement turns the keyboard player's virtual motion sensor and the buttons
++/// are ZR (left), R (right) and the right stick click (middle); see input::VirtualGyro.
++#[cfg(target_os = "macos")]
++fn set_mouse_aim(window: &NSWindow, on: bool) {
++    use std::sync::atomic::Ordering::Relaxed;
++    if crate::input::MOUSE_AIM.swap(on, Relaxed) == on {
++        return;
++    }
++    crate::input::MOUSE_BUTTONS.store(0, Relaxed);
++    if on {
++        let f = window.frame();
++        let top = objc2_app_kit::NSScreen::screens(window.mtm()).firstObject().map_or(f.origin.y + f.size.height, |s| s.frame().size.height);
++        let center = objc2_core_foundation::CGPoint { x: f.origin.x + f.size.width / 2.0, y: top - (f.origin.y + f.size.height / 2.0) };
++        objc2_core_graphics::CGWarpMouseCursorPosition(center);
++        objc2_app_kit::NSCursor::hide();
++    } else {
++        objc2_app_kit::NSCursor::unhide();
++    }
++    objc2_core_graphics::CGAssociateMouseAndMouseCursorPosition(!on);
++    eprintln!("[input] mouse aiming {}", if on { "on (M or Esc releases)" } else { "off" });
++}
++
++/// Mouse events while aiming: returns true when the event was used for aiming.
++#[cfg(target_os = "macos")]
++fn mouse_aim(ev: &objc2_app_kit::NSEvent) -> bool {
++    use objc2_app_kit::NSEventType as T;
++    use std::sync::atomic::Ordering::Relaxed;
++    if !crate::input::MOUSE_AIM.load(Relaxed) {
++        return false;
++    }
++    let bit = |ev: &objc2_app_kit::NSEvent| match ev.r#type() {
++        T::LeftMouseDown | T::LeftMouseUp => crate::input::ZR,
++        T::RightMouseDown | T::RightMouseUp => crate::input::R,
++        _ if ev.buttonNumber() == 2 => crate::input::STICK_R,
++        _ => 0,
++    };
++    match ev.r#type() {
++        T::MouseMoved | T::LeftMouseDragged | T::RightMouseDragged | T::OtherMouseDragged => crate::input::mouse_moved(ev.deltaX(), ev.deltaY()),
++        T::LeftMouseDown | T::RightMouseDown | T::OtherMouseDown => _ = crate::input::MOUSE_BUTTONS.fetch_or(bit(ev), Relaxed),
++        T::LeftMouseUp | T::RightMouseUp | T::OtherMouseUp => _ = crate::input::MOUSE_BUTTONS.fetch_and(!bit(ev), Relaxed),
++        _ => {}
++    }
++    true
++}
++
+ #[cfg(target_os = "macos")]
+ fn mouse_touch(window: &NSWindow, ev: &objc2_app_kit::NSEvent, held: &std::cell::Cell<bool>) {
+     use objc2_app_kit::NSEventType as T;
+diff --git a/crates/nxhost/src/input.rs b/crates/nxhost/src/input.rs
+index a5ea8f3..20a689d 100644
+--- a/crates/nxhost/src/input.rs
++++ b/crates/nxhost/src/input.rs
+@@ -24,7 +24,8 @@ const STICK_DIRS: u32 = 16;
+ const STICK_MAX: f32 = 32767.0;
+ 
+ /// NX_AUTOINPUT="t:NAME[*seconds][@player],...": NAME is a button (A, B, ..., DOWN) or, added by
+-/// SplatNative, a stick direction (LUP, LDOWN, LLEFT, LRIGHT, RUP, RDOWN, RLEFT, RRIGHT), held from
++/// SplatNative, a stick direction (LUP, LDOWN, LLEFT, LRIGHT, RUP, RDOWN, RLEFT, RRIGHT) or a turn
++/// of the virtual motion sensor (AIMUP, AIMDOWN, AIMLEFT, AIMRIGHT, at NX_KEY_GYRO_RATE), held from
+ /// game time t for `seconds` (default 0.15).
+ struct Scripted {
+     at: f32,
+@@ -43,6 +44,7 @@ fn script() -> &'static [Scripted] {
+         let sticks = [
+             ("LUP", (1, 0.0, 1.0)), ("LDOWN", (1, 0.0, -1.0)), ("LLEFT", (1, -1.0, 0.0)), ("LRIGHT", (1, 1.0, 0.0)),
+             ("RUP", (2, 0.0, 1.0)), ("RDOWN", (2, 0.0, -1.0)), ("RLEFT", (2, -1.0, 0.0)), ("RRIGHT", (2, 1.0, 0.0)),
++            ("AIMUP", (3, 0.0, 1.0)), ("AIMDOWN", (3, 0.0, -1.0)), ("AIMLEFT", (3, -1.0, 0.0)), ("AIMRIGHT", (3, 1.0, 0.0)),
+         ];
+         std::env::var("NX_AUTOINPUT").unwrap_or_default().split(',').filter_map(|e| {
+             let (t, b) = e.trim().split_once(':')?;
+@@ -68,7 +70,7 @@ fn scripted(player: usize) -> u64 {
+ fn scripted_sticks(player: usize) -> [f32; 4] {
+     let t = crate::gfx::clock();
+     let mut v = [0.0; 4];
+-    for s in script().iter().filter(|s| s.player == player + 1 && t >= s.at && t < s.until && s.stick.0 != 0) {
++    for s in script().iter().filter(|s| s.player == player + 1 && t >= s.at && t < s.until && matches!(s.stick.0, 1 | 2)) {
+         let k = 2 * (s.stick.0 - 1);
+         v[k] += s.stick.1;
+         v[k + 1] += s.stick.2;
+@@ -76,6 +78,12 @@ fn scripted_sticks(player: usize) -> [f32; 4] {
+     v
+ }
+ 
++/// Scripted virtual-gyro turn (yaw, pitch axes, -1..1) for `player` at the current time.
++fn scripted_aim(player: usize) -> (f32, f32) {
++    let t = crate::gfx::clock();
++    script().iter().filter(|s| s.player == player + 1 && t >= s.at && t < s.until && s.stick.0 == 3).fold((0.0, 0.0), |a, s| (a.0 + s.stick.1, a.1 + s.stick.2))
++}
++
+ pub const MAX_PLAYERS: usize = 8;
+ 
+ #[derive(Clone, Copy, PartialEq, Debug)]
+@@ -166,6 +174,80 @@ unsafe fn phone_motion(mgr: &objc2_core_motion::CMMotionManager) -> Option<Motio
+     }
+ }
+ 
++/// SplatNative: mouse aiming. While the mouse is captured (M in the game window, Esc releases),
++/// the window layer adds the mouse movement in points here and reports its buttons as Switch
++/// buttons; both are read by the keyboard player.
++pub static MOUSE_AIM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++pub static MOUSE_BUTTONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static MOUSE_DELTA: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((0.0, 0.0));
++
++pub fn mouse_moved(dx: f64, dy: f64) {
++    let mut d = MOUSE_DELTA.lock().unwrap();
++    d.0 += dx;
++    d.1 += dy;
++}
++
++fn take_mouse_delta() -> (f32, f32) {
++    let d = std::mem::take(&mut *MOUSE_DELTA.lock().unwrap());
++    (d.0 as f32, d.1 as f32)
++}
++
++fn env_f32(k: &str, default: f32) -> f32 {
++    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
++}
++
++/// SplatNative: the keyboard player's emulated motion sensor, so games that aim with the gyro
++/// (Splatoon 3 does by default) can be played without a motion controller. Mouse movement
++/// (radians per point: NX_MOUSE_SENS) and I/K (radians per second: NX_KEY_GYRO_RATE) turn a
++/// virtual controller; the rotation is spread over a few milliseconds so a game that reads one
++/// sample per frame still sees all of it. NX_KEY_GYRO=0 turns it off.
++pub struct VirtualGyro {
++    pending: [f32; 2],
++    pitch: f32,
++    last: Option<std::time::Instant>,
++}
++
++const GYRO_SPREAD: f32 = 0.012;
++const MAX_PITCH: f32 = 1.4;
++
++impl VirtualGyro {
++    const fn new() -> Self {
++        VirtualGyro { pending: [0.0; 2], pitch: 0.0, last: None }
++    }
++
++    pub fn enabled() -> bool {
++        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("NX_KEY_GYRO").as_deref() != Ok("0"));
++        *ON
++    }
++
++    /// One sample: `turn` is (yaw, pitch) in radians added since the last call, `tilt` (yaw,
++    /// pitch) axes (-1..1) turning at `rate` radians per second. Positive yaw turns right,
++    /// positive pitch aims up.
++    pub fn sample(&mut self, turn: (f32, f32), tilt: (f32, f32), rate: f32, now: std::time::Instant) -> Motion {
++        let dt = self.last.replace(now).map_or(0.0, |t| now.duration_since(t).as_secs_f32()).min(0.1);
++        self.pending[0] += turn.0 + tilt.0 * rate * dt;
++        self.pending[1] += turn.1 + tilt.1 * rate * dt;
++        let mut gyro = [0.0; 3];
++        if dt > 0.0 {
++            let share = 1.0 - (-dt / GYRO_SPREAD).exp();
++            let yaw = self.pending[0] * share;
++            let pitch = (self.pitch + self.pending[1] * share).clamp(-MAX_PITCH, MAX_PITCH) - self.pitch;
++            self.pending[0] -= yaw;
++            self.pending[1] -= self.pending[1] * share;
++            if (self.pitch + pitch).abs() >= MAX_PITCH {
++                self.pending[1] = 0.0;
++            }
++            self.pitch += pitch;
++            // Switch sixaxis axes (controller lying flat): Splatoon 3 aims down for a rotation
++            // about +x and turns left for one about +z (checked in game, docs/STEUERUNG.md).
++            gyro = [-pitch / dt, 0.0, -yaw / dt];
++        }
++        // Gravity seen by the tilted controller, consistent with integrating the gyro above.
++        let (s, c) = self.pitch.sin_cos();
++        Motion { accel: [0.0, -s, -c], gyro }
++    }
++}
++
+ pub static TOUCH_BUTTONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ pub static TOUCH_STICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ 
+@@ -299,6 +381,7 @@ pub struct Pads {
+     touch_init: bool,
+     idle: bool,
+     phone: Phone,
++    vgyro: VirtualGyro,
+     #[cfg(target_os = "macos")]
+     sdl_failed: crate::sdl::OpenOnce,
+ }
+@@ -318,6 +401,7 @@ impl Pads {
+             touch_init: false,
+             idle: false,
+             phone: Default::default(),
++            vgyro: VirtualGyro::new(),
+             #[cfg(target_os = "macos")]
+             sdl_failed: Default::default(),
+         }
+@@ -510,6 +594,8 @@ impl Pads {
+             let mut out: [Option<PadState>; MAX_PLAYERS] = Default::default();
+             let mut virtual_left = self.extra;
+             let phone = &mut self.phone;
++            let vgyro = &mut self.vgyro;
++            let mouse = take_mouse_delta();
+             for (i, slot) in self.slots.iter().enumerate() {
+                 let [slx, sly, srx, sry] = scripted_sticks(i);
+                 let mut acc = Acc { buttons: scripted(i), lx: slx, ly: sly, rx: srx, ry: sry, ..Default::default() };
+@@ -527,8 +613,10 @@ impl Pads {
+                 if let Some(pad) = &remote {
+                     acc.remote(pad);
+                 }
+-                if key_slot == Some(i) && !crate::gfx::keyboard::typing() {
+-                    acc.keyboard();
++                let keys = key_slot == Some(i) && !crate::gfx::keyboard::typing();
++                let mut tilt = 0.0;
++                if keys {
++                    tilt = acc.keyboard();
+                 }
+                 if touch_slot == Some(i) {
+                     acc.touch();
+@@ -555,6 +643,15 @@ impl Pads {
+                 } else {
+                     None
+                 };
++                let sample = sample.or_else(|| {
++                    (key_slot == Some(i) && VirtualGyro::enabled()).then(|| {
++                        static SENS: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| env_f32("NX_MOUSE_SENS", 0.003));
++                        static RATE: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| env_f32("NX_KEY_GYRO_RATE", 1.5));
++                        let turn = if keys { (mouse.0 * *SENS, -mouse.1 * *SENS) } else { (0.0, 0.0) };
++                        let aim = scripted_aim(i);
++                        (vgyro.sample(turn, (aim.0, aim.1 + tilt), *RATE, std::time::Instant::now()), false)
++                    })
++                });
+                 MOTION.lock().unwrap()[i] = sample;
+                 if !(changed || !self.touch_init) {
+                     continue;
+@@ -678,9 +775,14 @@ impl Acc {
+         self.ly += f32::from_bits(s as u32);
+     }
+ 
+-    unsafe fn keyboard(&mut self) {
++    /// Keyboard (and captured mouse) as a Pro Controller; returns the I/K axis, which also
++    /// tilts the virtual motion sensor.
++    unsafe fn keyboard(&mut self) -> f32 {
++        if MOUSE_AIM.load(std::sync::atomic::Ordering::Relaxed) {
++            self.buttons |= MOUSE_BUTTONS.load(std::sync::atomic::Ordering::Relaxed);
++        }
+         unsafe {
+-            let Some(k) = GCKeyboard::coalescedKeyboard().and_then(|k| k.keyboardInput()) else { return };
++            let Some(k) = GCKeyboard::coalescedKeyboard().and_then(|k| k.keyboardInput()) else { return 0.0 };
+             let down = |code: GCKeyCode| k.buttonForKeyCode(code).is_some_and(|b| b.isPressed());
+             let keys = [
+                 (GCKeyCodeKeyX, A),
+@@ -691,8 +793,12 @@ impl Acc {
+                 (GCKeyCodeKeyV, Y),
+                 (GCKeyCodeKeyQ, L),
+                 (GCKeyCodeKeyE, R),
++                (GCKeyCodeSpacebar, B),
+                 (GCKeyCodeOne, ZL),
++                (GCKeyCodeLeftShift, ZL),
+                 (GCKeyCodeThree, ZR),
++                (GCKeyCodeKeyF, STICK_R),
++                (GCKeyCodeKeyG, STICK_L),
+                 (GCKeyCodeEqualSign, PLUS),
+                 (GCKeyCodeTab, PLUS),
+                 (GCKeyCodeHyphen, MINUS),
+@@ -710,7 +816,9 @@ impl Acc {
+             self.lx += axis(GCKeyCodeKeyA, GCKeyCodeKeyD);
+             self.ly += axis(GCKeyCodeKeyS, GCKeyCodeKeyW);
+             self.rx += axis(GCKeyCodeKeyJ, GCKeyCodeKeyL);
+-            self.ry += axis(GCKeyCodeKeyK, GCKeyCodeKeyI);
++            let tilt = axis(GCKeyCodeKeyK, GCKeyCodeKeyI);
++            self.ry += tilt;
++            tilt
+         }
+     }
+ 
+@@ -735,6 +843,37 @@ impl Acc {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn virtual_gyro_delivers_the_whole_turn() {
++        let mut g = VirtualGyro::new();
++        let t0 = std::time::Instant::now();
++        let step = std::time::Duration::from_millis(5);
++        g.sample((0.0, 0.0), (0.0, 0.0), 1.5, t0);
++        let (mut yaw, mut pitch) = (0.0, 0.0);
++        for n in 1..=40 {
++            let turn = if n == 1 { (0.3, 0.2) } else { (0.0, 0.0) };
++            let m = g.sample(turn, (0.0, 0.0), 1.5, t0 + step * n);
++            yaw -= m.gyro[2] * 0.005;
++            pitch -= m.gyro[0] * 0.005;
++        }
++        assert!((yaw - 0.3).abs() < 1e-3 && (pitch - 0.2).abs() < 1e-3, "{yaw} {pitch}");
++        let m = g.sample((0.0, 0.0), (0.0, 0.0), 1.5, t0 + step * 41);
++        assert!((m.accel[1] + 0.2f32.sin()).abs() < 1e-3 && (m.accel[2] + 0.2f32.cos()).abs() < 1e-3);
++    }
++
++    #[test]
++    fn virtual_gyro_pitch_stops_at_the_limit() {
++        let mut g = VirtualGyro::new();
++        let t0 = std::time::Instant::now();
++        g.sample((0.0, 0.0), (0.0, 0.0), 1.5, t0);
++        for n in 1..200 {
++            g.sample((0.0, 0.0), (0.0, 1.0), 1.5, t0 + std::time::Duration::from_millis(5 * n));
++        }
++        assert!((g.pitch - MAX_PITCH).abs() < 1e-4);
++        let m = g.sample((0.0, 0.0), (0.0, -1.0), 1.5, t0 + std::time::Duration::from_millis(1000));
++        assert!(m.gyro[0] > 0.0, "turning back down works at once");
++    }
++
+     #[test]
+     fn pad_driver_parse() {
+         assert_eq!(PadDriver::parse(None), PadDriver::Apple);
+-- 
+2.56.1
+

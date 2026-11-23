@@ -1,0 +1,49 @@
+From cd92c187bfb8ee7feb542e32b15563135d01f4e3 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 22:49:41 +0100
+Subject: [PATCH 36/36] nxhost hid: NX_TRACE_MOTION logs six-axis samples while
+ the sensor turns
+
+---
+ crates/nxhost/src/services/hid.rs | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/crates/nxhost/src/services/hid.rs b/crates/nxhost/src/services/hid.rs
+index bc6760f..df27946 100644
+--- a/crates/nxhost/src/services/hid.rs
++++ b/crates/nxhost/src/services/hid.rs
+@@ -163,6 +163,12 @@ fn push_sixaxis(lifo: u64, sampling: u64, m: Option<&crate::input::Motion>, fuse
+     lifo_commit(lifo, sampling, tail);
+ }
+ 
++/// SplatNative: NX_TRACE_MOTION=1 logs the motion samples written while the sensor turns.
++fn trace_motion() -> bool {
++    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("NX_TRACE_MOTION").is_ok_and(|v| v == "1"));
++    *ON
++}
++
+ fn start_input_thread() {
+     static STARTED: OnceLock<()> = OnceLock::new();
+     STARTED.get_or_init(|| {
+@@ -208,6 +214,18 @@ fn start_input_thread() {
+                             Some(m) => fused[i].update(m.accel, m.gyro.map(|r| r / std::f32::consts::TAU), from_pad, dt),
+                             None => fused[i] = crate::motion::Orientation::default(),
+                         }
++                        if present[i] && trace_motion() && motion.is_some_and(|m| m.gyro.iter().any(|r| r.abs() > 1e-3)) && sampling % 10 == 0 {
++                            let m = motion.unwrap();
++                            eprintln!(
++                                "[hid] t {:.2} player {} gyro {:?} accel {:?} rotation {:?} direction {:?}",
++                                crate::gfx::clock(),
++                                i + 1,
++                                m.gyro.map(|r| r / std::f32::consts::TAU),
++                                m.accel,
++                                fused[i].rotation(),
++                                fused[i].orientation()
++                            );
++                        }
+                         if present[i] {
+                             for l in SIXAXIS_LIFOS {
+                                 push_sixaxis(npad + l, sampling, motion.as_ref(), &fused[i]);
+-- 
+2.56.1
+

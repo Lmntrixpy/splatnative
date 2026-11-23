@@ -1,7 +1,7 @@
 From f1fa53797fd85e9dc597aa6723a1959822082534 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:07:27 +0100
-Subject: [PATCH 05/34] nxhost: identify the game, not only the MK8DX update
+Subject: [PATCH 05/36] nxhost: identify the game, not only the MK8DX update
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

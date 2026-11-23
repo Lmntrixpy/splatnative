@@ -1,7 +1,7 @@
 From 673d1810e98923f1bdddecac959950a33c94ae7b Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 10:51:11 +0100
-Subject: [PATCH 31/34] nxhost gfx: NX_BACKGROUND and logged quits
+Subject: [PATCH 31/36] nxhost gfx: NX_BACKGROUND and logged quits
 
 NX_BACKGROUND=1 opens the window behind others without activating the
 app, so automated runs do not take keyboard focus. Cmd-Q/W, closing the

@@ -1,7 +1,7 @@
 From fbb7eb0427bfc702521fbe668000d51e081b284a Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:19:35 +0100
-Subject: [PATCH 09/34] nxhost: skip the movie hooks for games without the SDK
+Subject: [PATCH 09/36] nxhost: skip the movie hooks for games without the SDK
  movie library
 
 movie::init panicked when movie::MediaData was not linked. Splatoon 3 does
