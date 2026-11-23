@@ -100,6 +100,7 @@ Jeder Lauf ist auf 120–150 s begrenzt; Logs in `work/runN.log`.
 | 24–26 | Kein Absturz mehr; Hauptthread pollt Eingaben | Endlosschleife in `nn::hid::detail::GetNpadStates`/`GetSixAxisSensorStates` | Patch 0022: Seqlock-Stempel in den HID-Lifos |
 | 27 | Command-Buffer werden aufgezeichnet, Textur-/Sampler-Getter echt | Hauptthread wartet dauerhaft (`WaitLightEvent`) im Job-System | Ursache: `GetCurrentProcessorNumber` lieferte für jeden Thread Kern 0 |
 | 28–39 | **Assets laden (972 Texturen, ~2,5 GB), 3D-Renderpipeline läuft (Schatten, HDR, Blur), 60 fps Present** | Ausgabe schwarz | Patch 0023 (Kern aus Affinität), 0024 (Occlusion-Queries „sichtbar“), 0025 (Diagnose); Bild offen, siehe unten |
+| 40–56 | **Erstes Bild: 3D-Szene des Erststart-Bildschirms mit UI, 60 fps** | wartet auf Eingabe | Patch 0026: Zähler-Reports wie der Treiber (Zeitstempel nur im Zeitstempel-Feld), bedingtes Rendern ausgewertet, Clears mit Scissor/Kanalmaske |
 
 ### Gelöst: Befund aus Lauf 15
 Der Schreiber `main+0x4529ca8` liegt in der Grafik-Initialisierung hinter der Prüfung
@@ -110,15 +111,20 @@ Werte des MK8-Treibers; der Splatoon-Treiber meldet 55/15.
 Das Job-System (main+0x4ad6ca0) übergibt Jobs an den Worker mit Affinitätsmaske `1 << aktueller Kern`
 und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen selbst wartenden Worker.
 
-### Offener Befund (Läufe 32–39): schwarzes Bild
-- Gemessen mit `NX_DUMP_RT_AT`/`NX_TRACE_AT` (Render-Targets eines Frames) und einem PNG-Auswerter:
-  Texturen der Spieldaten sind korrekt dekodiert; Tiefen-Prepass (`LESS`, Maske 0) und Farbpass
-  (`EQUAL`) laufen, 3D-Szene mit ~480 Draws; der HDR-Puffer (R11G11B10F, 960×540) bleibt aber 0.
-- Ausgeschlossen: Zustandskodierung (Blend/ChannelMask/DepthStencil/Polygon/VertexAttrib stimmt mit dem
-  Treiber überein), fehlgeschlagene Shader (keiner der Draws nutzt einen), Tiefen-Gleichheit
-  (Experiment `EQUAL`→`LEQUAL` ändert nichts), Occlusion-Queries (Patch 0024), Dump-Format.
-- Nächste Kandidaten: Uniform-/Konstantenpuffer-Inhalte (UpdateUniformBuffer, 760k Aufrufe/90 s),
-  Speicher-Pool-Adressierung der Splatoon-Puffer, Shader-Übersetzung von Bindless-Zugriffen.
+### Gelöst: schwarzes Bild (Läufe 32–56)
+- Das Spiel rendert seinen Frame vollständig nach f61 (1920×1080, RGB10A2) und löscht ihn danach zweimal
+  unter `SetRenderEnableConditional(!=)`; verglichen wird das Zählerfeld eines Reports vom Typ 16 mit 0.
+- Im Treiber (ReportCounter 0x4ef450) schreibt Typ 16 eine 16-Byte-Semaphore mit Payload 0, Typ 0 einen
+  Report mit Payload 0 (Steuerwort 0xf002): das Zählerfeld ist 0, die Zeit steht bei +8. Mush8 schrieb
+  die Zeit ins Zählerfeld → Bedingung wahr → Frame vor dem Anzeigen gelöscht.
+- Gefunden mit Render-Target-Dumps, einem Konstantfarben-Experiment (Fragment-Shader → Magenta) und
+  Dumps unmittelbar vor jedem Clear; alle Experimente sind wieder entfernt.
+
+### Aktueller Stand (Lauf 56)
+- Erststart-Bildschirm (keine Speicherdaten → Intro/Charaktereinrichtung) mit 3D-Szene, Schatten,
+  Tiefenunschärfe und UI-Ebene, 60 fps. Bilder per `NX_DUMP_AT` in `work/frame/` (nicht im Repo).
+- Sichtbarer Fehler: die UI-Ebene erscheint verkleinert im linken oberen Viertel (Skalierung des UI-Passes).
+- Nächster Schritt: Eingabe (Controller/Tastatur bzw. `NX_AUTOINPUT`) bis zum Hauptmenü.
 
 ### Sporadisch: Lade-Hänger im Datei-Cache
 - In ~2 von 8 Läufen bleibt der Ladethread in `FileDataCacheSystem::ReserveFreePagesByGatherCompaction`

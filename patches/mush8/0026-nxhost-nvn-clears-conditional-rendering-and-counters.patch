@@ -1,0 +1,227 @@
+From 6651184e7b9cc98ca9827975b9c9fc9a076637b6 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 07:17:20 +0100
+Subject: [PATCH 26/26] nxhost nvn: clears, conditional rendering and counters
+ as the driver does
+
+Splatoon 3 rendered its whole frame but presented black. Measured with
+render-target dumps and command traces, fixed against the sdk 574284b4
+driver:
+
+- Counter reports: timestamps (types 0 and 16) carry the time only in the
+  timestamp field; the counter field is the report payload 0 (type 0:
+  report control 0xf002, type 16: 16-byte semaphore release of payload 0,
+  ReportCounter 0x4ef450). Mush8 wrote the time into the counter field.
+  The game guards the clears of its finished frame with
+  SetRenderEnableConditional(!=) on that field against 0, so every frame
+  was cleared right before it was shown.
+- SetRenderEnableConditional is evaluated (mode 0 RENDER_IF_EQUAL, 1
+  RENDER_IF_NOT_EQUAL per the driver, 0x4ef760; compares the 64-bit
+  report values at addr and addr+16) instead of always rendering.
+- SAMPLES_PASSED is a running counter reset by ResetCounter, advancing by
+  one per report, so occlusion queries read as visible.
+- ClearColor honors the scissor (sub-rectangle or nothing) and its channel
+  mask instead of always clearing the whole target.
+- NX_TRACE_* also logs render-target bindings, conditional decisions,
+  counter reports and clear scissors/masks.
+
+With this the game shows its first-launch scene.
+---
+ crates/nxhost/src/nvn/cmd.rs      | 25 +++++++++--
+ crates/nxhost/src/nvn/draw/mod.rs | 73 ++++++++++++++++++++++++++-----
+ 2 files changed, 85 insertions(+), 13 deletions(-)
+
+diff --git a/crates/nxhost/src/nvn/cmd.rs b/crates/nxhost/src/nvn/cmd.rs
+index 012b4fa..6eb530b 100644
+--- a/crates/nxhost/src/nvn/cmd.rs
++++ b/crates/nxhost/src/nvn/cmd.rs
+@@ -38,7 +38,8 @@ impl Draw {
+ #[derive(Debug, Clone)]
+ pub enum Cmd {
+     SetRenderTargets { colors: Vec<Option<Box<TexBuilder>>>, depth: Option<Box<TexBuilder>> },
+-    ClearColor { index: u32, rgba: [f32; 4] },
++    /// mask: NVNclearColorMask (R=1, G=2, B=4, A=8), the fourth argument of nvnCommandBufferClearColor.
++    ClearColor { index: u32, rgba: [f32; 4], mask: u32 },
+     ClearDepthStencil { depth: f32, stencil: u32 },
+     Call(Vec<u64>),
+     Program(Vec<(u64, u64)>),
+@@ -68,6 +69,11 @@ pub enum Cmd {
+     CopyTextureToBuffer { src: Box<TexBuilder>, region: [i32; 6], dst: u64 },
+     ClearTexture { dst: Box<TexBuilder>, region: [i32; 6], color: [f32; 4], mask: u32 },
+     RenderEnable(bool),
++    /// SplatNative: nvnCommandBufferSetRenderEnableConditional. The driver (sdk 574284b4 0x4ef760)
++    /// maps mode 0 to Maxwell RENDER_IF_EQUAL and 1 to RENDER_IF_NOT_EQUAL, which compare the
++    /// 64-bit report values at `addr` and `addr + 16`.
++    RenderEnableConditional { not_equal: bool, addr: u64 },
++    ResetCounter(u32),
+     Dispatch([u32; 3]),
+     RasterizerDiscard(bool),
+     ReportCounter { counter: u32, addr: u64 },
+@@ -193,7 +199,7 @@ pub fn set_render_targets(a: &Args) -> u64 {
+ pub fn clear_color(a: &Args) -> u64 {
+     let p = a.0[2];
+     let rgba = [rd::<f32>(p), rd::<f32>(p + 4), rd::<f32>(p + 8), rd::<f32>(p + 12)];
+-    push(a.0[0], Cmd::ClearColor { index: a.0[1] as u32, rgba });
++    push(a.0[0], Cmd::ClearColor { index: a.0[1] as u32, rgba, mask: a.0[3] as u32 & 0xF });
+     0
+ }
+ 
+@@ -203,6 +209,12 @@ pub fn clear_depth_stencil(a: &Args) -> u64 {
+ }
+ 
+ pub fn bind_uniform_buffer(a: &Args) -> u64 {
++    if std::env::var_os("NX_NVN_LOG").is_some() {
++        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 20000 == 0 {
++            eprintln!("[nvn] BindUniformBuffer stage {} index {} addr {:#x} size {:#x}", a.0[1], a.0[2], a.0[3], a.0[4]);
++        }
++    }
+     push(a.0[0], Cmd::Uniform { stage: a.0[1] as u32, index: a.0[2] as u32, addr: a.0[3], size: a.0[4] });
+     0
+ }
+@@ -331,7 +343,14 @@ pub fn host_impl(name: &str) -> Option<fn(&Args) -> u64> {
+             0
+         },
+         "nvnCommandBufferSetRenderEnableConditional" => |a| {
+-            push(a.0[0], Cmd::RenderEnable(true));
++            match a.0[1] as u32 {
++                0 | 1 => push(a.0[0], Cmd::RenderEnableConditional { not_equal: a.0[1] as u32 == 1, addr: a.0[2] }),
++                _ => push(a.0[0], Cmd::RenderEnable(true)),
++            }
++            0
++        },
++        "nvnCommandBufferResetCounter" => |a| {
++            push(a.0[0], Cmd::ResetCounter(a.0[1] as u32));
+             0
+         },
+         "nvnCommandBufferReportCounter" => |a| {
+diff --git a/crates/nxhost/src/nvn/draw/mod.rs b/crates/nxhost/src/nvn/draw/mod.rs
+index 206e973..0fecc64 100644
+--- a/crates/nxhost/src/nvn/draw/mod.rs
++++ b/crates/nxhost/src/nvn/draw/mod.rs
+@@ -139,6 +139,10 @@ impl Replay<'_> {
+             let st = &mut self.e.st;
+             match c {
+                 Cmd::SetRenderTargets { colors, depth } => {
++                    if TRACE_DRAWS.load(Relaxed) {
++                        let name = |b: &Option<Box<TexBuilder>>| b.as_ref().and_then(|b| textures::TexKey::of(b)).map_or("-".to_string(), |k| format!("{:#x}/{}/{}x{}", k.addr, k.format, k.width, k.height));
++                        eprintln!("[frame] targets {:?} depth {}", colors.iter().map(name).collect::<Vec<_>>(), name(depth));
++                    }
+                     if self.pass.is_some() && self.e.colors == *colors && self.e.depth == *depth {
+                         continue;
+                     }
+@@ -146,10 +150,13 @@ impl Replay<'_> {
+                     self.e.colors = colors.clone();
+                     self.e.depth = depth.clone();
+                 }
+-                Cmd::ClearColor { index, rgba } => {
+-                    if !st.render_enable {
++                Cmd::ClearColor { index, rgba, mask } => {
++                    // SplatNative: the channel mask was ignored; Splatoon 3 issues clears with
++                    // mask 0 (no channels) right before sampling the target it would wipe.
++                    if !st.render_enable || *mask == 0 {
+                         continue;
+                     }
++                    let scissor = st.scissor;
+                     self.end_pass();
+                     let Some(Some(b)) = self.e.colors.get(*index as usize).cloned() else { continue };
+                     if textures::is_compressed(u32::from_le_bytes(b[0x30..0x34].try_into().unwrap())) {
+@@ -157,10 +164,23 @@ impl Replay<'_> {
+                     }
+                     let Some((key, t)) = self.e.textures.get(&b, true) else { continue };
+                     if TRACE_DRAWS.load(Relaxed) {
+-                        eprintln!("[frame] clear color rt{index} {key:?} = {rgba:?}");
++                        eprintln!("[frame] clear color rt{index} {key:?} = {rgba:?} mask {mask:#x} scissor {scissor:?}");
+                     }
+-                    let c = rgba.map(|x| x as f64);
+                     let sub = super::objects::view_subresource(&b);
++                    // SplatNative: NVN color clears honor the scissor rectangle. Splatoon 3 clears
++                    // sub-rectangles of its downsampling chains and, at the end of a frame, its
++                    // 1920x1080 scene target with a scissor left outside the texture; a full clear
++                    // wiped the finished image. Partial scissors clear only the intersection.
++                    let partial = scissor.and_then(|s| partial_scissor(s, &t.0, sub.1));
++                    if partial.is_some() || *mask != 0xF {
++                        self.flush_clears();
++                        let full = [0, 0, (t.0.width() >> sub.1).max(1) as i32, (t.0.height() >> sub.1).max(1) as i32];
++                        if let Some([x, y, w, h]) = partial.unwrap_or(Some(full)) {
++                            let _ = self.e.copier.clear(&self.cb, &t, sub, [x, y, 0, w, h, 1], *rgba, *mask);
++                        }
++                        continue;
++                    }
++                    let c = rgba.map(|x| x as f64);
+                     self.defer_clear(PendingClear { key, sub, tex: t, load: Load::ClearColor(c), stencil: false });
+                 }
+                 Cmd::ClearDepthStencil { depth: z, stencil } => {
+@@ -233,14 +253,22 @@ impl Replay<'_> {
+                 Cmd::ReportCounter { counter, addr } => {
+                     static T0: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+                     let ns = T0.elapsed().as_nanos() as u64;
+-                    // SplatNative: SAMPLES_PASSED (1) is an occlusion query. Nothing here measures
+-                    // occlusion and conditional rendering is always enabled, so report every
+-                    // query as visible; 0 made Splatoon 3's occlusion culling drop its whole scene.
++                    // SplatNative: SAMPLES_PASSED (1) is a running counter on the GPU, reset by
++                    // ResetCounter. Nothing here measures occlusion, so every report advances it
++                    // by one: any two reports differ and any report after a reset is non-zero,
++                    // i.e. every occlusion query reads as visible (0 made Splatoon 3 cull all).
++                    // Timestamps (0, 16) carry the time only in the timestamp field: the driver
++                    // (sdk 574284b4 0x4ef450) emits a report with payload 0 (type 0, control 0xf002)
++                    // or a 16-byte semaphore release of payload 0 (type 16), so the counter field is
++                    // 0. Splatoon 3 compares that field against 0 to skip clears of its frame; with
++                    // the time there every frame was cleared before it was shown.
+                     let value = match *counter {
+-                        0 | 16 => ns,
+-                        COUNTER_SAMPLES_PASSED => SAMPLES_PASSED_VISIBLE,
++                        COUNTER_SAMPLES_PASSED => SAMPLES_PASSED.fetch_add(1, Relaxed) + 1,
+                         _ => 0,
+                     };
++                    if TRACE_DRAWS.load(Relaxed) {
++                        eprintln!("[frame] report counter {counter} at {addr:#x} = {value:#x}");
++                    }
+                     if *addr != 0 {
+                         unsafe {
+                             (*addr as *mut u64).write_unaligned(value);
+@@ -290,6 +318,18 @@ impl Replay<'_> {
+                     let _ = r;
+                 }
+                 Cmd::RenderEnable(v) => st.render_enable = *v,
++                Cmd::RenderEnableConditional { not_equal, addr } => {
++                    let (a, b) = if *addr == 0 { (0, 0) } else { unsafe { ((*addr as *const u64).read_unaligned(), ((*addr + 16) as *const u64).read_unaligned()) } };
++                    st.render_enable = *addr == 0 || (a == b) != *not_equal;
++                    if TRACE_DRAWS.load(Relaxed) {
++                        eprintln!("[frame] conditional {} at {addr:#x}: {a:#x} vs {b:#x} -> {}", if *not_equal { "!=" } else { "==" }, st.render_enable);
++                    }
++                }
++                Cmd::ResetCounter(counter) => {
++                    if *counter == COUNTER_SAMPLES_PASSED {
++                        SAMPLES_PASSED.store(0, Relaxed);
++                    }
++                }
+                 Cmd::Dispatch(groups) => {
+                     self.end_pass();
+                     self.flush_clears();
+@@ -884,8 +924,21 @@ fn commit(cb: &gfx::CommandBuffer) {
+     cb.commit();
+ }
+ 
++/// For a scissor that does not cover mip `level` of `tex` entirely: Some(Some(rect)) with the
++/// intersection, or Some(None) when it lies outside. None when the scissor covers the level.
++fn partial_scissor([x, y, w, h]: [i32; 4], tex: &gfx::Texture, level: u32) -> Option<Option<[i32; 4]>> {
++    let lw = (tex.width() >> level).max(1) as i64;
++    let lh = (tex.height() >> level).max(1) as i64;
++    let (x, y, w, h) = (x as i64, y as i64, w as i64, h as i64);
++    if x <= 0 && y <= 0 && x + w >= lw && y + h >= lh {
++        return None;
++    }
++    let (x0, y0, x1, y1) = (x.max(0), y.max(0), (x + w).min(lw), (y + h).min(lh));
++    Some((x1 > x0 && y1 > y0).then(|| [x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32]))
++}
++
+ const COUNTER_SAMPLES_PASSED: u32 = 1;
+-const SAMPLES_PASSED_VISIBLE: u64 = u32::MAX as u64;
++static SAMPLES_PASSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ 
+ static FPS: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NX_FPS").is_some());
+ static GPU_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+-- 
+2.56.1
+

@@ -29,13 +29,13 @@ Status: ✅ erledigt · ⏳ in Arbeit · ⛔ blockiert · ☐ offen
 ## Phase 5 – Start auf macOS bis Nintendo-Logo/Hauptmenü ⏳
 1. ⏳ `nxhost` mit Splatoon auf macOS starten, Stub-Log auswerten – SDK-Init komplett, `nnMain` läuft,
    Metal-GPU initialisiert, Display/Account/HID-Dienste werden geöffnet, Grafiksystem und
-   Audio-Renderer laufen an, Assets laden, 3D-Renderpipeline läuft mit 60 fps; Bild noch schwarz
-   (Verlauf: `docs/SPLATOON3_PROFILE.md`, Boot-Protokoll; Mush8-Patches 0006–0025)
+   Audio-Renderer laufen an, Assets laden, **erstes Bild: Erststart-Szene mit UI, 60 fps**
+   (Verlauf: `docs/SPLATOON3_PROFILE.md`, Boot-Protokoll; Mush8-Patches 0006–0026)
 2. ⏳ Fehlende Dienste minimal und korrekt implementieren: ISelfController 44, GetInfo 20,
    HID-Seqlock, Audio-Effektstatus v2 erledigt
 3a. ✅ NVN-Treiber des Splatoon-SDK: API-Version, Strukturlayouts über Getter (`nvn/abi.rs`),
    SetShadersExt, Textur-/Sampler-Getter
-3. ☐ Fehlende NVN-Procs, Shader-Opcodes ergänzen; erste Frames
+3. ⏳ Erste Frames ✅; offen: UI-Skalierung, Shader-Opcodes `Brx`/`R2p`/`IcmpI/IcmpC`
 4. ☐ Pipeline-Liste für Splatoon aufzeichnen (`work/pipelines.tsv`) → AOT
 5. ☐ Savedata, Controller, Audio verifizieren; Hauptmenü erreichen
 
