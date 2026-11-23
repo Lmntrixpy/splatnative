@@ -101,6 +101,7 @@ Jeder Lauf ist auf 120–150 s begrenzt; Logs in `work/runN.log`.
 | 27 | Command-Buffer werden aufgezeichnet, Textur-/Sampler-Getter echt | Hauptthread wartet dauerhaft (`WaitLightEvent`) im Job-System | Ursache: `GetCurrentProcessorNumber` lieferte für jeden Thread Kern 0 |
 | 28–39 | **Assets laden (972 Texturen, ~2,5 GB), 3D-Renderpipeline läuft (Schatten, HDR, Blur), 60 fps Present** | Ausgabe schwarz | Patch 0023 (Kern aus Affinität), 0024 (Occlusion-Queries „sichtbar“), 0025 (Diagnose); Bild offen, siehe unten |
 | 40–56 | **Erstes Bild: 3D-Szene des Erststart-Bildschirms mit UI, 60 fps** | wartet auf Eingabe | Patch 0026: Zähler-Reports wie der Treiber (Zeitstempel nur im Zeitstempel-Feld), bedingtes Rendern ausgewertet, Clears mit Scissor/Kanalmaske |
+| 57–64 | Eingabe per `NX_AUTOINPUT` wirkt; **Texte und Menüs sichtbar** („Wähle einen Style!“) | — | Patch 0027: nxshader übersetzt `BRX`, `ICMP`, `R2P` (≈25 Programme, u. a. Layout-Text); 0028 `NX_TRACE_UBO` |
 
 ### Gelöst: Befund aus Lauf 15
 Der Schreiber `main+0x4529ca8` liegt in der Grafik-Initialisierung hinter der Prüfung
@@ -123,8 +124,10 @@ und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen 
 ### Aktueller Stand (Lauf 56)
 - Erststart-Bildschirm (keine Speicherdaten → Intro/Charaktereinrichtung) mit 3D-Szene, Schatten,
   Tiefenunschärfe und UI-Ebene, 60 fps. Bilder per `NX_DUMP_AT` in `work/frame/` (nicht im Repo).
-- Sichtbarer Fehler: die UI-Ebene erscheint verkleinert im linken oberen Viertel (Skalierung des UI-Passes).
-- Nächster Schritt: Eingabe (Controller/Tastatur bzw. `NX_AUTOINPUT`) bis zum Hauptmenü.
+- Vermeintlicher UI-Skalierungsfehler geklärt: die schrägen Tafeln links oben sind das Layout des Spiels
+  (Positionen aus den Konstantenpuffern nachgerechnet); es fehlten Texte, weil ihre Shader `BRX`/`ICMP`/`R2P`
+  enthielten (Patch 0027).
+- Nächster Schritt: Erststart-Ablauf (Style, Charaktererstellung, Einführung) per Eingabe bis zum Hauptmenü.
 
 ### Sporadisch: Lade-Hänger im Datei-Cache
 - In ~2 von 8 Läufen bleibt der Ladethread in `FileDataCacheSystem::ReserveFreePagesByGatherCompaction`
@@ -133,5 +136,4 @@ und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen 
   Dauerwartens noch offen (Kandidat: Wake/Scheduling im Host).
 
 ### Bekannt offen (nicht blockierend)
-- Shader-Übersetzung: `Brx`, `R2p`, `IcmpI/IcmpC` fehlen in nxshader (≈25 Shader, nicht in den gemessenen Draws).
 - Audio REV15: Voice-Eingabe ist 0x188 statt 0x170 Byte pro Voice; Mush8s Parser nimmt 0x170.

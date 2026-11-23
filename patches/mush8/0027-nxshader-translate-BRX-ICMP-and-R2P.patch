@@ -1,0 +1,149 @@
+From 12eabcaa057658f8c02c653518e102b21868c176 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 10:23:58 +0100
+Subject: [PATCH 27/28] nxshader: translate BRX, ICMP and R2P
+
+About 25 Splatoon 3 programs failed to translate, among them the layout
+text shaders, so menus showed no text:
+
+- BRX (indirect branch): target = next instruction + Ra + sext(imm24) with
+  the same scheduling-word skip as BRA; programs containing BRX get a case
+  label for every instruction in the emitted pc switch.
+- ICMP R/I/C: Rd = (Rc <cmp> 0) ? Ra : Rb.
+- R2P R/I/C (predicate mode): P[i] = bit (byte_sel * 8 + i) of Ra for each
+  mask bit i < 7; the condition-code form is rejected explicitly.
+
+Tests cover the BRX target analysis.
+---
+ crates/nxshader/src/msl.rs     | 63 ++++++++++++++++++++++++++++++++++
+ crates/nxshader/src/program.rs | 29 ++++++++++++++++
+ 2 files changed, 92 insertions(+)
+
+diff --git a/crates/nxshader/src/msl.rs b/crates/nxshader/src/msl.rs
+index 2dc9898..71f3fab 100644
+--- a/crates/nxshader/src/msl.rs
++++ b/crates/nxshader/src/msl.rs
+@@ -672,6 +672,51 @@ impl<'a> Gen<'a> {
+                 self.setp(dpi, format!("bop({bop}u, !c, {p})"));
+                 self.line("}");
+             }
++            // SplatNative: ICMP Rd = (Rc <cmp> 0) ? Ra : Rb.
++            Op::IcmpR | Op::IcmpI | Op::IcmpC => {
++                let (d, a, b, c, cmp, sg) = match i.op {
++                    Op::IcmpR => {
++                        let o = op!(InstIcmpR);
++                        (o.dest(), self.r(o.src_a()), self.r(o.src_b()), self.r(o.src_c()), o.i_comp().0, o.signed())
++                    }
++                    Op::IcmpI => {
++                        let o = op!(InstIcmpI);
++                        (o.dest(), self.r(o.src_a()), format!("{:#x}u", ((o.imm20() << 12) >> 12) as u32), self.r(o.src_c()), o.i_comp().0, o.signed())
++                    }
++                    _ => {
++                        let o = op!(InstIcmpC);
++                        (o.dest(), self.r(o.src_a()), self.cb(o.cbuf_slot(), o.cbuf_offset()), self.r(o.src_c()), o.i_comp().0, o.signed())
++                    }
++                };
++                self.set(d, format!("(icmp({cmp}u, {c}, 0u, {sg}) ? {a} : {b})"));
++            }
++            // SplatNative: R2P (predicate mode): P[i] = bit (byte_sel * 8 + i) of Ra for every
++            // mask bit i < 7.
++            Op::R2pR | Op::R2pI | Op::R2pC => {
++                let (a, mask, sel, ccpr) = match i.op {
++                    Op::R2pR => {
++                        let o = op!(InstR2pR);
++                        (self.r(o.src_a()), self.r(o.src_b()), o.byte_sel().0, o.ccpr())
++                    }
++                    Op::R2pI => {
++                        let o = op!(InstR2pI);
++                        (self.r(o.src_a()), format!("{:#x}u", ((o.imm20() << 12) >> 12) as u32), o.byte_sel().0, o.ccpr())
++                    }
++                    _ => {
++                        let o = op!(InstR2pC);
++                        (self.r(o.src_a()), self.cb(o.cbuf_slot(), o.cbuf_offset()), o.byte_sel().0, o.ccpr())
++                    }
++                };
++                if ccpr {
++                    bail!("R2P to condition codes at {:#x}", i.addr);
++                }
++                self.line(format!("{{ uint m = {mask}, v = {a} >> {}u;", sel * 8));
++                for k in 0..7 {
++                    let cur = self.p(k, false);
++                    self.setp(k, format!("((m >> {k}u) & 1u) != 0u ? ((v >> {k}u) & 1u) != 0u : {cur}"));
++                }
++                self.line("}");
++            }
+             Op::IsetR | Op::IsetI | Op::IsetC => {
+                 let (d, a, b, cmp, s, bop, sp, spi, bv) = match i.op {
+                     Op::IsetR => {
+@@ -1258,6 +1303,24 @@ impl<'a> Gen<'a> {
+                     self.label_target(t);
+                 }
+             }
++            // SplatNative: indirect branch. Target = next instruction + Ra + sext(imm24), with
++            // the scheduling-word skip branch_target applies; every instruction of a program
++            // containing BRX is a case label (program.rs).
++            Op::Brx => {
++                let o = op!(InstBrx);
++                if o.ca() {
++                    bail!("BRX with a constant-buffer target at {:#x}", i.addr);
++                }
++                let a = self.r(o.src_a());
++                let rel = ((o.imm24() << 8) >> 8) as u32;
++                let jump = format!("{{ uint t = {}u + {a} + {rel:#x}u; if ((t & 31u) == 0u) t += 8u; pc = t; continue; }}", i.addr + 8);
++                if o.ccc() != Ccc::T {
++                    self.uses_cc = true;
++                    self.line(format!("if (ccc({}u, zf, nf, cf, vf)) {jump}", o.ccc().0));
++                } else {
++                    self.line(jump);
++                }
++            }
+             Op::Sync | Op::Brk => match self.prog.converge.get(&i.addr) {
+                 Some(&t) => self.label_target(t),
+                 None => {
+diff --git a/crates/nxshader/src/program.rs b/crates/nxshader/src/program.rs
+index 0f3ca6a..a546d39 100644
+--- a/crates/nxshader/src/program.rs
++++ b/crates/nxshader/src/program.rs
+@@ -46,6 +46,11 @@ impl Program {
+         }
+         let mut targets = BTreeSet::new();
+         targets.insert(insts[0].addr);
++        // SplatNative: an indirect branch (BRX) can reach any instruction, so every instruction
++        // of such a program gets a case label in the emitted pc switch.
++        if insts.iter().any(|i| i.name == InstName::Brx) {
++            targets.extend(insts.iter().map(|i| i.addr));
++        }
+         let mut converge = BTreeMap::new();
+         let (mut ssy, mut pbk): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+         for i in &insts {
+@@ -85,3 +90,27 @@ impl Program {
+         Ok(Program { insts, targets, converge })
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn code(words: &[u64]) -> Vec<u8> {
++        words.iter().flat_map(|w| w.to_le_bytes()).collect()
++    }
++
++    #[test]
++    fn brx_makes_every_instruction_a_target() {
++        // [scheduling word, BRX RZ (always), filler, filler]
++        let brx = (0b1110_0010_0101u64 << 52) | (0xff << 8) | 0xf;
++        let p = Program::decode(&code(&[0, brx, 0x50b0_0000_0007_0f00, 0x50b0_0000_0007_0f00])).unwrap();
++        assert_eq!(p.insts[0].name, InstName::Brx);
++        assert_eq!(p.targets.iter().copied().collect::<Vec<_>>(), vec![8, 16, 24]);
++    }
++
++    #[test]
++    fn programs_without_brx_keep_their_branch_targets_only() {
++        let p = Program::decode(&code(&[0, 0x50b0_0000_0007_0f00, 0x50b0_0000_0007_0f00, 0x50b0_0000_0007_0f00])).unwrap();
++        assert_eq!(p.targets.iter().copied().collect::<Vec<_>>(), vec![8]);
++    }
++}
+-- 
+2.56.1
+

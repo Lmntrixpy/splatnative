@@ -1,7 +1,7 @@
 From cf0f48ab1f540e74689dc9b4f32f8f59a59f974c Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:18:10 +0100
-Subject: [PATCH 08/26] nxhost: NVN driver tables for Splatoon 3's sdk
+Subject: [PATCH 08/28] nxhost: NVN driver tables for Splatoon 3's sdk
 
 nvn::init only knew MK8DX's sdk build. Splatoon 3 11.3.0's driver has 534
 procs and a 0x30-byte format-info entry (MK8DX: 477 and 0x34), so the
