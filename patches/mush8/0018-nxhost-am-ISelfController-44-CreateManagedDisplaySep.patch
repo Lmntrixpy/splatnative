@@ -1,7 +1,7 @@
 From 8a5b93c83c5df25730bf5ffc905d13c139a47128 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 05:36:00 +0100
-Subject: [PATCH 18/33] nxhost am: ISelfController 44
+Subject: [PATCH 18/34] nxhost am: ISelfController 44
  CreateManagedDisplaySeparableLayer
 
 Returns (layer id 1, recording layer id 2). The Splatoon 3 sdk's

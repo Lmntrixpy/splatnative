@@ -1,0 +1,42 @@
+From ccbb6e128420a85adc5ed18637db418dc5f41132 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Mon, 23 Nov 2026 21:53:40 +0100
+Subject: [PATCH 34/34] nxhost fs: NX_TRACE_FS logs save-data filesystem
+ operations with paths
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/services/fs.rs | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/crates/nxhost/src/services/fs.rs b/crates/nxhost/src/services/fs.rs
+index 4fea561..3b9d9ee 100644
+--- a/crates/nxhost/src/services/fs.rs
++++ b/crates/nxhost/src/services/fs.rs
+@@ -279,6 +279,9 @@ impl Service for HostFs {
+             }
+             Ok(())
+         })();
++        if trace_fs() {
++            eprintln!("[fs] {} cmd {} {} -> {}", self.name, req.cmd, rel.display(), r.as_ref().map_or_else(|e| e.to_string(), |_| "ok".into()));
++        }
+         match r {
+             Ok(()) => 0,
+             Err(e) => {
+@@ -291,6 +294,12 @@ impl Service for HostFs {
+     }
+ }
+ 
++/// SplatNative: NX_TRACE_FS logs every host-filesystem (save data) operation with its path.
++fn trace_fs() -> bool {
++    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *T.get_or_init(|| std::env::var_os("NX_TRACE_FS").is_some())
++}
++
+ struct HostFile {
+     f: Mutex<File>,
+     append: bool,
+-- 
+2.56.1
+

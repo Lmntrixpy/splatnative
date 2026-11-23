@@ -145,6 +145,19 @@ und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen 
   immer, spätere Signale setzten nur 2 ohne Syscall.
 - Patch 0032 rechnet wie Horizon (Unit-Tests inkl. Zwei-Wartende-Szenario).
 
+### Spielstand: warum jeder Start bei der Style-Wahl beginnt (Läufe 80–85)
+- `NX_TRACE_FS` (Patch 0034): beim Start liest das Spiel `save.dat` und schreibt sie sofort zurück
+  (verschlüsselt, jedes Mal anders). Nach Style-Wahl, Charaktererstellung und bis in den
+  Ballon-Abschnitt des Tutorials (330 s) folgt **kein** weiterer Schreibzugriff.
+- Im Spielcode liegt der Zustand `State::CreateSaveData` in der Erststart-Sequenz
+  `IntroduceFest → NetworkAnalyze → SelectFestRegion → ConfirmFestRegion(_Reboot) → CreateSaveData`
+  (main+0x3b02xxx): der Charakter wird erst nach Tutorial und Wahl der Splatfest-Region gespeichert.
+- Kein Host-Fehler gefunden (Lesen/Schreiben/Commit korrekt, kein hängender Speicher-Thread,
+  alte Arbiter-Semantik ändert nichts). Die frühere Beobachtung „Start direkt im Tutorial“ (Lauf 66)
+  ist nicht reproduzierbar.
+- Offen: Mush8s Speicher-Dateisystem schreibt direkt in die Datei, `Commit` ist ein No-op (Horizon:
+  transaktional). Bei Abbruch während eines Schreibvorgangs könnte der Spielstand beschädigt werden.
+
 ### Beobachtet, noch nicht umgesetzt: Kernzuordnung
 - Threads mit idealem Kern −2 („Prozesswert“) behalten im Host −2, obwohl das Spiel später Masken 0x2/0x4
   setzt; der Host-Scheduler (`sched_core`) ordnet sie alle Kern 0 zu. Horizon löst −2 beim Erzeugen auf

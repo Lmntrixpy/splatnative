@@ -1,7 +1,7 @@
 From f07fd2207dedea45d33bb445730bf5178f450845 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 05:36:00 +0100
-Subject: [PATCH 20/33] nxhost audio: effect StatusData<1> from renderer REV9
+Subject: [PATCH 20/34] nxhost audio: effect StatusData<1> from renderer REV9
 
 The Splatoon 3 sdk reads effect output as StatusData<1> (0x90 bytes per
 effect, EffectManager::UpdateEffectOutStatus 0x2225f0) from REV9
