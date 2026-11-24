@@ -1,7 +1,7 @@
 From d7d04399435020469a864addb8d8647d3d4db595 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Tue, 24 Nov 2026 09:35:53 +0100
-Subject: [PATCH 43/44] nxshader: shaders with more than 16 textures share the
+Subject: [PATCH 43/45] nxshader: shaders with more than 16 textures share the
  last sampler slot
 
 Metal has 16 sampler slots per stage but many more texture slots. Splatoon

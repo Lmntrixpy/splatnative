@@ -17,7 +17,7 @@ steuern Spieler 1 als Pro Controller. Ein angeschlossener Gamepad wird zusätzli
 | L | Q | – |
 | R | E | Sekundärwaffe |
 | ZL | 1, **linke Umschalttaste** | Abtauchen (Tintenfisch) |
-| ZR | 3 | Schießen |
+| ZR | 3, **R**, linke Maustaste (eingefangen) | Schießen |
 | Linker Stick drücken | **G** | – |
 | Rechter Stick drücken | **F** | Spezialwaffe |
 | + | Tab, = | Menü |
@@ -32,13 +32,14 @@ Splatoon 3 zielt standardmäßig mit dem Gyrosensor; senkrecht reagiert die Kame
 den rechten Stick. Der Host meldet für Spieler 1 deshalb einen virtuellen Bewegungssensor, wenn
 kein echter Controller Bewegungsdaten liefert:
 
-- **M** im Spielfenster fängt die Maus ein (Zeiger ausgeblendet und festgehalten). Mausbewegung
+- **Klick ins Spielbild** (Patch 0045) oder **M** fängt die Maus ein (Zeiger ausgeblendet und festgehalten). Mausbewegung
   dreht den virtuellen Controller: links/rechts = Drehung, hoch/runter = Neigung.
 - Maustasten, solange eingefangen: **links = ZR** (Schießen), **rechts = R** (Sekundärwaffe),
   **Mitte = rechter Stick drücken** (Spezialwaffe).
 - **Esc** oder erneut **M** gibt die Maus frei; ebenso jeder Fensterwechsel (Cmd-Tab).
 - Ohne Maus: **I/K** neigen den Sensor mit fester Geschwindigkeit.
-- Nicht eingefangen bleibt der linke Mausklick der Touchscreen (wie bisher).
+- Der erste Klick fängt nur ein und schießt nicht. Mit `NX_CLICK_CAPTURE=0` bleibt ein Klick ohne
+  Einfangen ein Touchscreen-Tipp (Einfangen dann nur mit M).
 
 Die Neigung ist auf ±80° begrenzt; Y (Taste V) setzt im Spiel die Kamera zurück und richtet
 den virtuellen Sensor wieder waagerecht aus (Patch 0040), damit die Grenze danach von der neuen

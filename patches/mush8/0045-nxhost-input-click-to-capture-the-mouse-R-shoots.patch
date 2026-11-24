@@ -1,0 +1,74 @@
+From 537554d52ca5eabc5507e1b323220ed44a0e0dbd Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Tue, 24 Nov 2026 10:07:30 +0100
+Subject: [PATCH 45/45] nxhost input: click to capture the mouse, R shoots
+
+Shooting from the keyboard was only on 3, and an uncaptured left click was
+a touchscreen tap, so clicking never shot. A left click into the game
+picture now captures the mouse (left button = ZR, the mouse aims);
+NX_CLICK_CAPTURE=0 keeps clicks as touchscreen taps. R is a second ZR key
+next to WASD.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/gfx/mod.rs | 23 +++++++++++++++++++++++
+ crates/nxhost/src/input.rs   |  1 +
+ 2 files changed, 24 insertions(+)
+
+diff --git a/crates/nxhost/src/gfx/mod.rs b/crates/nxhost/src/gfx/mod.rs
+index 58a4e06..88a0db2 100644
+--- a/crates/nxhost/src/gfx/mod.rs
++++ b/crates/nxhost/src/gfx/mod.rs
+@@ -422,6 +422,10 @@ pub fn run_app(title: &str, width: f64, height: f64) -> ! {
+         if mouse_aim(unsafe { e.as_ref() }) {
+             return std::ptr::null_mut();
+         }
++        if click_captures(&game, unsafe { e.as_ref() }) {
++            set_mouse_aim(&game, true);
++            return std::ptr::null_mut();
++        }
+         mouse_touch(&game, unsafe { e.as_ref() }, &held);
+         e.as_ptr()
+     });
+@@ -810,6 +814,25 @@ fn set_mouse_aim(window: &NSWindow, on: bool) {
+     eprintln!("[input] mouse aiming {}", if on { "on (M or Esc releases)" } else { "off" });
+ }
+ 
++/// SplatNative: a left click into the game picture captures the mouse (like a PC shooter), so
++/// the left button shoots (ZR) and the mouse aims; the click itself is not passed on. Before,
++/// an uncaptured click was a touchscreen tap and never shot. NX_CLICK_CAPTURE=0 keeps clicks as
++/// touchscreen taps (capture with M only).
++#[cfg(target_os = "macos")]
++fn click_captures(window: &NSWindow, ev: &objc2_app_kit::NSEvent) -> bool {
++    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("NX_CLICK_CAPTURE").as_deref() != Ok("0"));
++    if !*ON || ev.r#type() != objc2_app_kit::NSEventType::LeftMouseDown || keyboard::typing() || !window.isKeyWindow() {
++        return false;
++    }
++    let Some(view) = window.contentView() else { return false };
++    if !ev.window(view.mtm()).is_some_and(|w| std::ptr::eq(&*w, window)) {
++        return false;
++    }
++    let p = view.convertPoint_fromView(ev.locationInWindow(), None);
++    let b = view.bounds().size;
++    p.x >= 0.0 && p.y >= 0.0 && p.x < b.width && p.y < b.height
++}
++
+ /// Mouse events while aiming: returns true when the event was used for aiming.
+ #[cfg(target_os = "macos")]
+ fn mouse_aim(ev: &objc2_app_kit::NSEvent) -> bool {
+diff --git a/crates/nxhost/src/input.rs b/crates/nxhost/src/input.rs
+index ffad5ea..cf0c2b4 100644
+--- a/crates/nxhost/src/input.rs
++++ b/crates/nxhost/src/input.rs
+@@ -822,6 +822,7 @@ impl Acc {
+                 (GCKeyCodeOne, ZL),
+                 (GCKeyCodeLeftShift, ZL),
+                 (GCKeyCodeThree, ZR),
++                (GCKeyCodeKeyR, ZR),
+                 (GCKeyCodeKeyF, STICK_R),
+                 (GCKeyCodeKeyG, STICK_L),
+                 (GCKeyCodeEqualSign, PLUS),
+-- 
+2.56.1
+
