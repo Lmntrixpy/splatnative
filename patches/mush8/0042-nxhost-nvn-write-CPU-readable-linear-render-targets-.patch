@@ -1,0 +1,133 @@
+From d0b4bf100079fe8cd9ad62315286c6f2c4048a8b Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Tue, 24 Nov 2026 09:22:12 +0100
+Subject: [PATCH 42/42] nxhost nvn: write CPU-readable linear render targets
+ back to guest memory
+
+A game that renders into a linear texture (LINEAR or LINEAR_RENDER_TARGET)
+in a CPU-readable pool reads the result from that memory after a fence
+wait; the host drew into a separate Metal texture and never copied it
+back, so the CPU kept seeing stale bytes. Splatoon 3 hands GPU results to
+its game code this way (1x1, 2x2 and 128x1 RGBA32F targets). When a pass
+ends, such color targets are now blitted into guest memory at their row
+pitch, in the same command buffer, so the copy is complete when the
+game's fence wait returns. NX_CPU_TARGET_WRITEBACK=0 turns it off;
+NX_TRACE_CPU_TARGETS=1 logs the first writebacks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/nvn/draw/copy.rs | 33 +++++++++++++++++++++++
+ crates/nxhost/src/nvn/draw/mod.rs  | 42 ++++++++++++++++++++++++++++++
+ 2 files changed, 75 insertions(+)
+
+diff --git a/crates/nxhost/src/nvn/draw/copy.rs b/crates/nxhost/src/nvn/draw/copy.rs
+index 84474eb..7905df2 100644
+--- a/crates/nxhost/src/nvn/draw/copy.rs
++++ b/crates/nxhost/src/nvn/draw/copy.rs
+@@ -285,6 +285,39 @@ pub fn copy_to_buffer(cb: &gfx::CommandBuffer, src: &Texture, (layer, level): (u
+     Ok(())
+ }
+ 
++/// SplatNative: copies a whole mip level of `src` into guest memory at `dst` with `stride` bytes
++/// per row (0: tightly packed), as a linear NVN texture lays it out.
++pub fn copy_rows_to_guest(cb: &gfx::CommandBuffer, src: &Texture, (layer, level): (u32, u32), nvn_format: u32, dst: u64, stride: usize) -> Result<(), &'static str> {
++    let (bw, bh, bpb) = super::super::format_info(nvn_format);
++    let (w, h) = level_size(src, level);
++    let packed = w.div_ceil(bw as usize) * bpb as usize;
++    let row = if stride >= packed { stride } else { packed };
++    let rows = h.div_ceil(bh as usize);
++    let len = (row * (rows - 1) + packed) as u64;
++    let heap = gfx::heap().ok_or("no GPU heap")?;
++    let (chunk, off) = heap.buffer_range(dst, len).ok_or("render target outside one GPU heap chunk")?;
++    if off % bpb as usize != 0 {
++        return Err("unaligned render target");
++    }
++    let Some(enc) = cb.blitCommandEncoder() else { return Err("no blit encoder") };
++    let slice = if layered(src) { layer as usize } else { 0 };
++    unsafe {
++        enc.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
++            src,
++            slice,
++            level as usize,
++            MTLOrigin { x: 0, y: 0, z: 0 },
++            MTLSize { width: w, height: h, depth: 1 },
++            &chunk.buffer.0,
++            off,
++            row,
++            row * rows,
++        )
++    };
++    enc.endEncoding();
++    Ok(())
++}
++
+ pub fn copy_into(cb: &gfx::CommandBuffer, src: &Texture, (layer, level): (u32, u32), r: Region, nvn_format: u32, buffer: &gfx::Buffer, offset: usize) -> Result<(), &'static str> {
+     let [x, y, z, w, h, d] = r.map(|v| v.max(0) as usize);
+     if w == 0 || h == 0 {
+diff --git a/crates/nxhost/src/nvn/draw/mod.rs b/crates/nxhost/src/nvn/draw/mod.rs
+index 5af37bf..3674a81 100644
+--- a/crates/nxhost/src/nvn/draw/mod.rs
++++ b/crates/nxhost/src/nvn/draw/mod.rs
+@@ -94,6 +94,8 @@ impl Engine {
+ }
+ 
+ static ENGINE: LazyLock<Mutex<Engine>> = LazyLock::new(Default::default);
++/// NX_TRACE_CPU_TARGETS=1 also logs the first writebacks of CPU-readable render targets.
++static TRACE_CPU_WRITEBACK: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(std::env::var("NX_TRACE_CPU_TARGETS").is_ok_and(|v| v == "1")));
+ 
+ struct Pass {
+     enc: Retained<RenderEncoder>,
+@@ -429,9 +431,49 @@ impl Replay<'_> {
+         eprintln!("[frame] draw dump {n:04}");
+     }
+ 
++    /// SplatNative: render targets are Metal textures, separate from guest memory. A game that
++    /// renders into a linear texture in a CPU-readable pool (NVN texture flag LINEAR 0x10 or
++    /// LINEAR_RENDER_TARGET 0x40, pool flag CPU_UNCACHED 2 / CPU_CACHED 4) reads the result from
++    /// that memory after waiting on a fence; Splatoon 3 does this with 1x1..128x1 targets. Copy
++    /// such targets back into guest memory at their row pitch; the blit is in the same command
++    /// buffer, so it is done when the game's fence wait returns. NX_CPU_TARGET_WRITEBACK=0 turns
++    /// it off.
++    fn write_back_cpu_targets(&mut self) {
++        static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("NX_CPU_TARGET_WRITEBACK").as_deref() != Ok("0"));
++        if !*ON {
++            return;
++        }
++        let u32_at = |b: &TexBuilder, o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
++        for b in self.e.colors.clone().into_iter().flatten() {
++            if u32_at(&b, 0x18) & 0x50 == 0 {
++                continue;
++            }
++            let pool = u64::from_le_bytes(b[8..16].try_into().unwrap());
++            let (key, readable) = {
++                let s = STATE.lock().unwrap();
++                (textures::TexKey::of_in(&b, &s), s.pools.get(&pool).is_some_and(|p| p.flags & 6 != 0 && p.cpu != 0))
++            };
++            let Some(key) = key.filter(|k| readable && k.addr >> 63 == 0) else { continue };
++            if textures::is_compressed(key.format) || gfx::has_stencil(key.format) {
++                continue;
++            }
++            let Some((_, tex)) = self.e.textures.cached(&key) else { continue };
++            let sub = super::objects::view_subresource(&b);
++            let stride = u32_at(&b, 0x5c) as usize;
++            let r = copy::copy_rows_to_guest(&self.cb, &tex.0, sub, key.format, key.addr, stride);
++            if TRACE_CPU_WRITEBACK.load(Relaxed) {
++                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++                if N.fetch_add(1, Relaxed) < 200 {
++                    eprintln!("[cpu-target] write back {:#x} {}x{} fmt {} stride {stride}: {r:?}", key.addr, key.width, key.height, key.format);
++                }
++            }
++        }
++    }
++
+     fn end_pass(&mut self) {
+         if let Some(p) = self.pass.take() {
+             p.enc.endEncoding();
++            self.write_back_cpu_targets();
+             for (k, sub) in &p.keys {
+                 if let Some((_, src)) = self.e.textures.cached(k) {
+                     for (dst, soft) in self.e.textures.aliases_of(k) {
+-- 
+2.56.1
+

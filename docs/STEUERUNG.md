@@ -40,7 +40,22 @@ kein echter Controller Bewegungsdaten liefert:
 - Ohne Maus: **I/K** neigen den Sensor mit fester Geschwindigkeit.
 - Nicht eingefangen bleibt der linke Mausklick der Touchscreen (wie bisher).
 
-Die Neigung ist auf ±80° begrenzt; Y (Taste V) setzt im Spiel die Kamera zurück.
+Die Neigung ist auf ±80° begrenzt; Y (Taste V) setzt im Spiel die Kamera zurück und richtet
+den virtuellen Sensor wieder waagerecht aus (Patch 0040), damit die Grenze danach von der neuen
+Mitte aus zählt.
+
+## Gamepad (Patch 0040)
+
+Splatoon 3 zielt senkrecht nur mit dem Bewegungssensor; der rechte Stick dreht im Gyro-Modus nur
+waagerecht. Ein Gamepad ohne Bewegungsdaten (jedes Gamepad ohne `NX_MOTION=1`, oder ohne Gyro wie
+Xbox-Controller) bekommt deshalb ebenfalls den virtuellen Sensor: **rechter Stick hoch/runter neigt
+ihn** wie I/K, mit `NX_KEY_GYRO_RATE` bei Vollausschlag. Unter 15 % Ausschlag passiert nichts
+(Stick-Drift soll die Kamera nicht langsam wegdrehen). Waagerecht liest das Spiel den Stick selbst.
+
+- Echtes Gyro-Zielen mit Pro Controller/DualSense: `NX_MOTION=1`; dann ersetzt der echte Sensor
+  den virtuellen und der Stick neigt nicht mehr.
+- Wer im Spiel die Bewegungssteuerung ausschaltet, zielt mit dem Stick direkt; der virtuelle
+  Sensor wird dann vom Spiel ignoriert.
 
 ### Einstellungen (Umgebungsvariablen)
 
@@ -57,7 +72,9 @@ den virtuellen Sensor mit `NX_KEY_GYRO_RATE` drehen, z. B. `NX_AUTOINPUT="336:AI
 
 ## Umsetzung
 
-- `crates/nxhost/src/input.rs`: `VirtualGyro` erzeugt Drehrate (rad/s) und eine dazu passende
+- `crates/nxhost/src/input.rs`: je Spieler ein `VirtualGyro` (Tastatur-Spieler, Gamepads und
+  iPhone-Controller ohne eigene Bewegungsdaten); die Neigung kommt aus der senkrechten Achse des
+  rechten Sticks nach Totzone (`stick_tilt`), I/K landen auf derselben Achse. `VirtualGyro` erzeugt Drehrate (rad/s) und eine dazu passende
   Schwerkraftrichtung (Beschleunigung `[0, −sin θ, −cos θ]` bei Neigung θ nach oben). Mausbewegung wird nicht
   in einem einzigen 5-ms-Abtastwert gemeldet, sondern mit einer Zeitkonstante von 12 ms verteilt,
   damit ein Spiel, das pro Bild nur den jüngsten Abtastwert liest, die ganze Drehung sieht

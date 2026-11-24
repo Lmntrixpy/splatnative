@@ -1,7 +1,7 @@
 From 68acb20be28fad175076fbcac4bc60e72b8804dc Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 06:27:36 +0100
-Subject: [PATCH 24/39] nxhost nvn: report SAMPLES_PASSED occlusion queries as
+Subject: [PATCH 24/42] nxhost nvn: report SAMPLES_PASSED occlusion queries as
  visible
 
 Counter type 1 (SAMPLES_PASSED) was written as 0. Nothing here measures

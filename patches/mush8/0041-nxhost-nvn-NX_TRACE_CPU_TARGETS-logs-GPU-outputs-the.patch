@@ -1,0 +1,94 @@
+From f738f20d5a5857409e9a2caa6d29f92abb3d1890 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Tue, 24 Nov 2026 09:22:12 +0100
+Subject: [PATCH 41/42] nxhost nvn: NX_TRACE_CPU_TARGETS logs GPU outputs the
+ CPU can read
+
+Logs once per texture every render target and texture-to-buffer copy whose
+memory pool is CPU-readable (CPU_UNCACHED or CPU_CACHED). Render targets
+are Metal textures, so a game that reads such memory on the CPU sees what
+was there before the GPU drew. Splatoon 3 renders into seven 1x1/2x2/128x1
+RGBA32F targets with LINEAR_RENDER_TARGET in CPU-cached pools.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/nvn/cmd.rs | 52 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/crates/nxhost/src/nvn/cmd.rs b/crates/nxhost/src/nvn/cmd.rs
+index 6eb530b..5aabe2b 100644
+--- a/crates/nxhost/src/nvn/cmd.rs
++++ b/crates/nxhost/src/nvn/cmd.rs
+@@ -179,9 +179,57 @@ fn rd_vec<T: Copy>(addr: u64, n: u64) -> Vec<T> {
+     (0..n).map(|i| rd::<T>(addr + i * std::mem::size_of::<T>() as u64)).collect()
+ }
+ 
++/// SplatNative: NX_TRACE_CPU_TARGETS=1 logs, once per texture object, every render target and
++/// texture-to-buffer copy source/destination whose memory the CPU can read (pool flag
++/// CPU_UNCACHED 2 or CPU_CACHED 4). Render targets live in Metal textures, so if the game reads
++/// such a texture's memory on the CPU it sees what was there before the GPU drew (no writeback).
++fn trace_cpu_targets() -> bool {
++    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("NX_TRACE_CPU_TARGETS").is_ok_and(|v| v == "1"));
++    *ON
++}
++
++fn trace_cpu_texture(kind: &str, obj: u64) {
++    static SEEN: Mutex<BTreeMap<(u64, u64), ()>> = Mutex::new(BTreeMap::new());
++    let Some(t) = super::objects::texture(obj) else { return };
++    let pool = u64::from_le_bytes(t.builder[8..16].try_into().unwrap());
++    let offset = u64::from_le_bytes(t.builder[16..24].try_into().unwrap());
++    let Some(p) = STATE.lock().unwrap().pools.get(&pool).copied() else { return };
++    if p.flags & 6 == 0 || SEEN.lock().unwrap().insert((obj, pool ^ offset), ()).is_some() {
++        return;
++    }
++    eprintln!(
++        "[cpu-target] t {:.2} {kind} tex {obj:#x} {}x{}x{} fmt {} levels {} target {} texflags {:#x} at {:#x} (pool {pool:#x} flags {:#x} size {:#x})",
++        crate::gfx::clock(),
++        t.width(),
++        t.height(),
++        t.depth(),
++        t.format(),
++        t.levels(),
++        t.target(),
++        t.u32(0x18),
++        p.cpu + offset,
++        p.flags,
++        p.size
++    );
++}
++
++fn trace_cpu_buffer(dst: u64) {
++    static SEEN: Mutex<BTreeMap<u64, ()>> = Mutex::new(BTreeMap::new());
++    if SEEN.lock().unwrap().insert(dst, ()).is_some() {
++        return;
++    }
++    let pool = STATE.lock().unwrap().pools.values().find(|p| dst >= p.cpu && dst < p.cpu + p.size).copied();
++    eprintln!("[cpu-target] t {:.2} copy-to-buffer dst {dst:#x} pool flags {:#x}", crate::gfx::clock(), pool.map_or(0, |p| p.flags));
++}
++
+ pub fn set_render_targets(a: &Args) -> u64 {
+     let n = a.0[1] as usize;
+     let objs: Vec<u64> = (0..n).map(|i| if a.0[2] == 0 { 0 } else { rd::<u64>(a.0[2] + 8 * i as u64) }).collect();
++    if trace_cpu_targets() {
++        for &o in objs.iter().chain([a.0[4]].iter()).filter(|&&o| o != 0) {
++            trace_cpu_texture("render-target", o);
++        }
++    }
+     let builder = |t: u64, view: u64| {
+         super::objects::texture(t).map(|t| {
+             let mut b = Box::new(t.builder);
+@@ -323,6 +371,10 @@ pub fn host_impl(name: &str) -> Option<fn(&Args) -> u64> {
+             0
+         },
+         "nvnCommandBufferCopyTextureToBuffer" => |a| {
++            if trace_cpu_targets() {
++                trace_cpu_texture("copy-source", a.0[1]);
++                trace_cpu_buffer(a.0[4]);
++            }
+             if let Some(src) = view_builder(a.0[1], a.0[2]) {
+                 push(a.0[0], Cmd::CopyTextureToBuffer { src, region: rd(a.0[3]), dst: a.0[4] });
+             }
+-- 
+2.56.1
+

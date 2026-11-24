@@ -1,0 +1,171 @@
+From 6821afa70405ca44dead39fa4ee0591d44cd4815 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Tue, 24 Nov 2026 03:09:40 +0100
+Subject: [PATCH 40/42] nxhost input: the right stick tilts the virtual motion
+ sensor for gamepads
+
+Splatoon 3 aims with the motion sensor by default and then reads the right
+stick only horizontally, so a gamepad without motion data (any pad unless
+NX_MOTION=1, or one without a gyro) could not look up or down. Every player
+without real motion data now gets its own virtual sensor, and the right
+stick's vertical axis tilts it (15% dead zone against stick drift); I/K on
+the keyboard are that same axis. Y, which recentres Splatoon 3's camera,
+levels the virtual controller so the pitch limit counts from the new centre.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/input.rs | 71 +++++++++++++++++++++++++++++++-------
+ 1 file changed, 58 insertions(+), 13 deletions(-)
+
+diff --git a/crates/nxhost/src/input.rs b/crates/nxhost/src/input.rs
+index 20a689d..ffad5ea 100644
+--- a/crates/nxhost/src/input.rs
++++ b/crates/nxhost/src/input.rs
+@@ -209,6 +209,15 @@ pub struct VirtualGyro {
+ 
+ const GYRO_SPREAD: f32 = 0.012;
+ const MAX_PITCH: f32 = 1.4;
++/// Right-stick deflection below this does not tilt the virtual sensor (stick drift would
++/// otherwise turn the camera slowly forever); above it the axis is rescaled to 0..1.
++const STICK_TILT_DEADZONE: f32 = 0.15;
++
++/// Vertical right-stick deflection as a tilt axis for the virtual sensor.
++fn stick_tilt(y: f32) -> f32 {
++    let y = y.clamp(-1.0, 1.0);
++    ((y.abs() - STICK_TILT_DEADZONE).max(0.0) / (1.0 - STICK_TILT_DEADZONE)).copysign(y)
++}
+ 
+ impl VirtualGyro {
+     const fn new() -> Self {
+@@ -246,6 +255,13 @@ impl VirtualGyro {
+         let (s, c) = self.pitch.sin_cos();
+         Motion { accel: [0.0, -s, -c], gyro }
+     }
++
++    /// The game recentred its camera (Y in Splatoon 3): level the virtual controller again so
++    /// the pitch limit counts from the new centre and a pending turn is not replayed.
++    pub fn level(&mut self) {
++        self.pitch = 0.0;
++        self.pending[1] = 0.0;
++    }
+ }
+ 
+ pub static TOUCH_BUTTONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+@@ -381,7 +397,7 @@ pub struct Pads {
+     touch_init: bool,
+     idle: bool,
+     phone: Phone,
+-    vgyro: VirtualGyro,
++    vgyro: [VirtualGyro; MAX_PLAYERS],
+     #[cfg(target_os = "macos")]
+     sdl_failed: crate::sdl::OpenOnce,
+ }
+@@ -401,7 +417,7 @@ impl Pads {
+             touch_init: false,
+             idle: false,
+             phone: Default::default(),
+-            vgyro: VirtualGyro::new(),
++            vgyro: std::array::from_fn(|_| VirtualGyro::new()),
+             #[cfg(target_os = "macos")]
+             sdl_failed: Default::default(),
+         }
+@@ -614,9 +630,8 @@ impl Pads {
+                     acc.remote(pad);
+                 }
+                 let keys = key_slot == Some(i) && !crate::gfx::keyboard::typing();
+-                let mut tilt = 0.0;
+                 if keys {
+-                    tilt = acc.keyboard();
++                    acc.keyboard();
+                 }
+                 if touch_slot == Some(i) {
+                     acc.touch();
+@@ -643,13 +658,23 @@ impl Pads {
+                 } else {
+                     None
+                 };
++                // Players without a real motion sensor (keyboard, or a gamepad without NX_MOTION=1
++                // or without a gyro) get the virtual one. Splatoon 3 aims vertically only with the
++                // sensor by default, so the right stick's vertical axis (gamepad, or I/K) tilts it;
++                // horizontally the game reads the stick itself.
++                let virtual_sensor = key_slot == Some(i) || slot.is_some() || remote.is_some();
+                 let sample = sample.or_else(|| {
+-                    (key_slot == Some(i) && VirtualGyro::enabled()).then(|| {
++                    (virtual_sensor && VirtualGyro::enabled()).then(|| {
+                         static SENS: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| env_f32("NX_MOUSE_SENS", 0.003));
+                         static RATE: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| env_f32("NX_KEY_GYRO_RATE", 1.5));
++                        let g = &mut vgyro[i];
++                        if acc.buttons & Y != 0 {
++                            g.level();
++                        }
+                         let turn = if keys { (mouse.0 * *SENS, -mouse.1 * *SENS) } else { (0.0, 0.0) };
+                         let aim = scripted_aim(i);
+-                        (vgyro.sample(turn, (aim.0, aim.1 + tilt), *RATE, std::time::Instant::now()), false)
++                        let tilt = stick_tilt(acc.ry);
++                        (g.sample(turn, (aim.0, aim.1 + tilt), *RATE, std::time::Instant::now()), false)
+                     })
+                 });
+                 MOTION.lock().unwrap()[i] = sample;
+@@ -775,14 +800,14 @@ impl Acc {
+         self.ly += f32::from_bits(s as u32);
+     }
+ 
+-    /// Keyboard (and captured mouse) as a Pro Controller; returns the I/K axis, which also
+-    /// tilts the virtual motion sensor.
+-    unsafe fn keyboard(&mut self) -> f32 {
++    /// Keyboard (and captured mouse) as a Pro Controller. I/K are the right stick's vertical
++    /// axis, which also tilts the virtual motion sensor.
++    unsafe fn keyboard(&mut self) {
+         if MOUSE_AIM.load(std::sync::atomic::Ordering::Relaxed) {
+             self.buttons |= MOUSE_BUTTONS.load(std::sync::atomic::Ordering::Relaxed);
+         }
+         unsafe {
+-            let Some(k) = GCKeyboard::coalescedKeyboard().and_then(|k| k.keyboardInput()) else { return 0.0 };
++            let Some(k) = GCKeyboard::coalescedKeyboard().and_then(|k| k.keyboardInput()) else { return };
+             let down = |code: GCKeyCode| k.buttonForKeyCode(code).is_some_and(|b| b.isPressed());
+             let keys = [
+                 (GCKeyCodeKeyX, A),
+@@ -816,9 +841,7 @@ impl Acc {
+             self.lx += axis(GCKeyCodeKeyA, GCKeyCodeKeyD);
+             self.ly += axis(GCKeyCodeKeyS, GCKeyCodeKeyW);
+             self.rx += axis(GCKeyCodeKeyJ, GCKeyCodeKeyL);
+-            let tilt = axis(GCKeyCodeKeyK, GCKeyCodeKeyI);
+-            self.ry += tilt;
+-            tilt
++            self.ry += axis(GCKeyCodeKeyK, GCKeyCodeKeyI);
+         }
+     }
+ 
+@@ -874,6 +897,28 @@ mod tests {
+         assert!(m.gyro[0] > 0.0, "turning back down works at once");
+     }
+ 
++    #[test]
++    fn stick_tilt_ignores_drift_and_reaches_full_speed() {
++        assert_eq!(stick_tilt(0.1), 0.0);
++        assert_eq!(stick_tilt(-0.15), 0.0);
++        assert!((stick_tilt(1.0) - 1.0).abs() < 1e-6);
++        assert!((stick_tilt(-1.3) + 1.0).abs() < 1e-6);
++        assert!(stick_tilt(0.5) > 0.0 && stick_tilt(-0.5) < 0.0);
++    }
++
++    #[test]
++    fn levelling_frees_the_pitch_limit() {
++        let mut g = VirtualGyro::new();
++        let t0 = std::time::Instant::now();
++        g.sample((0.0, 0.0), (0.0, 0.0), 1.5, t0);
++        for n in 1..200 {
++            g.sample((0.0, 0.0), (0.0, 1.0), 1.5, t0 + std::time::Duration::from_millis(5 * n));
++        }
++        g.level();
++        let m = g.sample((0.0, 0.0), (0.0, 1.0), 1.5, t0 + std::time::Duration::from_millis(1000));
++        assert!(m.gyro[0] < 0.0, "aiming up works again after the camera reset");
++    }
++
+     #[test]
+     fn pad_driver_parse() {
+         assert_eq!(PadDriver::parse(None), PadDriver::Apple);
+-- 
+2.56.1
+

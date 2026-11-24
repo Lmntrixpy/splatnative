@@ -1,7 +1,7 @@
 From a9751be2436a82c210ef978064ee5f0a4141615b Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:23:11 +0100
-Subject: [PATCH 11/39] nxhost: time shared memory (IStaticService 20)
+Subject: [PATCH 11/42] nxhost: time shared memory (IStaticService 20)
 
 Splatoon 3's nn::time::Initialize maps the time service's shared memory
 (GetSharedMemoryNativeHandle) and aborted on Mush8's stub. The shared

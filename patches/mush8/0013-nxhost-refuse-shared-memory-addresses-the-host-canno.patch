@@ -1,7 +1,7 @@
 From 16364e670cc6ff69798d49ff6618618be49d9bd2 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:27:46 +0100
-Subject: [PATCH 13/39] nxhost: refuse shared memory addresses the host cannot
+Subject: [PATCH 13/42] nxhost: refuse shared memory addresses the host cannot
  map
 
 Guest shared memory is mapped with host mmap (16 KiB pages) while the guest

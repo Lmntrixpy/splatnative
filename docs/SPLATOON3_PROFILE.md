@@ -106,6 +106,8 @@ Jeder Lauf ist auf 120–150 s begrenzt; Logs in `work/runN.log`.
 | 72–st75 | Ladebildschirm hängt sporadisch (~1 von 5 Starts, auch beim Nutzer) | — | Patch 0032: `SignalToAddress` (ModifyByWaitingCount) wie Horizon; 0033 `NX_THREAD_DUMP_AT`, sichere Probes. Danach 15/15 Starts ohne Hänger |
 | 86–94 | **Zielen per Bewegungssteuerung ohne Gyro-Controller**: Spiel liest den virtuellen Sensor, Kamera folgt (hoch/runter, links/rechts geprüft) | — | Patch 0035: virtueller Sechsachsensensor (Maus/I-K), vollständige Tastenbelegung (`docs/STEUERUNG.md`); 0036 `NX_TRACE_MOTION` |
 | 95–116 | **Tutorial ohne Geometriefehler** (keine flachen Keile/Balken mehr), alle Compute-Shader laufen | Beine/Arme der Figur fehlen; 2 Shader mit >16 Texturen | Patch 0037: Compute-Programmkopf, `LDS`/`STS`, unausgerichtete Vertex-Attribute; 0038/0039 Draw-Diagnose (`NX_DUMP_EACH_DRAW`, `NX_DUMP_DRAW_BUFFERS`) |
+| 117–119 | **Gamepad zielt senkrecht**: rechter Stick hoch/runter dreht den virtuellen Sensor (`RUP`/`RDOWN` per Skript, `NX_TRACE_MOTION`) | Wandklettern im Tutorial klappt laut Nutzer nicht (siehe unten) | Patch 0040: virtueller Sensor je Spieler, auch für Gamepads ohne Bewegungsdaten; Y richtet ihn neu aus |
+| 120–121 | CPU-lesbare lineare Render-Targets gefunden und zurückgeschrieben | Wandklettern/Schwimmtempo im Tutorial ungeprüft | Patch 0041 `NX_TRACE_CPU_TARGETS`; 0042 Rückschreiben in den Gastspeicher |
 
 ### Gelöst: Befund aus Lauf 15
 Der Schreiber `main+0x4529ca8` liegt in der Grafik-Initialisierung hinter der Prüfung
@@ -197,6 +199,49 @@ und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen 
 - **Offen:** Zwei Fragment-Shader (`a791e3bcb93355bb`, `11c0b56ba2312e14`, ab ca. 200 s) nutzen mehr als 16
   Texturen; Metal erlaubt 16 Sampler pro Stufe, die Draws fallen aus. Lösung braucht Sampler im
   Argument-Buffer.
+
+### Gamepad: senkrechtes Zielen (Läufe 117–119)
+- Ursache: Splatoon 3 zielt standardmäßig per Gyro und liest dann den rechten Stick nur waagerecht.
+  Der virtuelle Sensor (Patch 0035) hing nur am Tastatur-Spieler und nahm nur I/K als Neigung.
+- Patch 0040: jeder Spieler ohne echte Bewegungsdaten bekommt einen eigenen virtuellen Sensor, die
+  senkrechte Achse des rechten Sticks (Totzone 15 %) neigt ihn. Läufe 118/119: `RUP` erzeugt dieselben
+  Drehraten wie `AIMUP` (−0,24 U/s = −1,5 rad/s), `RDOWN` dreht zurück; an der Grenze (±80°) wird
+  weiteres Hochziehen verworfen. In Lauf 117 erschien keine einzige Trace-Zeile (nicht wiederholbar).
+
+### Tutorial-Navigation (Hinweis des Nutzers)
+- In der Charaktererstellung muss nach der Wahl der Hose und nach der Wahl der Frisur jeweils
+  **zweimal Rechts** gedrückt werden, um zum nächsten Abschnitt zu kommen (für Skripte mit `NX_AUTOINPUT`).
+
+### Offen: Wandklettern im Tutorial (Recherche, nicht selbst getestet)
+- Spielmechanik: Die Wand muss in der eigenen Farbe eingefärbt sein (mit ZR anschießen), dann ZL
+  halten (Tintenfisch) und den linken Stick **in die Wand** drücken; man muss dabei in der eigenen
+  Tinte sein. Kein Sprinten nötig, auch kein Sprung (B); B an der Wandkante ist ein optionaler
+  Sprung („Squid Surge“). Nicht jede Oberfläche ist färbbar (Gitter, Metall, glatte Kanten).
+- Ohne funktionierendes Hoch-/Runterzielen (Gamepad vor Patch 0040) trifft man die Wand evtl. nur
+  am Fuß; das reicht normalerweise zum Einsteigen, ist aber unbequem.
+- Emulator-Berichte: Splatoon 2 auf yuzu/Ryujinx – Tintenfisch taucht nicht in die eigene Tinte ein,
+  Tutorial blockiert an der Wand; auf yuzu half „Asynchronous GPU Emulation“ (also eine Frage, wann
+  GPU-Ergebnisse für die CPU sichtbar werden). Das Spiel erfährt, ob unter dem Spieler Tinte ist, über
+  Ergebnisse der GPU (Farbkarte der Tinte); stimmen die nicht, scheitern Schwimmen und Klettern.
+- Host-Kandidaten: (1) die zwei Fragment-Shader mit >16 Texturen, deren Draws ab ca. 200 s ausfallen
+  – falls sie Tinte in die Farbkarte schreiben, landet sie sichtbar, aber nicht „echt“; (2) Rückschreiben
+  von GPU-Ergebnissen (Compute/Render-Targets) in den Gastspeicher, das die CPU später liest.
+- Antwort des Nutzers: auf dem Boden taucht der Tintenfisch ein und der Tank füllt sich, er ist
+  aber **nicht schneller** als zu Fuß; Tinte an der Wand ist sichtbar. → Tinten-Erkennung arbeitet
+  nur teilweise; Schwimmtempo und Klettern brauchen einen durchgehend gültigen „in Tinte“-Zustand.
+- Spiel-Strings: eigenes Kollisions-Tintensystem `spl::paint::ColPaint*` (Panels, Pixelbereiche,
+  getrennte Octrees `ColPaintHorizontal`/`ColPaintVertical`, Thread `ColPaintThread`), Textur-Namen
+  `cInkTex, cHeightTex, cDstPaintTex`.
+- **Gefunden (Lauf 120, `NX_TRACE_CPU_TARGETS=1`, Patch 0041):** Das Spiel rendert in sieben winzige
+  Render-Targets (1×1, 2×2, 128×1, RGBA32F, Texturflag 0x40 `LINEAR_RENDER_TARGET`) in Pools mit
+  Flag 0x24 (CPU_CACHED|GPU_CACHED) – der übliche Weg, GPU-Ergebnisse an den CPU-Code zu geben.
+  Mush8 rendert in eigene Metal-Texturen und hat diese nie in den Gastspeicher zurückgeschrieben: die
+  CPU las immer alte Bytes.
+- **Patch 0042:** am Ende jedes Passes werden solche Targets per Blit in den Gastspeicher kopiert
+  (Zeilenabstand der Textur, gleicher Command-Buffer → fertig, wenn die Fence-Wartezeit des Spiels
+  endet). Lauf 121: alle sieben Targets werden fehlerfrei zurückgeschrieben, Menüs laufen normal.
+  Ob das die Tinten-Abfrage ist, muss ein Tutorial-Lauf zeigen (`NX_TRACE_CPU_TARGETS=1` listet
+  dort neu auftauchende Targets). Abschalten: `NX_CPU_TARGET_WRITEBACK=0`.
 
 ### Beobachtet, noch nicht umgesetzt: Kernzuordnung
 - Threads mit idealem Kern −2 („Prozesswert“) behalten im Host −2, obwohl das Spiel später Masken 0x2/0x4
