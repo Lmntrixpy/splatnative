@@ -4,3 +4,4 @@
 /research/
 *.keys
 .DS_Store
+xcuserdata/
