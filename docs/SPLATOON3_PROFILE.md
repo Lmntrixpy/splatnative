@@ -259,9 +259,9 @@ und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen 
   mit je einem Report – Mush8 meldete immer 1. Jetzt echte Zählung über Metal-Visibility-Results
   (Slots je Intervall und Pass, Accumulate, Auflösung nach Abschluss des Command-Buffers). Lauf 125:
   Werte 0, 46–52, bis 1830; Menüszene vollständig (keine Fehl-Cullings). Abschalten:
-  `NX_REAL_OCCLUSION=0`, Trace: `NX_TRACE_OCCLUSION=1`. Tutorial-Test durch den Nutzer offen.
-- Weitere Kandidaten, falls 0043 nicht reicht: gefälschte Occlusion-Queries (`SAMPLES_PASSED` +1 je
-  Report statt echter Pixelzahl), Thread-Kernzuordnung (`ColPaintThread`).
+  `NX_REAL_OCCLUSION=0`, Trace: `NX_TRACE_OCCLUSION=1`.
+- **Nutzer-Lauf mit 0046: funktioniert.** Die gefälschten Occlusion-Queries waren die Ursache; die
+  Tinten-Abfrage des Spiels braucht echte Pixelzahlen.
 
 ### Beobachtet, noch nicht umgesetzt: Kernzuordnung
 - Threads mit idealem Kern −2 („Prozesswert“) behalten im Host −2, obwohl das Spiel später Masken 0x2/0x4
