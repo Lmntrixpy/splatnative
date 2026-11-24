@@ -69,7 +69,9 @@ final class Settings: ObservableObject {
         dlc = j["dlc"] as? String ?? ""
         keys = j["keys"] as? String ?? ""
         firmware = j["firmware"] as? String ?? ""
-        network = j["network"] as? String ?? "off"
+        // LAN and Lan-Play make nifm report a connected network; Splatoon 3 then starts its
+        // online setup and never leaves the loading screen. Only off and wireless work so far.
+        network = ["off", "wireless"].contains(j["network"] as? String ?? "") ? j["network"] as! String : "off"
         lanInterface = j["lan_interface"] as? String ?? ""
         lanPlayServer = j["lanplay_server"] as? String ?? ""
         nickname = j["nickname"] as? String ?? ""

@@ -61,8 +61,6 @@ struct LauncherView: View {
 
     var modeName: String {
         switch s.network {
-        case "lan": "LAN"
-        case "lanplay": "Lan-Play"
         case "wireless": "Wireless"
         default: "Off"
         }
@@ -81,21 +79,7 @@ struct LauncherView: View {
             Section {
                 Picker("Mode", selection: $s.network) {
                     Text("Off").tag("off")
-                    Text("LAN").tag("lan")
-                    Text("Lan-Play").tag("lanplay")
                     Text("Wireless (nearby)").tag("wireless")
-                }
-                if s.network == "lan" {
-                    Picker("Network", selection: $s.lanInterface) {
-                        Text("Automatic").tag("")
-                        ForEach(sys.interfaces, id: \.self) { n in Text("\(n.name) · \(n.ip)").tag(n.name) }
-                    }
-                }
-                if s.network == "lanplay" {
-                    TextField("Server", text: $s.lanPlayServer, prompt: Text("host:port"))
-                        #if os(iOS)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
-                        #endif
                 }
             } footer: {
                 Text(multiplayerNote).font(.caption).foregroundStyle(.secondary)
@@ -105,10 +89,8 @@ struct LauncherView: View {
 
     var multiplayerNote: String {
         switch s.network {
-        case "lan": "Switch consoles and SplatNative players on the same network can join (LAN Play mode in the game)"
-        case "lanplay": "Players on the same Lan-Play server can join"
         case "wireless": "Nearby SplatNative players can join local play (keep Wi-Fi on)"
-        default: "Online play through Nextendo comes later"
+        default: "LAN, Lan-Play and online play come later: with a network connected the game currently hangs on the loading screen"
         }
     }
 
