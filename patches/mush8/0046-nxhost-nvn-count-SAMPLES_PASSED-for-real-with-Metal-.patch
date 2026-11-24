@@ -1,7 +1,7 @@
 From 2ece8dbf878e68c5a68f5ea4157fff4fe72be8fe Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Tue, 24 Nov 2026 10:19:31 +0100
-Subject: [PATCH 46/46] nxhost nvn: count SAMPLES_PASSED for real with Metal
+Subject: [PATCH 46/47] nxhost nvn: count SAMPLES_PASSED for real with Metal
  visibility results
 
 Every SAMPLES_PASSED report used to read "one more than the last", which

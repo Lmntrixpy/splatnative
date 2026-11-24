@@ -1,7 +1,7 @@
 From 9f295e851e7711ea35261712a11f5d7fe6d0a0bc Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:06:16 +0100
-Subject: [PATCH 04/46] nxfs: open XCI game card images
+Subject: [PATCH 04/47] nxfs: open XCI game card images
 
 Splatoon 3's base game here is a game card dump (XCI). nxfs only read NSP
 (PFS0) files. hfs0.rs parses HFS0 partitions (unencrypted), xci.rs finds

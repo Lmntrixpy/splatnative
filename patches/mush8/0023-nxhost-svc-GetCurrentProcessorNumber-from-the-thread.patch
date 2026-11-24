@@ -1,7 +1,7 @@
 From b0d3df2075397d4d0eaa0482f56dff350a89e621 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 06:27:36 +0100
-Subject: [PATCH 23/46] nxhost svc: GetCurrentProcessorNumber from the thread's
+Subject: [PATCH 23/47] nxhost svc: GetCurrentProcessorNumber from the thread's
  affinity
 
 Always answering core 0 deadlocked Splatoon 3 before its first frame: its

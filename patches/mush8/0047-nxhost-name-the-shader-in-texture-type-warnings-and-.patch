@@ -1,0 +1,67 @@
+From e9a37845eb0ae504a88d04dbc6b5637447f91277 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Tue, 24 Nov 2026 11:39:24 +0100
+Subject: [PATCH 47/47] nxhost: name the shader in texture type warnings and
+ NX_DUMP_MSL
+
+The texture type mismatch warning now says which shader and binding it is
+about, and NX_DUMP_MSL logs which dump file belongs to which entry point.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/nvn/draw/exec.rs     | 2 +-
+ crates/nxhost/src/nvn/draw/shaders.rs  | 3 +++
+ crates/nxhost/src/nvn/draw/textures.rs | 4 ++--
+ 3 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/crates/nxhost/src/nvn/draw/exec.rs b/crates/nxhost/src/nvn/draw/exec.rs
+index edcb948..3320ef6 100644
+--- a/crates/nxhost/src/nvn/draw/exec.rs
++++ b/crates/nxhost/src/nvn/draw/exec.rs
+@@ -311,7 +311,7 @@ impl Replay<'_> {
+                     .textures
+                     .view(k, &tb, &t, kind)
+                     .filter(|t| !kind.is_depth() || gfx_is_depth(t.0.pixelFormat()))
+-                    .unwrap_or_else(|| self.e.textures.fallback(kind, &t)),
++                    .unwrap_or_else(|| self.e.textures.fallback(kind, &t, &format!("{} t{b}", c.entry))),
+                 None => self.e.textures.dummy(kind),
+             };
+             let sampler = self.e.textures.sampler(sb.as_ref());
+diff --git a/crates/nxhost/src/nvn/draw/shaders.rs b/crates/nxhost/src/nvn/draw/shaders.rs
+index f095461..a3509f2 100644
+--- a/crates/nxhost/src/nvn/draw/shaders.rs
++++ b/crates/nxhost/src/nvn/draw/shaders.rs
+@@ -482,6 +482,9 @@ fn compile_inner(blob: &[u8], compute: bool, extra_outputs: u32, uint_targets: u
+     }
+     let source = if compute { None } else { nxshader::corpus::key(blob).map(|k| (k, [extra_outputs, uint_targets, sint_targets])) };
+     let (key, src, entry) = cache_name(&t);
++    if std::env::var_os("NX_DUMP_MSL").is_some() {
++        eprintln!("[shader] {hash:016x}_{extra_outputs:x} is {entry}");
++    }
+     if let Some((lib, func)) = aot_function(key, &entry) {
+         return Some(Arc::new(Compiled { func, lib, entry, iface: t.interface, source }));
+     }
+diff --git a/crates/nxhost/src/nvn/draw/textures.rs b/crates/nxhost/src/nvn/draw/textures.rs
+index 0da9b8a..07d5fa8 100644
+--- a/crates/nxhost/src/nvn/draw/textures.rs
++++ b/crates/nxhost/src/nvn/draw/textures.rs
+@@ -381,13 +381,13 @@ impl Textures {
+         self.filled(kind, 0xFF)
+     }
+ 
+-    pub fn fallback(&mut self, kind: TexKind, tex: &Shared<Texture>) -> Shared<Texture> {
++    pub fn fallback(&mut self, kind: TexKind, tex: &Shared<Texture>, who: &str) -> Shared<Texture> {
+         let have = tex.0.textureType();
+         if have == kind_type(kind) {
+             return self.dummy(kind);
+         }
+         if self.mismatches.insert((kind, have.0 as u64), ()).is_none() {
+-            eprintln!("[gfx] texture type mismatch: shader declares {kind:?}, texture is {have:?} with {} layers; binding zero", tex.0.arrayLength());
++            eprintln!("[gfx] texture type mismatch in {who}: shader declares {kind:?}, texture is {have:?} with {} layers; binding zero", tex.0.arrayLength());
+         }
+         self.filled(kind, 0)
+     }
+-- 
+2.56.1
+
