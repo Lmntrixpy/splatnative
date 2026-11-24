@@ -1,0 +1,306 @@
+From 41216882f8903e6406f10f20412949bdd6196536 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Tue, 24 Nov 2026 12:07:03 +0100
+Subject: [PATCH 49/50] nxhost: ldn:u local wireless service that finds nobody
+
+ldn:u was a stub that returned no session object, so nn::ldn::Initialize
+dereferenced null when Splatoon 3 entered the Inkcade. The new service
+initializes, scans an empty air, fails Connect and lets the game open an
+access point whose network only holds this console.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/services/ldn.rs | 259 ++++++++++++++++++++++++++++++
+ crates/nxhost/src/services/mod.rs |   2 +
+ 2 files changed, 261 insertions(+)
+ create mode 100644 crates/nxhost/src/services/ldn.rs
+
+diff --git a/crates/nxhost/src/services/ldn.rs b/crates/nxhost/src/services/ldn.rs
+new file mode 100644
+index 0000000..678a772
+--- /dev/null
++++ b/crates/nxhost/src/services/ldn.rs
+@@ -0,0 +1,259 @@
++// SplatNative: ldn:u (local wireless play, nn::ldn).
++//
++// There is no real local-wireless radio behind this. The service behaves like a console whose
++// radio works but finds nobody: Initialize succeeds, Scan finds no networks, Connect fails, and
++// opening an access point creates a network that only holds this console. That is enough for
++// games that bring nn::ldn up when entering an area (Splatoon 3 crashed with a null session in
++// nn::ldn::Initialize because ldn:u was a stub that returned no object).
++use crate::ipc::{Request, Response, Service, Stub, write_buffer};
++use crate::kernel::{KERNEL, Obj};
++use std::sync::{Arc, Mutex};
++
++const MODULE: u32 = 203;
++const fn err(desc: u32) -> u32 {
++    MODULE | (desc << 9)
++}
++const CONNECTION_FAILED: u32 = err(31);
++const BAD_STATE: u32 = err(32);
++
++const STATE_NONE: u32 = 0;
++const STATE_INITIALIZED: u32 = 1;
++const STATE_ACCESS_POINT: u32 = 2;
++const STATE_ACCESS_POINT_CREATED: u32 = 3;
++const STATE_STATION: u32 = 4;
++
++const NETWORK_INFO_SIZE: usize = 0x480;
++const ADDRESS: u32 = 0xA9FE_0001; // 169.254.0.1
++const NETMASK: u32 = 0xFFFF_0000;
++const MAC: [u8; 6] = [0x02, 0x6d, 0x75, 0x73, 0x68, 0x38];
++
++pub fn open() -> Arc<dyn Service> {
++    Arc::new(Creator)
++}
++
++struct Creator;
++
++impl Service for Creator {
++    fn name(&self) -> String {
++        "ldn:u".into()
++    }
++    fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
++        match req.cmd {
++            0 => {
++                rsp.objects.push(Arc::new(Session::new()));
++                0
++            }
++            _ => Stub(self.name()).call(req, rsp),
++        }
++    }
++}
++
++struct Network {
++    /// The NetworkConfig the game created the network with (0x20 bytes).
++    config: [u8; 0x20],
++    user_name: [u8; 0x21],
++    security_mode: u16,
++    advertise: Vec<u8>,
++}
++
++struct Session {
++    state: Mutex<u32>,
++    network: Mutex<Option<Network>>,
++    advertise: Mutex<Vec<u8>>,
++    event: Mutex<Option<u32>>,
++}
++
++impl Session {
++    fn new() -> Session {
++        Session { state: Mutex::new(STATE_NONE), network: Mutex::new(None), advertise: Mutex::new(Vec::new()), event: Mutex::new(None) }
++    }
++
++    fn set_state(&self, s: u32) {
++        *self.state.lock().unwrap() = s;
++        if let Some(h) = *self.event.lock().unwrap() {
++            if let Some(Obj::ReadableEvent(e)) = KERNEL.lock().get(h) {
++                crate::kernel::signal_event(&e);
++            }
++        }
++    }
++
++    fn state(&self) -> u32 {
++        *self.state.lock().unwrap()
++    }
++
++    fn network_info(&self) -> Option<[u8; NETWORK_INFO_SIZE]> {
++        let net = self.network.lock().unwrap();
++        let n = net.as_ref()?;
++        let mut b = [0u8; NETWORK_INFO_SIZE];
++        // NetworkId: IntentId (local communication id, scene id) from the config, then a session id.
++        b[0x00..0x10].copy_from_slice(&n.config[0x00..0x10]);
++        b[0x10..0x20].copy_from_slice(b"mush8-ldn-sessio");
++        // CommonNetworkInfo: bssid, ssid, channel, link level, network type (general).
++        b[0x20..0x26].copy_from_slice(&MAC);
++        let ssid = b"mush8";
++        b[0x26] = ssid.len() as u8;
++        b[0x27..0x27 + ssid.len()].copy_from_slice(ssid);
++        let channel = u16::from_le_bytes([n.config[0x10], n.config[0x11]]);
++        b[0x48..0x4A].copy_from_slice(&(if channel == 0 { 1 } else { channel }).to_le_bytes());
++        b[0x4A] = 3;
++        b[0x4B] = 2;
++        // LdnNetworkInfo at 0x50.
++        b[0x60..0x62].copy_from_slice(&n.security_mode.to_le_bytes());
++        b[0x66] = n.config[0x12].max(1);
++        b[0x67] = 1;
++        // Node 0: this console.
++        let node = 0x68;
++        b[node..node + 4].copy_from_slice(&ADDRESS.to_le_bytes());
++        b[node + 4..node + 10].copy_from_slice(&MAC);
++        b[node + 0xA] = 0;
++        b[node + 0xB] = 1;
++        b[node + 0xC..node + 0x2D].copy_from_slice(&n.user_name);
++        b[node + 0x2E..node + 0x30].copy_from_slice(&n.config[0x14..0x16]);
++        let ad = &n.advertise[..n.advertise.len().min(0x180)];
++        b[0x26A..0x26C].copy_from_slice(&(ad.len() as u16).to_le_bytes());
++        b[0x26C..0x26C + ad.len()].copy_from_slice(ad);
++        Some(b)
++    }
++
++    fn in_network(&self) -> bool {
++        self.state() == STATE_ACCESS_POINT_CREATED && self.network.lock().unwrap().is_some()
++    }
++}
++
++impl Service for Session {
++    fn name(&self) -> String {
++        "ldn::IUserLocalCommunicationService".into()
++    }
++    fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
++        match req.cmd {
++            // GetState
++            0 => rsp.push_u32(self.state()),
++            // GetNetworkInfo
++            1 => {
++                let Some(info) = self.network_info() else { return BAD_STATE };
++                if let Some(b) = req.out_buffer() {
++                    write_buffer(&b, &info);
++                }
++            }
++            // GetIpv4Address
++            2 => {
++                if !self.in_network() {
++                    return BAD_STATE;
++                }
++                rsp.push_u32(ADDRESS);
++                rsp.push_u32(NETMASK);
++            }
++            // GetDisconnectReason
++            3 => rsp.push_u32(0),
++            // GetSecurityParameter: security parameter (0x10) and session id (0x10)
++            4 => {
++                let Some(info) = self.network_info() else { return BAD_STATE };
++                rsp.data.extend_from_slice(&info[0x50..0x60]);
++                rsp.data.extend_from_slice(&info[0x10..0x20]);
++            }
++            // GetNetworkConfig
++            5 => {
++                let net = self.network.lock().unwrap();
++                let Some(n) = net.as_ref() else { return BAD_STATE };
++                rsp.data.extend_from_slice(&n.config);
++            }
++            // AttachStateChangeEvent
++            100 => {
++                let mut e = self.event.lock().unwrap();
++                let h = *e.get_or_insert_with(|| crate::ipc::new_event(false));
++                rsp.copy_handles.push(h);
++            }
++            // GetNetworkInfoLatestUpdate: network info, then per-node updates (none)
++            101 => {
++                let Some(info) = self.network_info() else { return BAD_STATE };
++                let outs: Vec<_> = req.b.iter().chain(&req.c).filter(|b| b.addr != 0 && b.size != 0).copied().collect();
++                if let Some(b) = outs.first() {
++                    write_buffer(b, &info);
++                }
++                if let Some(b) = outs.get(1) {
++                    write_buffer(b, &vec![0u8; b.size as usize]);
++                }
++            }
++            // Scan / ScanPrivate: nobody around
++            102 | 103 => {
++                if self.state() == STATE_NONE {
++                    return BAD_STATE;
++                }
++                rsp.push_u32(0);
++            }
++            // SetWirelessControllerRestriction
++            104 => {}
++            // OpenAccessPoint
++            200 => match self.state() {
++                STATE_INITIALIZED | STATE_ACCESS_POINT => self.set_state(STATE_ACCESS_POINT),
++                _ => return BAD_STATE,
++            },
++            // CloseAccessPoint
++            201 => {
++                *self.network.lock().unwrap() = None;
++                self.set_state(STATE_INITIALIZED);
++            }
++            // CreateNetwork / CreateNetworkPrivate: SecurityConfig 0x44, UserConfig 0x30,
++            // 4 bytes padding, NetworkConfig 0x20
++            202 | 203 => {
++                if self.state() != STATE_ACCESS_POINT {
++                    return BAD_STATE;
++                }
++                let d = &req.data;
++                if d.len() < 0x98 {
++                    return BAD_STATE;
++                }
++                let mut n = Network { config: [0; 0x20], user_name: [0; 0x21], security_mode: 0, advertise: Vec::new() };
++                n.security_mode = u16::from_le_bytes([d[0], d[1]]);
++                n.user_name.copy_from_slice(&d[0x44..0x65]);
++                n.config.copy_from_slice(&d[0x78..0x98]);
++                n.advertise = self.advertise.lock().unwrap().clone();
++                eprintln!("[ldn] network created for local communication id {:#x} (nobody can join)", u64::from_le_bytes(d[0x78..0x80].try_into().unwrap()));
++                *self.network.lock().unwrap() = Some(n);
++                self.set_state(STATE_ACCESS_POINT_CREATED);
++            }
++            // DestroyNetwork
++            204 => {
++                *self.network.lock().unwrap() = None;
++                if self.state() == STATE_ACCESS_POINT_CREATED {
++                    self.set_state(STATE_ACCESS_POINT);
++                }
++            }
++            // Reject
++            205 => {}
++            // SetAdvertiseData
++            206 => {
++                let data = req.in_buffer().map(|b| unsafe { std::slice::from_raw_parts(b.addr as *const u8, b.size as usize) }.to_vec()).unwrap_or_default();
++                if let Some(n) = self.network.lock().unwrap().as_mut() {
++                    n.advertise = data.clone();
++                }
++                *self.advertise.lock().unwrap() = data;
++            }
++            // SetStationAcceptPolicy, AddAcceptFilterEntry, ClearAcceptFilter
++            207..=209 => {}
++            // OpenStation
++            300 => match self.state() {
++                STATE_INITIALIZED | STATE_STATION => self.set_state(STATE_STATION),
++                _ => return BAD_STATE,
++            },
++            // CloseStation
++            301 => self.set_state(STATE_INITIALIZED),
++            // Connect / ConnectPrivate: there is no network to join
++            302 | 303 => return CONNECTION_FAILED,
++            // Disconnect
++            304 => {}
++            // Initialize / InitializeSystem2
++            400 | 402 => {
++                eprintln!("[ldn] local wireless initialized (no other consoles will be found)");
++                self.set_state(STATE_INITIALIZED);
++            }
++            // Finalize
++            401 => {
++                *self.network.lock().unwrap() = None;
++                self.set_state(STATE_NONE);
++            }
++            _ => return Stub(self.name()).call(req, rsp),
++        }
++        0
++    }
++}
+diff --git a/crates/nxhost/src/services/mod.rs b/crates/nxhost/src/services/mod.rs
+index a703c0f..9d363e0 100644
+--- a/crates/nxhost/src/services/mod.rs
++++ b/crates/nxhost/src/services/mod.rs
+@@ -12,6 +12,7 @@ pub mod fs;
+ pub mod hid;
+ mod lan;
+ mod lanplay;
++mod ldn;
+ mod lm;
+ pub mod mii;
+ mod nfp;
+@@ -55,6 +56,7 @@ pub fn open(name: &str) -> Arc<dyn Service> {
+         "ssl" if nextendo::enabled() => ssl::open(),
+         "prepo:u" | "prepo:a" | "prepo:a2" | "prepo:m" | "prepo:s" if nextendo::enabled() => Arc::new(prepo::Prepo(name.to_string())),
+         "nfp:user" => nfp::open(),
++        "ldn:u" => ldn::open(),
+         "set" => Arc::new(set::Settings),
+         "pctl" | "pctl:s" | "pctl:a" | "pctl:r" => Arc::new(Table {
+             name: "pctl",
+-- 
+2.56.1
+

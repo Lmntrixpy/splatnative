@@ -1,7 +1,7 @@
 From 0a79816ecb697f879cf202a9339e17b5d56a8cb0 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 05:36:00 +0100
-Subject: [PATCH 22/48] nxhost hid: seqlock-stamped lifo entries for newer SDKs
+Subject: [PATCH 22/50] nxhost hid: seqlock-stamped lifo entries for newer SDKs
 
 The Splatoon 3 sdk reads npad (0x5099d0), six-axis (0x50cb24) and touch
 (0x5111e4) lifo entries as a seqlock: the leading u64 must be even when

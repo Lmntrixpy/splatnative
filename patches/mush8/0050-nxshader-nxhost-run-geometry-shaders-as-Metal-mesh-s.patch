@@ -1,0 +1,1041 @@
+From e488969ef413400d3918e230cff236843c33c4ad Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Tue, 24 Nov 2026 13:13:07 +0100
+Subject: [PATCH 50/50] nxshader, nxhost: run geometry shaders as Metal mesh
+ shaders
+
+Metal has no geometry stage; draws whose program has one were dropped (the
+geometry shader was even taken for the vertex shader). Splatoon 3 has 83
+geometry shaders, all triangle-strip emitters with 3 to 15 vertices.
+
+nxshader::translate_geometry builds one library per vertex + geometry pair:
+the vertex shader becomes a plain function, and the mesh entry runs it for
+the vertices of its input primitive (primitive assembly for points, lines,
+line strips, triangles, strips and fans, indexed or not), then the geometry
+code: ALD with a vertex register reads that vertex's outputs, AST writes the
+current output vertex, OUT.EMIT appends it to the mesh and closes strip
+triangles with the right winding, OUT.CUT restarts the strip,
+SR_INVOCATION_INFO reports the input vertex count. VMAD and VSETP now select
+bytes/halves like the hardware (the geometry prologue computes vertex
+indices with them). All 83 shaders translate and compile (shgeo tool).
+
+The host keeps the geometry stage's buffers and textures (NVN stage 2),
+builds a mesh pipeline and draws one single-thread threadgroup per primitive
+and instance.
+
+Diagnostics: NX_TRACE_3D_TARGETS, NX_TRACE_3D_TEXTURES, readback values in
+NX_TRACE_CPU_TARGETS.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/nvn/draw/exec.rs    | 229 ++++++++++++++++++++++++--
+ crates/nxhost/src/nvn/draw/mod.rs     |  37 ++++-
+ crates/nxhost/src/nvn/draw/shaders.rs |  54 +++++-
+ crates/nxhost/src/nvn/draw/state.rs   |  76 +++++++--
+ crates/nxshader/src/bin/shgeo.rs      |  21 +++
+ crates/nxshader/src/lib.rs            |   2 +-
+ crates/nxshader/src/msl.rs            | 221 ++++++++++++++++++++++++-
+ crates/nxshader/src/sph.rs            |   8 +
+ 8 files changed, 598 insertions(+), 50 deletions(-)
+ create mode 100644 crates/nxshader/src/bin/shgeo.rs
+
+diff --git a/crates/nxhost/src/nvn/draw/exec.rs b/crates/nxhost/src/nvn/draw/exec.rs
+index 3320ef6..68f2f10 100644
+--- a/crates/nxhost/src/nvn/draw/exec.rs
++++ b/crates/nxhost/src/nvn/draw/exec.rs
+@@ -23,10 +23,13 @@ impl Replay<'_> {
+         let st = self.e.st;
+         let mut vs = None;
+         let mut fs = None;
++        let mut gs = None;
+         for &(code, ctl) in st.stages() {
+             let Some(s) = self.e.shaders.stage(code, ctl) else { continue };
+             if s.fragment {
+                 fs = Some(s)
++            } else if s.geometry {
++                gs = Some(s)
+             } else if s.local_size.is_none() {
+                 vs = Some(s)
+             }
+@@ -49,6 +52,9 @@ impl Replay<'_> {
+             Lookup::Pending => return Err("shader compiling"),
+             Lookup::Failed => return Err("fragment shader failed"),
+         };
++        if let Some(gs) = gs {
++            return self.draw_geometry(d, &vs, &gs, &fs, &fsc, uints, sints, &targets);
++        }
+         let extra = fsc.iface.attributes;
+         let vsc = match self.e.shaders.function(&vs, extra, 0, 0, wait) {
+             Lookup::Ready(f) => f,
+@@ -88,24 +94,9 @@ impl Replay<'_> {
+             res[1].flags |= 4;
+             res[1].alpha_func = alpha - 1;
+         }
+-        let r = &mut res[0];
+-        for i in 0..16 {
+-            let a = st.attribs[i];
+-            if a & 0x40 == 0 {
+-                continue;
+-            }
+-            let stream = (a & 0x1F) as usize % 16;
+-            r.attr_format[i] = (a >> 21) & 0x3FF;
+-            r.attr_offset[i] = (a >> 7) & 0x3FFF;
+-            r.attr_stream[i] = stream as u32;
+-        }
+-
+-        for s in 0..16 {
+-            r.vb[s] = if st.vbufs[s].0 != 0 { self.gpu_range(st.vbufs[s].0, st.vbufs[s].1, false) } else { gfx::gpu().zeros.0.gpuAddress() };
+-            r.vb_stride[s] = st.streams[s].0;
+-            r.vb_divisor[s] = st.streams[s].1;
+-        }
+-        r.base_instance = d.base_instance;
++        let mut r = res[0];
++        self.vertex_inputs(&mut r, &st, d);
++        res[0] = r;
+ 
+         let heap = self.heap;
+         let pass = self.pass.as_mut().unwrap();
+@@ -276,6 +267,190 @@ impl Replay<'_> {
+         Ok(())
+     }
+ 
++    fn vertex_inputs(&mut self, r: &mut Res, st: &super::GState, d: &super::Draw) {
++        for i in 0..16 {
++            let a = st.attribs[i];
++            if a & 0x40 == 0 {
++                continue;
++            }
++            let stream = (a & 0x1F) as usize % 16;
++            r.attr_format[i] = (a >> 21) & 0x3FF;
++            r.attr_offset[i] = (a >> 7) & 0x3FFF;
++            r.attr_stream[i] = stream as u32;
++        }
++        for s in 0..16 {
++            r.vb[s] = if st.vbufs[s].0 != 0 { self.gpu_range(st.vbufs[s].0, st.vbufs[s].1, false) } else { gfx::gpu().zeros.0.gpuAddress() };
++            r.vb_stride[s] = st.streams[s].0;
++            r.vb_divisor[s] = st.streams[s].1;
++        }
++        r.base_instance = d.base_instance;
++    }
++
++    /// SplatNative: a draw with a geometry shader. Metal has no geometry stage, so the vertex and
++    /// geometry shaders run together as a mesh shader (nxshader::translate_geometry): one
++    /// single-thread threadgroup per input primitive and instance runs the vertex shader for the
++    /// primitive's vertices, then the geometry code, and emits its triangle strip.
++    #[allow(clippy::too_many_arguments)]
++    fn draw_geometry(
++        &mut self,
++        d: &super::Draw,
++        vs: &super::shaders::Stage,
++        gs: &super::shaders::Stage,
++        fs: &super::shaders::Stage,
++        fsc: &std::sync::Arc<super::shaders::Compiled>,
++        uints: u32,
++        sints: u32,
++        targets: &super::state::Targets,
++    ) -> Result<(), &'static str> {
++        let r = self.draw_geometry_inner(d, vs, gs, fs, fsc, uints, sints, targets);
++        if let Err(e) = r {
++            static SEEN: std::sync::Mutex<Vec<(u64, &'static str)>> = std::sync::Mutex::new(Vec::new());
++            let mut seen = SEEN.lock().unwrap();
++            if !seen.contains(&(gs.hash, e)) {
++                seen.push((gs.hash, e));
++                eprintln!("[gfx] geometry draw {:016x} (mode {} count {}) skipped: {e}", gs.hash, d.mode, d.count);
++            }
++        }
++        r
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn draw_geometry_inner(
++        &mut self,
++        d: &super::Draw,
++        vs: &super::shaders::Stage,
++        gs: &super::shaders::Stage,
++        fs: &super::shaders::Stage,
++        fsc: &std::sync::Arc<super::shaders::Compiled>,
++        uints: u32,
++        sints: u32,
++        targets: &super::state::Targets,
++    ) -> Result<(), &'static str> {
++        let (verts, prims) = match d.mode {
++            0 => (1, d.count),
++            1 => (2, d.count / 2),
++            3 => (2, d.count.saturating_sub(1)),
++            4 => (3, d.count / 3),
++            5 | 6 => (3, d.count.saturating_sub(2)),
++            _ => return Err("geometry shader with an unsupported input primitive"),
++        };
++        if prims == 0 {
++            return Ok(());
++        }
++        d.validate_indices()?;
++        let st = self.e.st;
++        let gsc = self.e.shaders.geometry(vs, gs, fsc.iface.attributes).ok_or("geometry shader failed")?;
++        let pipeline = self.e.states.mesh_pipeline(&gsc, (vs.hash, gs.hash), fsc, fs.hash ^ (uints as u64) << 48 ^ (sints as u64) << 56, targets, &st)?;
++        let ds = self.e.states.depth_stencil(&st, targets.depth.is_some(), targets.stencil);
++        let (w, h) = self.pass.as_ref().unwrap().size;
++        let (sx, sy, sw, sh) = match st.scissor {
++            Some([x, y, sw, sh]) => {
++                let (x0, y0) = (x.max(0) as u32, y.max(0) as u32);
++                let x1 = ((x as i64 + sw as i64).clamp(0, w as i64)) as u32;
++                let y1 = ((y as i64 + sh as i64).clamp(0, h as i64)) as u32;
++                if x1 <= x0 || y1 <= y0 {
++                    return Ok(());
++                }
++                (x0, y0, x1 - x0, y1 - y0)
++            }
++            None => (0, 0, w, h),
++        };
++        if st.polygon & 3 == 3 {
++            return Ok(());
++        }
++        let upper_left = UPPER_LEFT.load(Relaxed);
++        self.heap = gfx::heap();
++        let vertex_tex = self.stage_textures(&st, 0, &gsc);
++        let frag_tex = self.stage_textures(&st, 1, fsc);
++
++        let flags = (!upper_left) as u32 | ((!ZERO_TO_ONE.load(Relaxed)) as u32) << 1;
++        // The vertex shader's clip-space output feeds the geometry shader unchanged; the flips
++        // happen when the geometry shader emits.
++        let mut vres = self.res(&st, 0, vs.constants, 0);
++        self.vertex_inputs(&mut vres, &st, d);
++        let gres = self.res(&st, 3, gs.constants, flags);
++        let mut fres = self.res(&st, 1, fs.constants, flags);
++        let alpha = st.color_state >> 24 & 0xF;
++        if alpha != 0 && alpha != 8 {
++            fres.flags |= 4;
++            fres.alpha_func = alpha - 1;
++        }
++
++        #[repr(C)]
++        struct GsDraw {
++            mode: u32,
++            first: u32,
++            indexed: u32,
++            base_vertex: i32,
++            verts: u32,
++            pad: [u32; 3],
++        }
++        let (index_buffer, index_offset, indexed) = match d.index {
++            Some((t, addr)) => {
++                if !crate::kernel::aspace().readable(addr, [1u64, 2, 4][t.min(2) as usize] * d.count as u64) {
++                    return Err("index buffer outside guest memory");
++                }
++                let v: Vec<u32> = (0..d.count as u64)
++                    .map(|i| match t {
++                        0 => rd::<u8>(addr + i) as u32,
++                        1 => rd::<u16>(addr + 2 * i) as u32,
++                        _ => rd::<u32>(addr + 4 * i),
++                    })
++                    .collect();
++                let a = self.e.arena.alloc_bytes(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, 4 * v.len()) });
++                if a.new_chunk {
++                    self.use_chunk(&a.buffer);
++                }
++                (a.buffer, a.offset, true)
++            }
++            None => (gfx::gpu().zeros.clone(), 0, false),
++        };
++        let draw = GsDraw { mode: d.mode, first: if indexed { 0 } else { d.first }, indexed: indexed as u32, base_vertex: d.base_vertex, verts, pad: [0; 3] };
++
++        let heap = self.heap;
++        let prev = self.pass.as_ref().unwrap().fixed;
++        let next = {
++            let enc = &self.pass.as_ref().unwrap().enc;
++            if let Some(hb) = heap {
++                for chunk in hb.live() {
++                    enc.useResource_usage_stages(ProtocolObject::from_ref(&*chunk.buffer.0), MTLResourceUsage::Read, MTLRenderStages::Mesh | MTLRenderStages::Fragment);
++                }
++            }
++            enc.useResource_usage_stages(ProtocolObject::from_ref(&*index_buffer.0), MTLResourceUsage::Read, MTLRenderStages::Mesh);
++            bind_fixed(enc, prev, &pipeline, &ds, &st, upper_left, (w, h), [sx, sy, sw, sh])
++        };
++        self.pass.as_mut().unwrap().fixed = Some(next);
++        if super::TRACE_DRAWS.load(Relaxed) {
++            eprintln!("[frame] geometry draw vs {:016x} gs {:016x} fs {:016x} mode {} count {} prims {prims} inst {}", vs.hash, gs.hash, fs.hash, d.mode, d.count, d.instances);
++        }
++        let enc = &self.pass.as_ref().unwrap().enc;
++        unsafe {
++            enc.setMeshBytes_length_atIndex(NonNull::from(&vres).cast(), size_of::<Res>(), 0);
++            enc.setMeshBytes_length_atIndex(NonNull::from(&gres).cast(), size_of::<Res>(), 1);
++            enc.setMeshBytes_length_atIndex(NonNull::from(&draw).cast(), size_of::<GsDraw>(), 2);
++            enc.setMeshBuffer_offset_atIndex(Some(&index_buffer.0), index_offset, 3);
++            enc.setFragmentBytes_length_atIndex(NonNull::from(&fres).cast(), size_of::<Res>(), 0);
++            for (b, tex, slot, sampler) in &vertex_tex {
++                enc.setMeshTexture_atIndex(Some(&tex.0), *b as usize);
++                enc.setMeshSamplerState_atIndex(Some(&sampler.0), *slot as usize);
++            }
++            for (b, tex, slot, sampler) in &frag_tex {
++                enc.setFragmentTexture_atIndex(Some(&tex.0), *b as usize);
++                enc.setFragmentSamplerState_atIndex(Some(&sampler.0), *slot as usize);
++            }
++            if super::occlusion::enabled() {
++                let serial = self.pass.as_ref().unwrap().serial;
++                match self.e.occ.slot(serial) {
++                    Some(off) => enc.setVisibilityResultMode_offset(MTLVisibilityResultMode::Counting, off),
++                    None => enc.setVisibilityResultMode_offset(MTLVisibilityResultMode::Disabled, 0),
++                }
++            }
++        }
++        let one = MTLSize { width: 1, height: 1, depth: 1 };
++        enc.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(MTLSize { width: prims as usize, height: d.instances as usize, depth: 1 }, one, one);
++        Ok(())
++    }
++
+     fn stage_textures(&mut self, st: &super::GState, stage: usize, c: &super::shaders::Compiled) -> Vec<(u32, gfx::Shared<gfx::Texture>, u32, gfx::Shared<super::textures::Sampler>)> {
+         let mut bound = Vec::with_capacity(c.iface.textures.len());
+         let ids = |b: u32| {
+@@ -305,6 +480,24 @@ impl Replay<'_> {
+                 let swz = tb.map(|b| [0x38usize, 0x3c, 0x40, 0x44].map(|o| u32::from_le_bytes(b[o..o + 4].try_into().unwrap())));
+                 eprintln!("[frame]   tex {}{b}: id {tid} pool {:#x} -> {:?} swizzle {swz:?}", ["v", "f", "c"][stage], st.texture_pool, got.as_ref().map(|(k, _, _)| (k.addr, k.format, k.width, k.height)));
+             }
++            // SplatNative diagnostics: NX_TRACE_3D_TEXTURES=1 logs each sampled 3D texture once
++            // with the first words of its guest memory.
++            static TRACE_3D: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("NX_TRACE_3D_TEXTURES").is_some());
++            if *TRACE_3D && kind == nxshader::TexKind::T3D {
++                if let Some((k, t, _)) = got.as_ref() {
++                    static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
++                    let mut seen = SEEN.lock().unwrap();
++                    if !seen.contains(&k.addr) {
++                        seen.push(k.addr);
++                        let words: Vec<String> = (0..16).map(|i| format!("{:08x}", rd::<u32>(k.addr + 4 * i))).collect();
++                        let nonzero = (0..(k.width * k.height * k.depth.max(1)) as u64).filter(|&i| rd::<u32>(k.addr + 4 * i) != 0).count();
++                        eprintln!(
++                            "[gfx] 3D texture {:#x} {}x{}x{} fmt {} target {} metal {:?} depth {} in {}: {nonzero} nonzero words, guest {}",
++                            k.addr, k.width, k.height, k.depth, k.format, k.target, t.0.textureType(), t.0.depth(), c.entry, words.join(" ")
++                        );
++                    }
++                }
++            }
+             let tex = match got {
+                 Some((k, t, tb)) => self
+                     .e
+diff --git a/crates/nxhost/src/nvn/draw/mod.rs b/crates/nxhost/src/nvn/draw/mod.rs
+index 1f23a03..5dbdd75 100644
+--- a/crates/nxhost/src/nvn/draw/mod.rs
++++ b/crates/nxhost/src/nvn/draw/mod.rs
+@@ -46,9 +46,9 @@ struct Engine {
+     target_first_frame: HashMap<textures::TexKey, u64>,
+     copier: copy::Copier,
+     kernels: HashMap<u64, Shared<ProtocolObject<dyn MTLComputePipelineState>>>,
+-    bank_tex: [[u64; 32]; 3],
+-    bank_gpu: [u64; 3],
+-    bank_ok: [bool; 3],
++    bank_tex: [[u64; 32]; 4],
++    bank_gpu: [u64; 4],
++    bank_ok: [bool; 4],
+     sampled: HashMap<textures::TexKey, Shared<gfx::Texture>>,
+     touched: Vec<(textures::TexKey, Shared<gfx::Texture>)>,
+     clears: Vec<PendingClear>,
+@@ -135,7 +135,7 @@ struct Replay<'a> {
+     passes: u32,
+     draws_since_commit: u32,
+     copies: HashMap<(u64, u64), u64>,
+-    storage_touched: [[(u64, u64); 16]; 3],
++    storage_touched: [[(u64, u64); 16]; 4],
+ }
+ 
+ impl Replay<'_> {
+@@ -475,8 +475,11 @@ impl Replay<'_> {
+             let r = copy::copy_rows_to_guest(&self.cb, &tex.0, sub, key.format, key.addr, stride);
+             if TRACE_CPU_WRITEBACK.load(Relaxed) {
+                 static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+-                if N.fetch_add(1, Relaxed) < 200 {
+-                    eprintln!("[cpu-target] write back {:#x} {}x{} fmt {} stride {stride}: {r:?}", key.addr, key.width, key.height, key.format);
++                let n = N.fetch_add(1, Relaxed);
++                if n < 200 || (n % 400 < 4 && key.width * key.height <= 2) {
++                    // The copy lands when the GPU finishes; the guest memory shows the last frame's value.
++                    let last = if key.width * key.height <= 2 { format!(" last {:?}", unsafe { (key.addr as *const [f32; 4]).read_unaligned() }) } else { String::new() };
++                    eprintln!("[cpu-target] write back {:#x} {}x{} fmt {} stride {stride}: {r:?}{last}", key.addr, key.width, key.height, key.format);
+                 }
+             }
+         }
+@@ -622,6 +625,22 @@ impl Replay<'_> {
+                 }
+             }
+             let Some(size) = size else { return Err("no render target") };
++            // SplatNative diagnostics: NX_TRACE_3D_TARGETS=1 logs render passes into 3D or array
++            // textures once per texture and layer.
++            static TRACE_3D: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NX_TRACE_3D_TARGETS").is_some());
++            if *TRACE_3D {
++                static SEEN: Mutex<Vec<(u64, (u32, u32))>> = Mutex::new(Vec::new());
++                for b in self.e.colors.iter().flatten() {
++                    if let Some(k) = textures::TexKey::of(b).filter(|k| k.target != 1 || k.depth > 1) {
++                        let sub = super::objects::view_subresource(b);
++                        let mut seen = SEEN.lock().unwrap();
++                        if !seen.contains(&(k.addr, sub)) {
++                            seen.push((k.addr, sub));
++                            eprintln!("[frame] 3D/array target {:#x} {}x{}x{} target {} fmt {} layer {} level {}", k.addr, k.width, k.height, k.depth, k.target, k.format, sub.0, sub.1);
++                        }
++                    }
++                }
++            }
+             let keys: Vec<(textures::TexKey, (u32, u32))> =
+                 self.e.colors.iter().flatten().filter_map(|b| Some((textures::TexKey::of(b)?, super::objects::view_subresource(b)))).collect();
+             let frame = self.e.textures.frame;
+@@ -656,6 +675,8 @@ fn stage_index(nvn_stage: u32) -> Option<usize> {
+         0 => Some(0),
+         1 => Some(1),
+         5 => Some(2),
++        // SplatNative: geometry shaders keep their own buffers and textures (mesh emulation).
++        2 => Some(3),
+         _ => None,
+     }
+ }
+@@ -875,12 +896,12 @@ fn submit_now(handles: &[u64]) {
+         let mut e = ENGINE.lock().unwrap();
+         e.arena.recycle();
+         e.forget_dead();
+-        e.bank_ok = [false; 3];
++        e.bank_ok = [false; 4];
+         e.textures.frame += 1;
+         e.textures.maintain();
+         shaders::reset_wait_budget();
+         let Some(cb) = gfx::gpu().queue.0.commandBuffer() else { return };
+-        let mut r = Replay { e: &mut e, cb, pass: None, heap: None, passes: 0, draws_since_commit: 0, copies: HashMap::new(), storage_touched: [[(0, 0); 16]; 3] };
++        let mut r = Replay { e: &mut e, cb, pass: None, heap: None, passes: 0, draws_since_commit: 0, copies: HashMap::new(), storage_touched: [[(0, 0); 16]; 4] };
+         let mut updated = BTreeMap::new();
+         let mut programs = std::collections::BTreeSet::new();
+         for h in handles {
+diff --git a/crates/nxhost/src/nvn/draw/shaders.rs b/crates/nxhost/src/nvn/draw/shaders.rs
+index 98d9696..9af991c 100644
+--- a/crates/nxhost/src/nvn/draw/shaders.rs
++++ b/crates/nxhost/src/nvn/draw/shaders.rs
+@@ -20,6 +20,8 @@ pub struct Stage {
+     pub constants: u64,
+     pub fragment: bool,
+     pub local_size: Option<[u32; 3]>,
++    /// SplatNative: a geometry shader (emulated with a mesh shader, see Shaders::geometry).
++    pub geometry: bool,
+ }
+ 
+ pub struct Compiled {
+@@ -61,6 +63,7 @@ pub struct Shaders {
+     recent: [Recent; 4],
+     recent_i: usize,
+     prefetched: FastSet<u64>,
++    geo: FastMap<(u64, u64, u32), Option<Arc<Compiled>>>,
+ }
+ 
+ static DONE: LazyLock<Mutex<Vec<(Key, Option<Arc<Compiled>>)>>> = LazyLock::new(Default::default);
+@@ -185,7 +188,7 @@ fn compute_stage(code: u64, ctl: u64) -> Option<Stage> {
+         return None;
+     }
+     let blob = unsafe { std::slice::from_raw_parts(code as *const u8, len) };
+-    Some(Stage { hash: fnv1a(blob) ^ 0xC0, code, len, constants: code + len as u64, fragment: false, local_size: Some(local_size) })
++    Some(Stage { hash: fnv1a(blob) ^ 0xC0, code, len, constants: code + len as u64, fragment: false, local_size: Some(local_size), geometry: false })
+ }
+ 
+ /// SplatNative: compute programs of newer SDKs (Splatoon 3) start with a 0x100-byte header whose
+@@ -213,6 +216,7 @@ fn read_stage(code: u64, ctl: u64) -> Option<Stage> {
+         constants: code + rd32(ctl + 0x700) as u64,
+         fragment: (w0 >> 10) & 0xF == 5,
+         local_size: None,
++        geometry: (w0 >> 10) & 0xF == 4,
+     })
+ }
+ 
+@@ -229,6 +233,27 @@ fn validate_stage(code: u64, ctl: u64, cached: Option<Stage>) {
+ }
+ 
+ impl Shaders {
++    /// SplatNative: the mesh-shader library for a vertex + geometry shader pair whose output
++    /// feeds a fragment shader reading `fs_attributes`. Compiled on the render thread the first
++    /// time (geometry shaders are rare); failures are remembered.
++    pub fn geometry(&mut self, vs: &Stage, gs: &Stage, fs_attributes: u32) -> Option<Arc<Compiled>> {
++        let key = (vs.hash, gs.hash, fs_attributes);
++        if let Some(c) = self.geo.get(&key) {
++            return c.clone();
++        }
++        let t0 = std::time::Instant::now();
++        let c = crate::kernel::blocking(|| compile_geometry(vs, gs, fs_attributes));
++        eprintln!(
++            "[shader] geometry {:016x}+{:016x}: {} in {} ms",
++            vs.hash,
++            gs.hash,
++            if c.is_some() { "mesh shader ready" } else { "failed" },
++            t0.elapsed().as_millis()
++        );
++        self.geo.insert(key, c.clone());
++        c
++    }
++
+     pub fn stage(&mut self, code: u64, ctl: u64) -> Option<Stage> {
+         let quick = unsafe { std::slice::from_raw_parts((code + 0x30) as *const u8, 0x60) };
+         for slot in &self.recent {
+@@ -506,6 +531,33 @@ fn compile_inner(blob: &[u8], compute: bool, extra_outputs: u32, uint_targets: u
+     Some(Arc::new(Compiled { func: Shared(func), lib: Shared(lib), entry, iface: t.interface, source }))
+ }
+ 
++fn compile_geometry(vs: &Stage, gs: &Stage, fs_attributes: u32) -> Option<Arc<Compiled>> {
++    let vs_blob = unsafe { std::slice::from_raw_parts(vs.code as *const u8, vs.len) };
++    let gs_blob = unsafe { std::slice::from_raw_parts(gs.code as *const u8, gs.len) };
++    let t = match nxshader::translate_geometry(vs_blob, gs_blob, fs_attributes) {
++        Ok(t) => t,
++        Err(e) => {
++            eprintln!("[shader] geometry {:016x}: translation failed: {e}", gs.hash);
++            return None;
++        }
++    };
++    let opts = MTLCompileOptions::new();
++    opts.setMathMode(MTLMathMode::Safe);
++    opts.setPreserveInvariance(true);
++    let dev = &gfx::gpu().device.0;
++    let lib = match dev.newLibraryWithSource_options_error(&NSString::from_str(&t.msl), Some(&opts)) {
++        Ok(l) => l,
++        Err(e) => {
++            eprintln!("[shader] geometry {:016x}: Metal compile failed: {}", gs.hash, e.localizedDescription());
++            let _ = std::fs::create_dir_all("work/msl_fail");
++            let _ = std::fs::write(format!("work/msl_fail/geometry_{:016x}.metal", gs.hash), &t.msl);
++            return None;
++        }
++    };
++    let func = lib.newFunctionWithName(&NSString::from_str(&t.entry))?;
++    Some(Arc::new(Compiled { func: Shared(func), lib: Shared(lib), entry: t.entry, iface: t.interface, source: None }))
++}
++
+ pub(super) fn aot_dir() -> &'static str {
+     static DIR: LazyLock<String> = LazyLock::new(|| format!("{}/heap-segments-v2", std::env::var("NX_SHADER_CACHE").unwrap_or_else(|_| "work/shader_cache.noindex".into())));
+     &DIR
+diff --git a/crates/nxhost/src/nvn/draw/state.rs b/crates/nxhost/src/nvn/draw/state.rs
+index 6e7bf3f..82fd8a7 100644
+--- a/crates/nxhost/src/nvn/draw/state.rs
++++ b/crates/nxhost/src/nvn/draw/state.rs
+@@ -22,9 +22,9 @@ pub struct GState {
+     pub attribs: [u32; 16],
+     pub streams: [(u32, u32); 16],
+     pub vbufs: [(u64, u64); 16],
+-    pub ubos: [[(u64, u64); 15]; 3],
+-    pub textures: [[u64; 32]; 3],
+-    pub storage: [[(u64, u64); 16]; 3],
++    pub ubos: [[(u64, u64); 15]; 4],
++    pub textures: [[u64; 32]; 4],
++    pub storage: [[(u64, u64); 16]; 4],
+     pub color_state: u32,
+     pub channel_mask: u32,
+     pub blend: [u64; 8],
+@@ -53,9 +53,9 @@ impl Default for GState {
+             attribs: [0; 16],
+             streams: [(0, 0); 16],
+             vbufs: [(0, 0); 16],
+-            ubos: [[(0, 0); 15]; 3],
+-            textures: [[0; 32]; 3],
+-            storage: [[(0, 0); 16]; 3],
++            ubos: [[(0, 0); 15]; 4],
++            textures: [[0; 32]; 4],
++            storage: [[(0, 0); 16]; 4],
+             color_state: 0,
+             channel_mask: 0xFFFF_FFFF,
+             blend: std::array::from_fn(|i| i as u64),
+@@ -270,6 +270,7 @@ pub struct States {
+     pipelines: FastMap<PipeKey, Option<Shared<Pipeline>>>,
+     pending: super::shaders::Jobs<PipeKey>,
+     depth: FastMap<(u64, [u32; 4], bool, bool), Shared<DepthState>>,
++    mesh: FastMap<PipeKey, Option<Shared<Pipeline>>>,
+ }
+ 
+ static DONE: LazyLock<Mutex<Vec<(PipeKey, Option<Shared<Pipeline>>)>>> = LazyLock::new(Default::default);
+@@ -415,6 +416,49 @@ impl States {
+         }
+     }
+ 
++    /// SplatNative: a mesh pipeline for a draw whose geometry shader runs as a mesh shader.
++    /// Built synchronously and cached; no archive (there are few of them).
++    pub fn mesh_pipeline(&mut self, gs: &Arc<Compiled>, gs_key: (u64, u64), fs: &Arc<Compiled>, fs_key: u64, t: &Targets, st: &GState) -> Result<Shared<Pipeline>, &'static str> {
++        let mut key = PipeKey::new();
++        for w in [0x6d657368, gs_key.0, gs_key.1, fs_key, t.depth.map_or(0, |f| f.0 as u64), t.stencil as u64] {
++            key.push(w);
++        }
++        for (i, c) in t.colors.iter().enumerate() {
++            let enabled = st.color_state >> (8 + i) & 1 != 0;
++            let mask = st.channel_mask >> (4 * i) & 0xF;
++            key.push(c.map_or(0, |f| f.0 as u64) | (enabled as u64) << 32 | (mask as u64) << 33);
++            if enabled {
++                key.push(st.blend[i]);
++            }
++        }
++        if let Some(p) = self.mesh.get(&key) {
++            return p.clone().ok_or("mesh pipeline failed");
++        }
++        let d = MTLMeshRenderPipelineDescriptor::new();
++        unsafe {
++            d.setMeshFunction(Some(&gs.func.0));
++            d.setFragmentFunction(Some(&fs.func.0));
++        }
++        d.setMaxTotalThreadsPerMeshThreadgroup(1);
++        configure_colors(&d.colorAttachments(), t, st.color_state, st.channel_mask, &st.blend);
++        if let Some(f) = t.depth {
++            d.setDepthAttachmentPixelFormat(f);
++            if t.stencil {
++                d.setStencilAttachmentPixelFormat(f);
++            }
++        }
++        let dev = &gfx::gpu().device.0;
++        let p = match crate::kernel::blocking(|| dev.newRenderPipelineStateWithMeshDescriptor_options_reflection_error(&d, MTLPipelineOption::None, None)) {
++            Ok(p) => Some(Shared(p)),
++            Err(e) => {
++                eprintln!("[gfx] mesh pipeline {:016x}/{fs_key:016x} failed: {}", gs_key.1, e.localizedDescription());
++                None
++            }
++        };
++        self.mesh.insert(key, p.clone());
++        p.ok_or("mesh pipeline failed")
++    }
++
+     fn drain(&mut self) {
+         for (k, p) in std::mem::take(&mut *DONE.lock().unwrap()) {
+             self.pending.remove(&k);
+@@ -887,9 +931,20 @@ fn descriptor(vs: &Function, fs: &Function, t: &Targets, color_state: u32, chann
+     let d = MTLRenderPipelineDescriptor::new();
+     d.setVertexFunction(Some(vs));
+     d.setFragmentFunction(Some(fs));
++    configure_colors(&d.colorAttachments(), t, color_state, channel_mask, blend);
++    if let Some(f) = t.depth {
++        d.setDepthAttachmentPixelFormat(f);
++        if t.stencil {
++            d.setStencilAttachmentPixelFormat(f);
++        }
++    }
++    d
++}
++
++fn configure_colors(attachments: &MTLRenderPipelineColorAttachmentDescriptorArray, t: &Targets, color_state: u32, channel_mask: u32, blend: &[u64; 8]) {
+     for (i, c) in t.colors.iter().enumerate() {
+         let Some(fmt) = c else { continue };
+-        let a = unsafe { d.colorAttachments().objectAtIndexedSubscript(i) };
++        let a = unsafe { attachments.objectAtIndexedSubscript(i) };
+         a.setPixelFormat(*fmt);
+         let m = channel_mask >> (4 * i) & 0xF;
+         let mut wm = MTLColorWriteMask::empty();
+@@ -910,13 +965,6 @@ fn descriptor(vs: &Function, fs: &Function, t: &Targets, color_state: u32, chann
+             a.setDestinationAlphaBlendFactor(blend_factor(w1 >> 24 & 0x7F));
+         }
+     }
+-    if let Some(f) = t.depth {
+-        d.setDepthAttachmentPixelFormat(f);
+-        if t.stencil {
+-            d.setStencilAttachmentPixelFormat(f);
+-        }
+-    }
+-    d
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/nxshader/src/bin/shgeo.rs b/crates/nxshader/src/bin/shgeo.rs
+new file mode 100644
+index 0000000..00e1197
+--- /dev/null
++++ b/crates/nxshader/src/bin/shgeo.rs
+@@ -0,0 +1,21 @@
++// SplatNative: shgeo VS.bin GS.bin [fs-attribute-mask-hex] [out.metal]
++// Translates a vertex + geometry shader pair into the mesh-shader library the host builds.
++fn main() {
++    let args: Vec<String> = std::env::args().skip(1).collect();
++    let vs = std::fs::read(&args[0]).expect("read vertex shader");
++    let gs = std::fs::read(&args[1]).expect("read geometry shader");
++    let fs_attrs = args.get(2).map_or(0, |a| u32::from_str_radix(a, 16).expect("hex mask"));
++    match nxshader::translate_geometry(&vs, &gs, fs_attrs) {
++        Ok(t) => {
++            match args.get(3) {
++                Some(o) => std::fs::write(o, &t.msl).unwrap(),
++                None => print!("{}", t.msl),
++            }
++            eprintln!("{} interface {:?}", t.entry, t.interface);
++        }
++        Err(e) => {
++            eprintln!("error: {e:#}");
++            std::process::exit(1);
++        }
++    }
++}
+diff --git a/crates/nxshader/src/lib.rs b/crates/nxshader/src/lib.rs
+index 03ff3a3..d814a03 100644
+--- a/crates/nxshader/src/lib.rs
++++ b/crates/nxshader/src/lib.rs
+@@ -7,4 +7,4 @@ pub mod program;
+ pub mod sph;
+ pub mod table;
+ 
+-pub use msl::{Interface, TexKind, Translated, prelude, translate, translate_compute, translate_with};
++pub use msl::{Interface, TexKind, Translated, prelude, translate, translate_compute, translate_geometry, translate_with};
+diff --git a/crates/nxshader/src/msl.rs b/crates/nxshader/src/msl.rs
+index 6cc6606..5e56a74 100644
+--- a/crates/nxshader/src/msl.rs
++++ b/crates/nxshader/src/msl.rs
+@@ -176,6 +176,18 @@ impl<'a> Gen<'a> {
+         };
+         if inv { format!("(!{base})") } else { base }
+     }
++    /// Operands A and B of VMAD/VSETP: bit 50 says whether B is a register or a 16-bit immediate.
++    fn video_operands(&mut self, raw: u64, ra: i32, rb: i32, imm16: i32, asel: u32, bsel: u32) -> (String, String) {
++        let a = format!("vsel({}, {asel}u)", self.r(ra));
++        let b = if raw >> 50 & 1 != 0 {
++            format!("vsel({}, {bsel}u)", self.r(rb))
++        } else if bsel & 8 != 0 {
++            format!("{:#x}u", ((imm16 as u32) << 16) as i32 >> 16)
++        } else {
++            format!("{:#x}u", imm16 as u32 & 0xffff)
++        };
++        (a, b)
++    }
+     fn setp(&mut self, n: i32, expr: String) {
+         if n != 7 {
+             self.preds.insert(n);
+@@ -200,7 +212,7 @@ impl<'a> Gen<'a> {
+ 
+     fn attr_load(&mut self, addr: i32, output: bool) -> String {
+         match (self.sph.stage, addr) {
+-            (Stage::Vertex, a) if output => self.vs_output_ref(a).map_or("0u".into(), |f| format!("as_type<uint>({f})")),
++            (Stage::Vertex | Stage::Geometry, a) if output => self.vs_output_ref(a).map_or("0u".into(), |f| format!("as_type<uint>({f})")),
+             (Stage::Vertex, ATTR_GENERIC..ATTR_GENERIC_END) => {
+                 let (i, c) = ((addr - ATTR_GENERIC) / 16, (addr - ATTR_GENERIC) / 4 % 4);
+                 self.iface.attributes |= 1 << i;
+@@ -225,11 +237,32 @@ impl<'a> Gen<'a> {
+                 self.iface.outputs |= 1 << i;
+                 format!("o.v{i}.{}", c[k as usize])
+             }
++            ATTR_POINT_SIZE if self.sph.stage == Stage::Geometry => "gpsize".into(),
+             ATTR_POINT_SIZE => "o.psize".into(),
+             _ => return None,
+         })
+     }
+ 
++    /// SplatNative: a geometry shader input: attribute `addr` of input vertex `vertex` (the
++    /// value ISBERD passed through; out-of-range handles clamp to the last vertex).
++    fn gs_input(&mut self, addr: i32, vertex: String) -> String {
++        let c = ["x", "y", "z", "w"];
++        let v = format!("gin[min({vertex}, gs_n - 1u)]");
++        match addr {
++            ATTR_POSITION..=0x7c => format!("as_type<uint>({v}.pos.{})", c[((addr - ATTR_POSITION) / 4) as usize]),
++            ATTR_GENERIC..ATTR_GENERIC_END => {
++                let (i, k) = ((addr - ATTR_GENERIC) / 16, (addr - ATTR_GENERIC) / 4 % 4);
++                self.iface.attributes |= 1 << i;
++                format!("as_type<uint>({v}.v{i}.{})", c[k as usize])
++            }
++            ATTR_POINT_SIZE => format!("as_type<uint>({v}.psize)"),
++            _ => {
++                self.warnings.push(format!("geometry input {addr:#x}"));
++                "0u".into()
++            }
++        }
++    }
++
+     fn fs_input(&mut self, addr: i32, perspective_scale: bool) -> String {
+         let c = ["x", "y", "z", "w"];
+         match addr {
+@@ -1216,6 +1249,8 @@ impl<'a> Gen<'a> {
+                     0x25 if compute => "ctaid.x",
+                     0x26 if compute => "ctaid.y",
+                     0x27 if compute => "ctaid.z",
++                    // SR_INVOCATION_INFO: input vertex count in bits 16..23 (invocation 0).
++                    0x1d if self.sph.stage == Stage::Geometry => "(gs_n << 16)",
+                     _ => "0u",
+                 };
+                 self.set(o.dest(), v.into());
+@@ -1227,8 +1262,12 @@ impl<'a> Gen<'a> {
+                 if o.src_a() != RZ_ {
+                     self.warnings.push("indexed attribute load".into());
+                 }
++                let gs_vertex = (self.sph.stage == Stage::Geometry && !o.o()).then(|| self.r(o.src_b()));
+                 for k in 0..n {
+-                    let v = self.attr_load(o.imm11() + 4 * k, o.o());
++                    let v = match &gs_vertex {
++                        Some(vtx) => self.gs_input(o.imm11() + 4 * k, vtx.clone()),
++                        None => self.attr_load(o.imm11() + 4 * k, o.o()),
++                    };
+                     self.set(o.dest() + k, v);
+                 }
+             }
+@@ -1269,8 +1308,23 @@ impl<'a> Gen<'a> {
+                 let a = self.r(o.src_a());
+                 self.set(o.dest(), a);
+             }
++            // SplatNative: OUT.EMIT (bit 39) writes the current output vertex to the mesh and
++            // closes a triangle once the strip has three vertices; OUT.CUT (bit 40) starts a new
++            // strip. The returned output handle is not needed (AST writes the current vertex).
+             Op::OutR | Op::OutI | Op::OutC => {
+-                self.warnings.push("geometry OUT".into());
++                if self.sph.stage != Stage::Geometry {
++                    self.warnings.push("geometry OUT".into());
++                } else {
++                    let mode = (i.raw >> 39) & 3;
++                    let d = (i.raw & 0xFF) as i32;
++                    if mode & 1 != 0 {
++                        self.line("gs_emit();");
++                    }
++                    if mode & 2 != 0 {
++                        self.line("gs_strip = 0u;");
++                    }
++                    self.set(d, "0u".into());
++                }
+             }
+ 
+             Op::Texs => {
+@@ -1379,15 +1433,25 @@ impl<'a> Gen<'a> {
+                 self.setp(o.dest_pred(), format!("bop({}u, {c}, {p})", o.bop().0));
+                 self.setp(o.dest_pred_inv(), format!("bop({}u, !{c}, {p})", o.bop().0));
+             }
++            // SplatNative: video instructions with real operand selection. Geometry shaders use
++            // them to turn SR_INVOCATION_INFO into input vertex indices and range checks.
++            // Saturation and scaling are not applied (as in other emulators).
+             Op::Vsetp => {
+                 let o = op!(InstVsetp);
+-                self.setp(o.dest_pred(), "false".into());
+-                self.setp(o.dest_pred_inv(), "true".into());
++                let (a, b) = self.video_operands(i.raw, o.src_a(), o.src_b(), o.imm16(), o.a_select().0, o.b_select().0);
++                let signed = (o.a_select().0 | o.b_select().0) & 8 != 0;
++                let p = self.p(o.src_pred(), o.src_pred_inv());
++                let bop = o.bool_op().0;
++                self.line(format!("{{ bool c = icmp({}u, {a}, {b}, {signed});", o.v_comp().0));
++                self.setp(o.dest_pred(), format!("bop({bop}u, c, {p})"));
++                self.setp(o.dest_pred_inv(), format!("bop({bop}u, !c, {p})"));
++                self.line("}");
+             }
+             Op::Vmad => {
+                 let o = op!(InstVmad);
+-                let (a, b, c) = (self.r(o.src_a()), self.r(o.src_b()), self.r(o.src_c()));
+-                self.set(o.dest(), format!("(({a} & 0xffffu) * ({b} & 0xffffu) + {c})"));
++                let (a, b) = self.video_operands(i.raw, o.src_a(), o.src_b(), o.imm16(), o.a_select().0, o.b_select().0);
++                let c = self.r(o.src_c());
++                self.set(o.dest(), format!("({a} * {b} + {c})"));
+             }
+             Op::Shfl => {
+                 let o = op!(InstShfl);
+@@ -1792,6 +1856,21 @@ static inline bool icmp(uint op, uint a, uint b, bool s) {
+     default: return false;
+     }
+ }
++// SplatNative: operand of a video instruction (VMAD, VSETP): byte 0-3, half 4-5 or word 6,
++// sign-extended when bit 3 is set.
++static inline uint vsel(uint v, uint sel) {
++    bool sg = (sel & 8u) != 0u;
++    uint k = sel & 7u;
++    if (k < 4u) {
++        uint b = (v >> (k * 8u)) & 0xffu;
++        return sg ? uint(int(b << 24) >> 24) : b;
++    }
++    if (k < 6u) {
++        uint h = (v >> ((k - 4u) * 16u)) & 0xffffu;
++        return sg ? uint(int(h << 16) >> 16) : h;
++    }
++    return v;
++}
+ static inline bool ccc(uint c, bool zf, bool nf, bool cf, bool vf) {
+     switch (c) {
+     case 0u: return false;
+@@ -2033,6 +2112,82 @@ pub fn translate_with(blob: &[u8], extra_outputs: u32, uint_targets: u32, sint_t
+     translate_code(&sph, &blob[0x80..], extra_outputs, uint_targets, sint_targets)
+ }
+ 
++/// SplatNative: draw parameters and primitive assembly for geometry shaders run as mesh shaders.
++/// `mode` is the NVN draw mode; `gidx` holds the draw's indices as u32 when `indexed` is set.
++const GS_HELPERS: &str = r#"struct GsDraw {
++    uint mode;
++    uint first;
++    uint indexed;
++    int base_vertex;
++    uint verts;
++    uint pad0, pad1, pad2;
++};
++static inline uint gs_vertex(constant GsDraw& d, device const uint* idx, uint p, uint k) {
++    uint i;
++    switch (d.mode) {
++    case 0u: i = p; break;
++    case 1u: i = 2u * p + k; break;
++    case 3u: i = p + k; break;
++    case 5u: i = p + (((p & 1u) != 0u && k < 2u) ? 1u - k : k); break;
++    case 6u: i = k == 0u ? 0u : p + k; break;
++    default: i = 3u * p + k; break;
++    }
++    i += d.first;
++    return d.indexed != 0u ? uint(int(idx[i]) + d.base_vertex) : i;
++}
++"#;
++
++/// SplatNative: one Metal library for a draw with a geometry shader: the vertex shader becomes a
++/// plain function (`vs_run`) that the mesh entry `gmain` calls for each vertex of its input
++/// primitive before running the geometry code. `fs_attributes` are the fragment shader's inputs,
++/// which the mesh output must provide even when the geometry shader leaves them unwritten.
++/// The host binds the vertex stage's Res (with the y-flip/depth flags cleared) at mesh buffer 0,
++/// the geometry stage's Res at 1, GsDraw at 2 and the u32 indices at 3; vertex textures keep
++/// their slots.
++pub fn translate_geometry(vs_blob: &[u8], gs_blob: &[u8], fs_attributes: u32) -> Result<Translated> {
++    let gs = translate_with(gs_blob, fs_attributes, 0, 0)?;
++    if gs.stage != Stage::Geometry {
++        bail!("not a geometry shader");
++    }
++    let vs = translate_with(vs_blob, gs.interface.attributes, 0, 0)?;
++    if vs.stage != Stage::Vertex {
++        bail!("geometry shader without a vertex shader");
++    }
++    let vs_src = rename(&vs.msl[PRELUDE.len()..], "VOut", "VSOut");
++    // The vertex entry line becomes a plain function; its parameters lose their attributes.
++    let start = vs_src.find("vertex VSOut vmain(").ok_or_else(|| anyhow::anyhow!("vertex entry not found"))?;
++    let open = start + "vertex VSOut vmain(".len();
++    let close = open + vs_src[open..].find(") {").ok_or_else(|| anyhow::anyhow!("vertex entry not closed"))?;
++    let strip = |p: &str| {
++        let mut o = String::new();
++        let mut rest = p;
++        while let Some(i) = rest.find(" [[") {
++            o.push_str(&rest[..i]);
++            match rest[i..].find("]]") {
++                Some(j) => rest = &rest[i + j + 2..],
++                None => break,
++            }
++        }
++        o.push_str(rest);
++        o
++    };
++    let params: Vec<&str> = vs_src[open..close].split(", ").collect();
++    // vid, iid and res come first; the rest are textures and samplers.
++    let tex_params: Vec<&str> = params.iter().copied().filter(|p| p.contains("[[texture(") || p.contains("[[sampler(")).collect();
++    let tex_args: String = tex_params.iter().map(|p| format!(", {}", strip(p).rsplit(' ').next().unwrap_or(""))).collect();
++    let plain: Vec<String> = params.iter().map(|p| strip(p)).collect();
++    let body_struct = strip(&vs_src[..start]);
++    let vs_fn = format!("{body_struct}static inline VSOut vs_run({}{}", plain.join(", "), &vs_src[close..]);
++    let mut gs_src = gs.msl[PRELUDE.len()..].to_string();
++    gs_src = gs_src.replace(", /*VS_PARAMS*/", &tex_params.iter().map(|p| format!(", {p}")).collect::<String>());
++    gs_src = gs_src.replace("/*VS_ARGS*/", &tex_args);
++    let msl = format!("{PRELUDE}{vs_fn}{gs_src}");
++    let mut interface = gs.interface.clone();
++    interface.textures = vs.interface.textures.clone();
++    interface.samplers = vs.interface.samplers.clone();
++    Ok(Translated { stage: Stage::Geometry, msl, entry: "gmain".into(), interface })
++}
++
+ pub fn translate_compute(code: &[u8], local_memory: u32) -> Result<Translated> {
+     translate_code(&Sph::compute(local_memory), code, 0, 0, 0)
+ }
+@@ -2073,15 +2228,26 @@ fn translate_code(sph: &Sph, code: &[u8], extra_outputs: u32, uint_targets: u32,
+     g.line("return epilogue();");
+ 
+     let stage = sph.stage;
+-    if stage == Stage::Vertex {
++    if matches!(stage, Stage::Vertex | Stage::Geometry) {
+         g.iface.outputs |= extra_outputs;
+     }
+     let entry = match stage {
+         Stage::Vertex => "vmain",
+         Stage::Fragment => "fmain",
+         Stage::Compute => "cmain",
++        Stage::Geometry => {
++            if sph.gs_topology != 7 {
++                bail!("geometry output topology {}", sph.gs_topology);
++            }
++            if !g.iface.textures.is_empty() {
++                bail!("geometry shader samples textures");
++            }
++            "gmain"
++        }
+         s => bail!("unsupported stage {s:?}"),
+     };
++    let gs_max_vertices = sph.gs_max_vertices.clamp(3, 256);
++    let gs_max_prims = gs_max_vertices - 2;
+     let mut out = String::from(PRELUDE);
+     let c = ["x", "y", "z", "w"];
+     let _ = c;
+@@ -2094,6 +2260,18 @@ fn translate_code(sph: &Sph, code: &[u8], extra_outputs: u32, uint_targets: u32,
+             }
+         }
+         out.push_str("    float psize [[point_size]];\n};\n");
++    } else if stage == Stage::Geometry {
++        // SplatNative: geometry shaders run as Metal mesh shaders, one single-thread threadgroup
++        // per input primitive (see translate_geometry).
++        out.push_str("struct GOut {\n    float4 pos [[position, invariant]];\n");
++        for i in 0..32 {
++            if g.iface.outputs >> i & 1 != 0 {
++                writeln!(out, "    float4 v{i} [[user(locn{i})]];").unwrap();
++            }
++        }
++        out.push_str("};\n");
++        writeln!(out, "using GMesh = metal::mesh<GOut, void, {gs_max_vertices}, {gs_max_prims}, metal::topology::triangle>;").unwrap();
++        out.push_str(GS_HELPERS);
+     } else if stage == Stage::Fragment {
+         out.push_str("struct FIn {\n    float4 pos [[position]];\n");
+         for i in 0..32 {
+@@ -2132,6 +2310,16 @@ fn translate_code(sph: &Sph, code: &[u8], extra_outputs: u32, uint_targets: u32,
+         params.insert(0, "uint vid [[vertex_id]], uint iid [[instance_id]]".into());
+     } else if stage == Stage::Compute {
+         params.insert(0, "uint3 tid [[thread_position_in_threadgroup]], uint3 ctaid [[threadgroup_position_in_grid]]".into());
++    } else if stage == Stage::Geometry {
++        params = vec![
++            "GMesh m".into(),
++            "uint3 gid [[threadgroup_position_in_grid]]".into(),
++            "constant Res& vres [[buffer(0)]]".into(),
++            "constant Res& res [[buffer(1)]]".into(),
++            "constant GsDraw& gd [[buffer(2)]]".into(),
++            "device const uint* gidx [[buffer(3)]]".into(),
++            "/*VS_PARAMS*/".into(),
++        ];
+     } else {
+         params.insert(0, "FIn in [[stage_in]], bool front [[front_facing]]".into());
+         if g.uses_point_coord {
+@@ -2162,6 +2350,7 @@ fn translate_code(sph: &Sph, code: &[u8], extra_outputs: u32, uint_targets: u32,
+     }
+     let (kind, ret) = match stage {
+         Stage::Vertex => ("vertex", "VOut"),
++        Stage::Geometry => ("[[mesh]]", "void"),
+         Stage::Compute => ("kernel", "void"),
+         _ => ("fragment", "FOut"),
+     };
+@@ -2204,6 +2393,22 @@ fn translate_code(sph: &Sph, code: &[u8], extra_outputs: u32, uint_targets: u32,
+         );
+     } else if stage == Stage::Compute {
+         out.push_str("    auto epilogue = [&]() {};\n");
++    } else if stage == Stage::Geometry {
++        out.push_str("    const uint gs_n = clamp(gd.verts, 1u, 3u);\n    VSOut gin[3];\n");
++        out.push_str("    for (uint k = 0u; k < gs_n; k++) gin[k] = vs_run(gs_vertex(gd, gidx, gid.x, k), gid.y, vres/*VS_ARGS*/);\n");
++        out.push_str("    GOut o;\n    o.pos = float4(0.0f, 0.0f, 0.0f, 1.0f);\n    float gpsize = 1.0f;\n");
++        for i in 0..32 {
++            if g.iface.outputs >> i & 1 != 0 {
++                writeln!(out, "    o.v{i} = float4(0.0f, 0.0f, 0.0f, 1.0f);").unwrap();
++            }
++        }
++        out.push_str("    uint gs_nv = 0u, gs_np = 0u, gs_strip = 0u;\n");
++        writeln!(
++            out,
++            "    auto gs_emit = [&]() {{\n        if (gs_nv >= {gs_max_vertices}u) return;\n        GOut e = o;\n        if (res.flags & 1u) e.pos.y = -e.pos.y;\n        if (res.flags & 2u) e.pos.z = (e.pos.z + e.pos.w) * 0.5f;\n        m.set_vertex(gs_nv, e);\n        if (gs_strip >= 2u && gs_np < {gs_max_prims}u) {{\n            uint a = gs_nv - 2u, b = gs_nv - 1u;\n            if ((gs_strip & 1u) != 0u) {{ uint t = a; a = b; b = t; }}\n            m.set_index(gs_np * 3u, a);\n            m.set_index(gs_np * 3u + 1u, b);\n            m.set_index(gs_np * 3u + 2u, gs_nv);\n            gs_np++;\n        }}\n        gs_nv++;\n        gs_strip++;\n    }};"
++        )
++        .unwrap();
++        out.push_str("    (void)gpsize;\n    auto epilogue = [&]() { m.set_primitive_count(gs_np); };\n");
+     } else {
+ 
+         let mut s = String::from("    auto epilogue = [&]() -> FOut {\n        FOut r;\n");
+diff --git a/crates/nxshader/src/sph.rs b/crates/nxshader/src/sph.rs
+index a519408..42b433b 100644
+--- a/crates/nxshader/src/sph.rs
++++ b/crates/nxshader/src/sph.rs
+@@ -27,6 +27,10 @@ pub struct Sph {
+     pub omap_targets: u32,
+     pub omap_depth: bool,
+     pub omap_sample_mask: bool,
++    /// SplatNative: geometry shaders: output topology (1 points, 6 line strip, 7 triangle strip)
++    /// and the most vertices one invocation emits.
++    pub gs_topology: u32,
++    pub gs_max_vertices: u32,
+ }
+ 
+ impl Sph {
+@@ -39,6 +43,8 @@ impl Sph {
+             omap_targets: 0,
+             omap_depth: false,
+             omap_sample_mask: false,
++            gs_topology: 0,
++            gs_max_vertices: 0,
+         }
+     }
+ 
+@@ -76,6 +82,8 @@ impl Sph {
+             omap_targets: w(18),
+             omap_depth: w(19) >> 1 & 1 != 0,
+             omap_sample_mask: w(19) & 1 != 0,
++            gs_topology: w(3) >> 24 & 0xF,
++            gs_max_vertices: w(4) & 0xFFF,
+         })
+     }
+ }
+-- 
+2.56.1
+
