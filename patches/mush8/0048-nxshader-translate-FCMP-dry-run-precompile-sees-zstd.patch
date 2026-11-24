@@ -1,0 +1,171 @@
+From f3ba86a93749d777de83a864c617fc7c771fabaa Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Tue, 24 Nov 2026 11:53:20 +0100
+Subject: [PATCH 48/48] nxshader: translate FCMP; dry-run precompile sees zstd
+ shader archives
+
+FCMP (all four forms) selects Ra or B by comparing a float with zero, like
+ICMP. Splatoon 3's Crater shaders use FCMP.C; without it about 35 programs
+failed and the area rendered broken.
+
+NX_PRECOMPILE_DRY=<dir> makes --precompile only translate, unpack *.zs files
+with the zstd tool and save failing programs to <dir>. On Splatoon 3 11.3.0
+it finds 25162 programs; 129 still fail (83 geometry shaders, VMNMX, TXD,
+VOTE, BFI.I, HADD2.R, TEX.B, SHF.L.I, AL2P).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/nvn/draw/shaders.rs | 34 +++++++++++++-
+ crates/nxshader/src/msl.rs            | 64 +++++++++++++++++++++++++++
+ 2 files changed, 97 insertions(+), 1 deletion(-)
+
+diff --git a/crates/nxhost/src/nvn/draw/shaders.rs b/crates/nxhost/src/nvn/draw/shaders.rs
+index a3509f2..98d9696 100644
+--- a/crates/nxhost/src/nvn/draw/shaders.rs
++++ b/crates/nxhost/src/nvn/draw/shaders.rs
+@@ -678,14 +678,35 @@ fn aot_function(key: u64, entry: &str) -> Option<(Shared<Library>, Shared<Functi
+     Some((lib, func))
+ }
+ 
++fn unzstd(data: &[u8]) -> Option<Vec<u8>> {
++    use std::io::Write;
++    let mut child = std::process::Command::new("zstd")
++        .args(["-dc", "--no-progress"])
++        .stdin(std::process::Stdio::piped())
++        .stdout(std::process::Stdio::piped())
++        .stderr(std::process::Stdio::null())
++        .spawn()
++        .ok()?;
++    let mut stdin = child.stdin.take()?;
++    let input = data.to_vec();
++    let writer = std::thread::spawn(move || stdin.write_all(&input));
++    let out = child.wait_with_output().ok()?;
++    let _ = writer.join();
++    out.status.success().then_some(out.stdout)
++}
++
+ pub fn precompile(romfs: nxfs::storage::DynStorage, modules: &[std::path::PathBuf]) -> anyhow::Result<()> {
+     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+     let t0 = std::time::Instant::now();
+     let fs = nxfs::romfs::RomFs::open(romfs)?;
+     let mut found = std::collections::BTreeMap::new();
+     let mut pairs = std::collections::BTreeSet::new();
++    // SplatNative: with NX_PRECOMPILE_DRY, zstd-compressed files (Splatoon 3's *.bfsha.zs) are
++    // unpacked with the zstd tool too, so the dry run sees every shader the game can load.
++    let dry = std::env::var_os("NX_PRECOMPILE_DRY");
+     for f in fs.files() {
+         if let Ok(data) = fs.storage().read_vec(f.offset, f.size as usize) {
++            let data = if dry.is_some() && f.path.ends_with(".zs") { unzstd(&data).unwrap_or(data) } else { data };
+             nxshader::corpus::scan_pairs(&data, &mut found, &mut pairs);
+         }
+     }
+@@ -719,7 +740,13 @@ pub fn precompile(romfs: nxfs::storage::DynStorage, modules: &[std::path::PathBu
+                             guest.lock().unwrap().push(guest_line(gk, p, key, &entry, &t.interface));
+                             sources.lock().unwrap().insert(key, src);
+                         }
+-                        Err(e) => eprintln!("[shader] {:016x}: translation failed: {e}", fnv1a(&blob[0x30..])),
++                        Err(e) => {
++                            let h = fnv1a(&blob[0x30..]);
++                            eprintln!("[shader] {h:016x}: translation failed: {e}");
++                            if let Some(dir) = dry.as_ref().filter(|d| std::path::Path::new(d).is_dir()) {
++                                let _ = std::fs::write(std::path::Path::new(dir).join(format!("{h:016x}.bin")), blob);
++                            }
++                        }
+                     }
+                 });
+             }
+@@ -738,6 +765,11 @@ pub fn precompile(romfs: nxfs::storage::DynStorage, modules: &[std::path::PathBu
+     extra.dedup_by_key(|&mut (k, p, _)| (k, p));
+     eprintln!("[shader] {} vertex variants for the vertex/fragment pairs", extra.len());
+     translate_all(&extra);
++    // SplatNative: NX_PRECOMPILE_DRY=1 only translates (to list failing shaders), no Metal build.
++    if std::env::var_os("NX_PRECOMPILE_DRY").is_some() {
++        eprintln!("[shader] dry run: translated {} programs, nothing compiled", blobs.len() + extra.len());
++        return Ok(());
++    }
+     let sources: Vec<(u64, String)> = sources.into_inner().unwrap().into_iter().collect();
+     let mut guest = guest.into_inner().unwrap();
+     guest.sort();
+diff --git a/crates/nxshader/src/msl.rs b/crates/nxshader/src/msl.rs
+index 7ac4ab8..6cc6606 100644
+--- a/crates/nxshader/src/msl.rs
++++ b/crates/nxshader/src/msl.rs
+@@ -714,6 +714,30 @@ impl<'a> Gen<'a> {
+                 };
+                 self.set(d, format!("(icmp({cmp}u, {c}, 0u, {sg}) ? {a} : {b})"));
+             }
++            // SplatNative: FCMP: Rd = (Rc <op> 0.0) ? Ra : B, like ICMP but comparing a float.
++            // The RC form swaps the roles: the compared operand comes from the constant buffer
++            // and B is register 39. Splatoon 3's Crater (hero mode hub) shaders use FCMP.C.
++            Op::FcmpR | Op::FcmpI | Op::FcmpC | Op::FcmpRc => {
++                let (d, a, b, c, cmp) = match i.op {
++                    Op::FcmpR => {
++                        let o = op!(InstFcmpR);
++                        (o.dest(), self.r(o.src_a()), self.r(o.src_b()), self.fr(o.src_c()), o.f_comp().0)
++                    }
++                    Op::FcmpI => {
++                        let o = op!(InstFcmpI);
++                        (o.dest(), self.r(o.src_a()), format!("{:#x}u", (o.imm20() as u32) << 12), self.fr(o.src_c()), o.f_comp().0)
++                    }
++                    Op::FcmpC => {
++                        let o = op!(InstFcmpC);
++                        (o.dest(), self.r(o.src_a()), self.cb(o.cbuf_slot(), o.cbuf_offset()), self.fr(o.src_c()), o.f_comp().0)
++                    }
++                    _ => {
++                        let o = op!(InstFcmpRc);
++                        (o.dest(), self.r(o.src_a()), self.r(o.src_c()), self.fcb(o.cbuf_slot(), o.cbuf_offset()), o.f_comp().0)
++                    }
++                };
++                self.set(d, format!("(fcmp({cmp}u, {c}, 0.0f) ? {a} : {b})"));
++            }
+             // SplatNative: R2P (predicate mode): P[i] = bit (byte_sel * 8 + i) of Ra for every
+             // mask bit i < 7.
+             Op::R2pR | Op::R2pI | Op::R2pC => {
+@@ -2245,3 +2269,43 @@ fn translate_code(sph: &Sph, code: &[u8], extra_outputs: u32, uint_targets: u32,
+     }
+     Ok(Translated { stage, msl: out, entry: entry.into(), interface })
+ }
++
++#[cfg(test)]
++mod fcmp_tests {
++    fn code(words: &[u64]) -> Vec<u8> {
++        words.iter().flat_map(|w| w.to_le_bytes()).collect()
++    }
++
++    const NOP: u64 = 0x50b0_0000_0007_0f00;
++    const EXIT: u64 = 0xe300_0000_0007_000f;
++
++    fn fcmp(top12: u64, b_field: u64) -> u64 {
++        // R0 = (R2 < 0) ? R1 : B, always executed (PT)
++        (top12 << 52) | (1 << 48) | (2 << 39) | b_field | (7 << 16) | (1 << 8)
++    }
++
++    #[test]
++    fn fcmp_c_selects_by_the_sign_of_rc() {
++        let i = fcmp(0b0100_1011_1010, (3 << 34) | (5 << 20));
++        let t = super::translate_compute(&code(&[0, i, EXIT, NOP]), 0).unwrap();
++        assert!(t.msl.contains("r0 = (fcmp(1u, as_type<float>(r2), 0.0f) ? r1 : res.cb[3][5]);"), "{}", t.msl);
++    }
++
++    #[test]
++    fn fcmp_rc_compares_the_constant() {
++        let i = fcmp(0b0101_0011_1010, (3 << 34) | (5 << 20));
++        let t = super::translate_compute(&code(&[0, i, EXIT, NOP]), 0).unwrap();
++        assert!(t.msl.contains("r0 = (fcmp(1u, as_type<float>(res.cb[3][5]), 0.0f) ? r1 : r2);"), "{}", t.msl);
++    }
++
++    #[test]
++    fn fcmp_r_and_i_translate() {
++        let r = fcmp(0b0101_1011_1010, 4 << 20);
++        let t = super::translate_compute(&code(&[0, r, EXIT, NOP]), 0).unwrap();
++        assert!(t.msl.contains("r0 = (fcmp(1u, as_type<float>(r2), 0.0f) ? r1 : r4);"), "{}", t.msl);
++        // imm20 0x3f800 is 1.0f once shifted into the top bits
++        let i = fcmp(0b0011_0110_1010, 0x3f800 << 20);
++        let t = super::translate_compute(&code(&[0, i, EXIT, NOP]), 0).unwrap();
++        assert!(t.msl.contains("? r1 : 0x3f800000u);"), "{}", t.msl);
++    }
++}
+-- 
+2.56.1
+

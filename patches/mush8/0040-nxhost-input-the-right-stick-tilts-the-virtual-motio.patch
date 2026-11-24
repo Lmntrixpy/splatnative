@@ -1,7 +1,7 @@
 From 6821afa70405ca44dead39fa4ee0591d44cd4815 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Tue, 24 Nov 2026 03:09:40 +0100
-Subject: [PATCH 40/47] nxhost input: the right stick tilts the virtual motion
+Subject: [PATCH 40/48] nxhost input: the right stick tilts the virtual motion
  sensor for gamepads
 
 Splatoon 3 aims with the motion sensor by default and then reads the right

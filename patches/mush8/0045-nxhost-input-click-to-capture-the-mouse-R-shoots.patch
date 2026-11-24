@@ -1,7 +1,7 @@
 From 537554d52ca5eabc5507e1b323220ed44a0e0dbd Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Tue, 24 Nov 2026 10:07:30 +0100
-Subject: [PATCH 45/47] nxhost input: click to capture the mouse, R shoots
+Subject: [PATCH 45/48] nxhost input: click to capture the mouse, R shoots
 
 Shooting from the keyboard was only on 3, and an uncaptured left click was
 a touchscreen tap, so clicking never shot. A left click into the game

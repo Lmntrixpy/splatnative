@@ -1,7 +1,7 @@
 From 618e4d191dc6078d73fa21b548ec79f4b251bb45 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 10:51:11 +0100
-Subject: [PATCH 30/47] nxhost input: held buttons and stick directions in
+Subject: [PATCH 30/48] nxhost input: held buttons and stick directions in
  NX_AUTOINPUT
 
 NX_AUTOINPUT="t:NAME[*seconds][@player],..." now takes a hold duration
