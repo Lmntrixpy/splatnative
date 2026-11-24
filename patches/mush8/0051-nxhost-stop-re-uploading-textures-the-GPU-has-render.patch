@@ -1,0 +1,231 @@
+From f0083199f12a4c0dbf565208ec279cd975da31fb Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Tue, 24 Nov 2026 13:56:51 +0100
+Subject: [PATCH 51/51] nxhost: stop re-uploading textures the GPU has rendered
+ into
+
+A texture first created for sampling is re-uploaded from guest memory
+whenever that memory changes. Once the GPU draws or copies into it, its
+contents live only in the Metal texture, and a re-upload overwrites them
+with the guest's empty or stale bytes. In Splatoon 3's lobby this blacked
+out the whole 3D view (final composite: exposure from a 1x1 readback
+target, colour grading from an 8x8x8 LUT rendered once per scene).
+
+Diagnostics used to find it: NX_MSL_OVERRIDE=<dir> compiles an edited
+<hash>_<extra>.metal instead of the translation; draw dumps report NaN/Inf
+pixel counts; NX_TRACE_3D_TARGETS logs draws, copies and CPU uploads into
+3D textures; NX_TRACE_3D_TEXTURES reads back sampled 3D textures; failed
+texture views are logged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/nvn/draw/exec.rs     | 19 +++++++-
+ crates/nxhost/src/nvn/draw/mod.rs      | 65 +++++++++++++++++++++++++-
+ crates/nxhost/src/nvn/draw/shaders.rs  | 15 ++++++
+ crates/nxhost/src/nvn/draw/textures.rs | 14 +++++-
+ 4 files changed, 110 insertions(+), 3 deletions(-)
+
+diff --git a/crates/nxhost/src/nvn/draw/exec.rs b/crates/nxhost/src/nvn/draw/exec.rs
+index 68f2f10..562c23c 100644
+--- a/crates/nxhost/src/nvn/draw/exec.rs
++++ b/crates/nxhost/src/nvn/draw/exec.rs
+@@ -491,8 +491,25 @@ impl Replay<'_> {
+                         seen.push(k.addr);
+                         let words: Vec<String> = (0..16).map(|i| format!("{:08x}", rd::<u32>(k.addr + 4 * i))).collect();
+                         let nonzero = (0..(k.width * k.height * k.depth.max(1)) as u64).filter(|&i| rd::<u32>(k.addr + 4 * i) != 0).count();
++                        // What the GPU texture holds (work committed so far).
++                        let (w, h, dd) = (t.0.width(), t.0.height(), t.0.depth());
++                        let row = w * 16;
++                        let gpu_nonzero = gfx::gpu().device.0.newBufferWithLength_options(row * h * dd, MTLResourceOptions::StorageModeShared).and_then(|buf| {
++                            let cb = gfx::gpu().queue.0.commandBuffer()?;
++                            let bl = cb.blitCommandEncoder()?;
++                            unsafe {
++                                bl.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
++                                    &t.0, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 }, MTLSize { width: w, height: h, depth: dd }, &buf, 0, row, row * h,
++                                );
++                            }
++                            bl.endEncoding();
++                            cb.commit();
++                            cb.waitUntilCompleted();
++                            let words = unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u32, row * h * dd / 4) };
++                            Some((words.iter().filter(|&&x| x != 0).count(), words.iter().take(8).map(|x| format!("{x:08x}")).collect::<Vec<_>>().join(" ")))
++                        });
+                         eprintln!(
+-                            "[gfx] 3D texture {:#x} {}x{}x{} fmt {} target {} metal {:?} depth {} in {}: {nonzero} nonzero words, guest {}",
++                            "[gfx] 3D texture {:#x} {}x{}x{} fmt {} target {} metal {:?} depth {} in {}: guest {nonzero} nonzero words ({}), GPU {gpu_nonzero:?}",
+                             k.addr, k.width, k.height, k.depth, k.format, k.target, t.0.textureType(), t.0.depth(), c.entry, words.join(" ")
+                         );
+                     }
+diff --git a/crates/nxhost/src/nvn/draw/mod.rs b/crates/nxhost/src/nvn/draw/mod.rs
+index 5dbdd75..50652c7 100644
+--- a/crates/nxhost/src/nvn/draw/mod.rs
++++ b/crates/nxhost/src/nvn/draw/mod.rs
+@@ -291,6 +291,7 @@ impl Replay<'_> {
+                 Cmd::CopyBufferToTexture { src, dst, region } => {
+                     self.end_pass();
+                     self.flush_clears();
++                    trace_3d_write("copy from buffer", dst, &format!("src {src:#x} region {region:?}"));
+                     self.copy_buffer_to_texture(*src, dst, *region);
+                 }
+                 Cmd::CopyTextureToTexture { src, src_region, dst, dst_region, flags } => {
+@@ -303,6 +304,7 @@ impl Replay<'_> {
+                         }
+                         _ => Err("copy of an unavailable texture"),
+                     };
++                    trace_3d_write("copy from texture", dst, &format!("src {:?} {src_region:?} -> {dst_region:?} flags {flags:#x}: {r:?}", textures::TexKey::of(src).map(|k| (format!("{:#x}", k.addr), k.width, k.height, k.depth, k.target, k.format))));
+                     let _ = r;
+                 }
+                 Cmd::CopyTextureToBuffer { src, region, dst } => {
+@@ -354,6 +356,20 @@ impl Replay<'_> {
+                     if r.is_err() {
+                         self.e.occ.draw_lost();
+                     }
++                    {
++                        static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NX_TRACE_3D_TARGETS").is_some());
++                        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++                        if *ON {
++                            if let Some((k, sub)) = self.e.colors.iter().flatten().find_map(|b| textures::TexKey::of(b).filter(|k| k.target == 2).map(|k| (k, super::objects::view_subresource(b)))) {
++                                if N.fetch_add(1, Relaxed) < 200 {
++                                    let prog = self.e.st.program;
++                                    let n = self.e.st.program_len as usize;
++                                    let stages: Vec<String> = prog[..n].iter().filter_map(|&(c, l)| self.e.shaders.stage(c, l)).map(|s| format!("{:016x}{}", s.hash, if s.fragment { "f" } else if s.geometry { "g" } else { "v" })).collect();
++                                    eprintln!("[frame] draw into 3D {:#x} layer {}: mode {} count {} inst {} stages {stages:?}: {r:?}", k.addr, sub.0, d.mode, d.count, d.instances);
++                                }
++                            }
++                        }
++                    }
+                     if let Err(e) = r
+                         && TRACE_DRAWS.load(Relaxed)
+                     {
+@@ -440,7 +456,7 @@ impl Replay<'_> {
+         if let Some(d) = depth {
+             gfx::dump_png(&d.0, &format!("work/frame/draws/{n:04}_depth.png"));
+         }
+-        eprintln!("[frame] draw dump {n:04}");
++        eprintln!("[frame] draw dump {n:04}{}", nan_stats(&t.0).map_or(String::new(), |(bad, all)| format!(": {bad} of {all} pixels NaN/Inf")));
+     }
+ 
+     /// SplatNative: render targets are Metal textures, separate from guest memory. A game that
+@@ -670,6 +686,52 @@ impl Replay<'_> {
+     }
+ }
+ 
++/// SplatNative diagnostics: with NX_TRACE_3D_TARGETS, every write into a 3D texture (copies,
++/// CPU texel uploads) is logged (first 64).
++fn trace_3d_write(how: &str, b: &TexBuilder, what: &str) {
++    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NX_TRACE_3D_TARGETS").is_some());
++    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++    if !*ON {
++        return;
++    }
++    let Some(k) = textures::TexKey::of(b).filter(|k| k.target == 2) else { return };
++    if N.fetch_add(1, Relaxed) < 64 {
++        eprintln!("[frame] 3D write ({how}) into {:#x} {}x{}x{} fmt {} sub {:?}: {what}", k.addr, k.width, k.height, k.depth, k.format, super::objects::view_subresource(b));
++    }
++}
++
++/// SplatNative diagnostics: how many pixels of a float render target hold NaN or Inf (one such
++/// pixel spreads through blurs and tone mapping). Supports RG11B10, RGBA16 and RGBA32 float.
++fn nan_stats(t: &gfx::Texture) -> Option<(usize, usize)> {
++    let fmt = t.pixelFormat();
++    let bpp = match fmt {
++        MTLPixelFormat::RG11B10Float => 4,
++        MTLPixelFormat::RGBA16Float => 8,
++        MTLPixelFormat::RGBA32Float => 16,
++        _ => return None,
++    };
++    let (w, h) = (t.width(), t.height());
++    let g = gfx::gpu();
++    let buf = g.device.0.newBufferWithLength_options(w * h * bpp, MTLResourceOptions::StorageModeShared)?;
++    let cb = g.queue.0.commandBuffer()?;
++    let bl = cb.blitCommandEncoder()?;
++    unsafe {
++        bl.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
++            t, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 }, MTLSize { width: w, height: h, depth: 1 }, &buf, 0, w * bpp, w * h * bpp,
++        );
++    }
++    bl.endEncoding();
++    cb.commit();
++    cb.waitUntilCompleted();
++    let words = unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u32, w * h * bpp / 4) };
++    let bad = match bpp {
++        4 => words.iter().filter(|&&x| (x >> 6) & 31 == 31 || (x >> 17) & 31 == 31 || (x >> 27) & 31 == 31).count(),
++        8 => words.chunks(2).filter(|p| p.iter().any(|&x| (x >> 10) & 31 == 31 || (x >> 26) & 31 == 31)).count(),
++        _ => words.chunks(4).filter(|p| p.iter().any(|&x| (x >> 23) & 0xff == 0xff)).count(),
++    };
++    Some((bad, w * h))
++}
++
+ fn stage_index(nvn_stage: u32) -> Option<usize> {
+     match nvn_stage {
+         0 => Some(0),
+@@ -1113,6 +1175,7 @@ fn present_now(b: TexBuilder) {
+ pub fn write_texels(mut b: TexBuilder, view: u64, region: [i32; 6], data: *const u8, strides: Option<(usize, usize)>) {
+     async_gfx::drain();
+     super::objects::apply_view(&mut b, view, true);
++    trace_3d_write("CPU texels", &b, &format!("region {region:?} strides {strides:?}"));
+     objc2::rc::autoreleasepool(|_| {
+         let mut e = ENGINE.lock().unwrap();
+         e.forget_dead();
+diff --git a/crates/nxhost/src/nvn/draw/shaders.rs b/crates/nxhost/src/nvn/draw/shaders.rs
+index 9af991c..ef73ce5 100644
+--- a/crates/nxhost/src/nvn/draw/shaders.rs
++++ b/crates/nxhost/src/nvn/draw/shaders.rs
+@@ -505,6 +505,21 @@ fn compile_inner(blob: &[u8], compute: bool, extra_outputs: u32, uint_targets: u
+         let _ = std::fs::create_dir_all("work/msl_rt");
+         let _ = std::fs::write(format!("work/msl_rt/{hash:016x}_{extra_outputs:x}.metal"), &t.msl);
+     }
++    // SplatNative diagnostics: NX_MSL_OVERRIDE=<dir> compiles <dir>/<hash>_<extra>.metal (a
++    // full translation, e.g. an edited NX_DUMP_MSL file) instead of the translated source.
++    if let Some(src) = std::env::var_os("NX_MSL_OVERRIDE").and_then(|d| std::fs::read_to_string(std::path::Path::new(&d).join(format!("{hash:016x}_{extra_outputs:x}.metal"))).ok()) {
++        let opts = MTLCompileOptions::new();
++        opts.setMathMode(MTLMathMode::Safe);
++        opts.setPreserveInvariance(true);
++        match gfx::gpu().device.0.newLibraryWithSource_options_error(&NSString::from_str(&src), Some(&opts)) {
++            Ok(lib) => {
++                let func = lib.newFunctionWithName(&NSString::from_str(&t.entry))?;
++                eprintln!("[shader] {hash:016x}_{extra_outputs:x}: using the override source");
++                return Some(Arc::new(Compiled { func: Shared(func), lib: Shared(lib), entry: t.entry.clone(), iface: t.interface, source: None }));
++            }
++            Err(e) => eprintln!("[shader] {hash:016x}: override failed to compile: {}", e.localizedDescription()),
++        }
++    }
+     let source = if compute { None } else { nxshader::corpus::key(blob).map(|k| (k, [extra_outputs, uint_targets, sint_targets])) };
+     let (key, src, entry) = cache_name(&t);
+     if std::env::var_os("NX_DUMP_MSL").is_some() {
+diff --git a/crates/nxhost/src/nvn/draw/textures.rs b/crates/nxhost/src/nvn/draw/textures.rs
+index 07d5fa8..88ad489 100644
+--- a/crates/nxhost/src/nvn/draw/textures.rs
++++ b/crates/nxhost/src/nvn/draw/textures.rs
+@@ -136,7 +136,16 @@ impl Textures {
+             e.used = tick;
+             e.seen = frame;
+             let (t, skip) = (e.tex.clone(), e.skip);
+-            if !render_target {
++            if render_target {
++                // SplatNative: once the GPU draws or copies into a texture that was first created
++                // for sampling, its contents live in the Metal texture only. Re-uploading it from
++                // guest memory when that memory changes would wipe what the GPU rendered: Splatoon 3
++                // renders its 8x8x8 colour-grading LUT once per scene into such a texture, and a
++                // later re-upload of the (zero) guest memory turned the whole lobby black.
++                if self.uploaded.remove(&key).is_some() && std::env::var_os("NX_TRACE_3D_TARGETS").is_some() {
++                    eprintln!("[gfx] texture {:#x} {}x{}x{} is now rendered by the GPU; no more uploads from guest memory", key.addr, key.width, key.height, key.depth);
++                }
++            } else {
+                 if let Some((mut hashes, checked, len)) = self.uploaded.get(&key).copied() {
+                     if checked != frame {
+                         let w = window(len, frame);
+@@ -384,6 +393,9 @@ impl Textures {
+     pub fn fallback(&mut self, kind: TexKind, tex: &Shared<Texture>, who: &str) -> Shared<Texture> {
+         let have = tex.0.textureType();
+         if have == kind_type(kind) {
++            if self.mismatches.insert((kind, 0x1000 | have.0 as u64), ()).is_none() {
++                eprintln!("[gfx] texture view failed in {who}: {kind:?} {}x{}x{} format {:?}; binding the 0xFF dummy", tex.0.width(), tex.0.height(), tex.0.depth(), tex.0.pixelFormat());
++            }
+             return self.dummy(kind);
+         }
+         if self.mismatches.insert((kind, have.0 as u64), ()).is_none() {
+-- 
+2.56.1
+

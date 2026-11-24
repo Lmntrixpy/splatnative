@@ -1,7 +1,7 @@
 From 8fb3ba723035ef83d4769ee0bb039de6ee79463d Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 23:36:59 +0100
-Subject: [PATCH 37/50] nxshader/nxhost: compute shaders, shared memory and
+Subject: [PATCH 37/51] nxshader/nxhost: compute shaders, shared memory and
  unaligned vertex attributes
 
 - Compute programs of newer SDKs start with a 0x100-byte header (magic

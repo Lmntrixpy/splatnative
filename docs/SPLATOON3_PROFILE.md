@@ -263,6 +263,19 @@ und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen 
 - **Nutzer-Lauf mit 0046: funktioniert.** Die gefälschten Occlusion-Queries waren die Ursache; die
   Tinten-Abfrage des Spiels braucht echte Pixelzahlen.
 
+### Schwarze Lobby (Läufe 126–152)
+- Bild: nur Menüs, 3D schwarz; trat nicht bei jedem Start auf (abhängig vom Speicherverlauf).
+- Die Szene (960x540) war korrekt (`NX_DUMP_EACH_DRAW`, NaN-Zählung in den Dumps: 0), Bloom ebenso.
+  Erst der Abschluss-Shader (Belichtung aus einem 1x1-Rendertarget, Farbkorrektur über eine
+  8x8x8-LUT) lieferte Schwarz. Gegenprobe mit `NX_MSL_OVERRIDE`: ohne LUT-Zugriff erscheint die Lobby.
+- Die LUT wird beim Szenenstart mit **einem** Draw in 8 Rendertargets (Scheiben 0–7 derselben
+  3D-Textur) gerendert (`NX_TRACE_3D_TARGETS`).
+- Ursache im Host: Texturen, die zuerst zum Sampeln aus dem Gastspeicher angelegt wurden, wurden
+  bei jeder Änderung dieses Speichers neu hochgeladen – auch nachdem die GPU hineingerendert hatte.
+  Das überschrieb GPU-Ergebnisse mit dem (leeren/veralteten) Gastspeicher; betroffen laut Log das
+  1x1-Rücklese-Target, das der Abschluss-Shader liest. Patch 0051: ab dem ersten Rendern/Kopieren
+  in eine Textur kein Hochladen aus dem Gastspeicher mehr. Danach Lobby in 2/2 Läufen sichtbar.
+
 ### Beobachtet, noch nicht umgesetzt: Kernzuordnung
 - Threads mit idealem Kern −2 („Prozesswert“) behalten im Host −2, obwohl das Spiel später Masken 0x2/0x4
   setzt; der Host-Scheduler (`sched_core`) ordnet sie alle Kern 0 zu. Horizon löst −2 beim Erzeugen auf
