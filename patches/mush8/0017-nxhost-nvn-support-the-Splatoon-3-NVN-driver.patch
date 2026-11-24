@@ -1,7 +1,7 @@
 From f216cb0170ed8b997ee10497b77ea3acc06ec714 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 05:36:00 +0100
-Subject: [PATCH 17/45] nxhost nvn: support the Splatoon 3 NVN driver
+Subject: [PATCH 17/46] nxhost nvn: support the Splatoon 3 NVN driver
 
 The Splatoon 3 11.3.0 sdk (574284b4) ships a newer NVN driver than MK8DX:
 

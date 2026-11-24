@@ -1,7 +1,7 @@
 From 6651184e7b9cc98ca9827975b9c9fc9a076637b6 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 07:17:20 +0100
-Subject: [PATCH 26/45] nxhost nvn: clears, conditional rendering and counters
+Subject: [PATCH 26/46] nxhost nvn: clears, conditional rendering and counters
  as the driver does
 
 Splatoon 3 rendered its whole frame but presented black. Measured with

@@ -1,7 +1,7 @@
 From e2156cbda83020eea1b59fafef09d5d4a735a696 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:03:28 +0100
-Subject: [PATCH 02/45] nxfs: parse DT_RELR and DT_GNU_HASH dynamic sections
+Subject: [PATCH 02/46] nxfs: parse DT_RELR and DT_GNU_HASH dynamic sections
 
 Splatoon 3 11.3.0 is linked with a newer SDK: main uses DT_RELR for its
 relative relocations (528692 of them) and sdk has DT_GNU_HASH but no

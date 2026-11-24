@@ -1,0 +1,346 @@
+From 2ece8dbf878e68c5a68f5ea4157fff4fe72be8fe Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Tue, 24 Nov 2026 10:19:31 +0100
+Subject: [PATCH 46/46] nxhost nvn: count SAMPLES_PASSED for real with Metal
+ visibility results
+
+Every SAMPLES_PASSED report used to read "one more than the last", which
+kept occlusion-culled objects visible. Splatoon 3 also measures ink this
+way: its paint checker resets the counter, draws a probe that only passes
+where there is ink and reads the report (13 resets+reports per frame
+already in the menus). One sample per probe meant almost no ink, so
+swimming never sped up and inked walls could not be climbed.
+
+Draws after a reset now count into slots of a shared visibility buffer
+(one per counter interval and render pass, Accumulate mode, zeroed when
+handed out); a report sums its interval's slots once the command buffer
+has completed (completion handler, nvnSyncWait, next submit) and writes
+the value with the timestamp. Intervals with draws that could not be
+encoded fall back to the old fake value when they counted nothing.
+NX_REAL_OCCLUSION=0 restores the fake counter; NX_TRACE_OCCLUSION=1 logs
+the resolved reports. Menus render completely with real counts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/gfx/mod.rs            |  10 ++
+ crates/nxhost/src/nvn/draw/exec.rs      |   7 ++
+ crates/nxhost/src/nvn/draw/mod.rs       |  20 ++-
+ crates/nxhost/src/nvn/draw/occlusion.rs | 157 ++++++++++++++++++++++++
+ 4 files changed, 192 insertions(+), 2 deletions(-)
+ create mode 100644 crates/nxhost/src/nvn/draw/occlusion.rs
+
+diff --git a/crates/nxhost/src/gfx/mod.rs b/crates/nxhost/src/gfx/mod.rs
+index 88a0db2..e832429 100644
+--- a/crates/nxhost/src/gfx/mod.rs
++++ b/crates/nxhost/src/gfx/mod.rs
+@@ -574,7 +574,17 @@ pub fn run_pass(cb: &CommandBuffer, a: &Attachments) {
+ }
+ 
+ pub fn begin_pass(cb: &CommandBuffer, a: &Attachments) -> Option<Retained<RenderEncoder>> {
++    begin_pass_counting(cb, a, None)
++}
++
++/// begin_pass with a visibility-result buffer for sample counting (Accumulate: each slot keeps
++/// its count across encoders; the occlusion counter zeroes slots before handing them out).
++pub fn begin_pass_counting(cb: &CommandBuffer, a: &Attachments, visibility: Option<&Buffer>) -> Option<Retained<RenderEncoder>> {
+     let desc = MTLRenderPassDescriptor::new();
++    if let Some(v) = visibility {
++        desc.setVisibilityResultBuffer(Some(v));
++        desc.setVisibilityResultType(MTLVisibilityResultType::Accumulate);
++    }
+     for (i, c) in a.colors.iter().enumerate() {
+         let Some((tex, load)) = c else { continue };
+         let att = unsafe { desc.colorAttachments().objectAtIndexedSubscript(i) };
+diff --git a/crates/nxhost/src/nvn/draw/exec.rs b/crates/nxhost/src/nvn/draw/exec.rs
+index 8d63f8c..edcb948 100644
+--- a/crates/nxhost/src/nvn/draw/exec.rs
++++ b/crates/nxhost/src/nvn/draw/exec.rs
+@@ -251,6 +251,13 @@ impl Replay<'_> {
+                     enc.setVertexSamplerState_atIndex(Some(&sampler.0), *slot as usize);
+                 }
+             }
++            if super::occlusion::enabled() {
++                let serial = self.pass.as_ref().unwrap().serial;
++                match self.e.occ.slot(serial) {
++                    Some(off) => enc.setVisibilityResultMode_offset(MTLVisibilityResultMode::Counting, off),
++                    None => enc.setVisibilityResultMode_offset(MTLVisibilityResultMode::Disabled, 0),
++                }
++            }
+             match prim {
+                 Prim::Direct(ty) => enc.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(ty, d.first as usize, d.count as usize, d.instances as usize, 0),
+                 Prim::Indexed { ty, itype, buffer, offset, count, base_vertex } => enc
+diff --git a/crates/nxhost/src/nvn/draw/mod.rs b/crates/nxhost/src/nvn/draw/mod.rs
+index 3674a81..1f23a03 100644
+--- a/crates/nxhost/src/nvn/draw/mod.rs
++++ b/crates/nxhost/src/nvn/draw/mod.rs
+@@ -2,6 +2,7 @@
+ // Constantin Clerc (c22dev) - 0.1
+ mod copy;
+ mod exec;
++mod occlusion;
+ mod pso4;
+ mod shaders;
+ mod state;
+@@ -54,6 +55,7 @@ struct Engine {
+     draws: u32,
+     skipped: u32,
+     held: Held,
++    occ: occlusion::Counter,
+ }
+ 
+ #[derive(Default)]
+@@ -106,6 +108,7 @@ struct Pass {
+     keys: Vec<(textures::TexKey, (u32, u32))>,
+     fresh: bool,
+     fixed: Option<EncState>,
++    serial: u64,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -268,6 +271,11 @@ impl Replay<'_> {
+                         COUNTER_SAMPLES_PASSED => SAMPLES_PASSED.fetch_add(1, Relaxed) + 1,
+                         _ => 0,
+                     };
++                    // SplatNative: real sample counts, written when the GPU is done (occlusion.rs).
++                    if *counter == COUNTER_SAMPLES_PASSED && occlusion::enabled() {
++                        self.e.occ.report(&self.cb, *addr, value, ns);
++                        continue;
++                    }
+                     if TRACE_DRAWS.load(Relaxed) {
+                         eprintln!("[frame] report counter {counter} at {addr:#x} = {value:#x}");
+                     }
+@@ -329,6 +337,7 @@ impl Replay<'_> {
+                 }
+                 Cmd::ResetCounter(counter) => {
+                     if *counter == COUNTER_SAMPLES_PASSED {
++                        self.e.occ.reset();
+                         SAMPLES_PASSED.store(0, Relaxed);
+                     }
+                 }
+@@ -342,6 +351,9 @@ impl Replay<'_> {
+                     self.e.draws += 1;
+                     self.draws_since_commit += 1;
+                     let r = self.draw(d);
++                    if r.is_err() {
++                        self.e.occ.draw_lost();
++                    }
+                     if let Err(e) = r
+                         && TRACE_DRAWS.load(Relaxed)
+                     {
+@@ -624,7 +636,7 @@ impl Replay<'_> {
+                 fmts.pop();
+             }
+             self.flush_clears();
+-            let enc = gfx::begin_pass(&self.cb, &Attachments { colors, depth, subs, depth_sub }).ok_or("no encoder")?;
++            let enc = gfx::begin_pass_counting(&self.cb, &Attachments { colors, depth, subs, depth_sub }, occlusion::buffer()).ok_or("no encoder")?;
+             let chunks: Vec<_> = self.e.arena.used.clone();
+             if !gfx::residency() {
+                 for c in &chunks {
+@@ -633,7 +645,7 @@ impl Replay<'_> {
+                 let z = &gfx::gpu().zeros.0;
+                 enc.useResource_usage_stages(ProtocolObject::from_ref(&**z), MTLResourceUsage::Read, MTLRenderStages::Vertex | MTLRenderStages::Fragment);
+             }
+-            self.pass = Some(Pass { enc, targets: Targets { colors: fmts, depth: dfmt, stencil }, size, heap: 0, chunks: chunks.len(), fresh, keys, fixed: None });
++            self.pass = Some(Pass { enc, targets: Targets { colors: fmts, depth: dfmt, stencil }, size, heap: 0, chunks: chunks.len(), fresh, keys, fixed: None, serial: occlusion::new_pass() });
+         }
+         Ok(())
+     }
+@@ -858,6 +870,7 @@ fn submit_now(handles: &[u64]) {
+     gfx::wait_foreground();
+     static FIRST: std::sync::Once = std::sync::Once::new();
+     FIRST.call_once(state::wait_prewarm);
++    occlusion::resolve_completed();
+     objc2::rc::autoreleasepool(|_| {
+         let mut e = ENGINE.lock().unwrap();
+         e.arena.recycle();
+@@ -971,6 +984,7 @@ pub fn finish() {
+     if let Some(cb) = cb {
+         crate::kernel::blocking(|| cb.0.waitUntilCompleted());
+     }
++    occlusion::resolve_completed();
+ }
+ 
+ pub fn sync_wait(sync: u64) -> u64 {
+@@ -984,6 +998,7 @@ pub fn sync_wait(sync: u64) -> u64 {
+     match cb {
+         Some(cb) => {
+             crate::kernel::blocking(|| cb.0.waitUntilCompleted());
++            occlusion::resolve_completed();
+             1
+         }
+         None => 0,
+@@ -1005,6 +1020,7 @@ fn commit(cb: &gfx::CommandBuffer) {
+         });
+         unsafe { cb.addCompletedHandler(block2::RcBlock::as_ptr(&h)) };
+     }
++    occlusion::on_commit(cb);
+     cb.commit();
+ }
+ 
+diff --git a/crates/nxhost/src/nvn/draw/occlusion.rs b/crates/nxhost/src/nvn/draw/occlusion.rs
+new file mode 100644
+index 0000000..3cca1ab
+--- /dev/null
++++ b/crates/nxhost/src/nvn/draw/occlusion.rs
+@@ -0,0 +1,157 @@
++// SplatNative: real SAMPLES_PASSED counting with Metal visibility results.
++//
++// NVN's SAMPLES_PASSED counter (ResetCounter / ReportCounter type 1) counts the samples that pass
++// the depth/stencil tests. Mush8 answered every report with "one more than before", which keeps
++// occlusion-culled objects visible, but Splatoon 3 also measures ink with it: its paint checker
++// (`PaintDrawCommandProcessor::QueryBuffer`, `DirectionPaintCheckerMaterial`) resets the counter,
++// draws a probe that only passes where there is ink, and reports. Every probe read as one sample,
++// i.e. almost no ink, so swimming never sped up and inked walls could not be climbed.
++//
++// Here every draw after a reset counts into an 8-byte slot of a shared visibility buffer (one
++// slot per counter interval and render pass, Accumulate mode, zeroed when handed out). A report
++// records the slots since the last reset; once the command buffer has completed (completion
++// handler, or the game's nvnSyncWait), their sum is written to the report together with the
++// timestamp. NX_REAL_OCCLUSION=0 restores the old fake counter.
++
++use crate::gfx::{self, Shared};
++use objc2_metal::*;
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++use std::sync::{LazyLock, Mutex};
++
++const SLOTS: usize = 1 << 16;
++/// More slots than this since one reset: counting stops until the next reset (the report then
++/// falls back to the fake value) instead of collecting slots forever.
++const MAX_INTERVAL_SLOTS: usize = 8192;
++
++pub fn enabled() -> bool {
++    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("NX_REAL_OCCLUSION").as_deref() != Ok("0") && BUFFER.is_some());
++    *ON
++}
++
++fn trace() -> bool {
++    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("NX_TRACE_OCCLUSION").is_ok_and(|v| v == "1"));
++    *ON
++}
++
++static BUFFER: LazyLock<Option<Shared<gfx::Buffer>>> =
++    LazyLock::new(|| gfx::gpu().device.0.newBufferWithLength_options(SLOTS * 8, MTLResourceOptions::StorageModeShared).map(Shared));
++
++pub fn buffer() -> Option<&'static gfx::Buffer> {
++    BUFFER.as_ref().filter(|_| enabled()).map(|b| &*b.0)
++}
++
++/// Render passes get a serial so a slot is only ever used inside one encoder.
++static PASS_SERIAL: AtomicU64 = AtomicU64::new(0);
++
++pub fn new_pass() -> u64 {
++    PASS_SERIAL.fetch_add(1, Relaxed) + 1
++}
++
++#[derive(Default)]
++pub struct Counter {
++    next: usize,
++    since_reset: Vec<u32>,
++    open: Option<(u32, u64)>,
++    counting: bool,
++    lossy: bool,
++}
++
++struct Pending {
++    cb: Shared<gfx::CommandBuffer>,
++    addr: u64,
++    slots: Vec<u32>,
++    lossy: bool,
++    fake: u64,
++    ns: u64,
++}
++
++static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
++
++impl Counter {
++    pub fn reset(&mut self) {
++        self.since_reset.clear();
++        self.open = None;
++        self.counting = true;
++        self.lossy = false;
++    }
++
++    /// Byte offset to count the next draw of pass `serial` into, or None (not counting).
++    pub fn slot(&mut self, serial: u64) -> Option<usize> {
++        let buf = buffer()?;
++        if !self.counting {
++            return None;
++        }
++        if let Some((s, p)) = self.open
++            && p == serial
++        {
++            return Some(s as usize * 8);
++        }
++        if self.since_reset.len() >= MAX_INTERVAL_SLOTS {
++            self.lossy = true;
++            return None;
++        }
++        let s = self.next;
++        self.next = (self.next + 1) % SLOTS;
++        unsafe { (buf.contents().as_ptr() as *mut u64).add(s).write_volatile(0) };
++        self.since_reset.push(s as u32);
++        self.open = Some((s as u32, serial));
++        Some(s * 8)
++    }
++
++    /// A draw after a reset that could not be encoded (shader still compiling, failed program):
++    /// its samples are unknown, so the report must not read as "nothing passed".
++    pub fn draw_lost(&mut self) {
++        if self.counting {
++            self.lossy = true;
++        }
++    }
++
++    /// ReportCounter(SAMPLES_PASSED, addr) recorded into `cb`; `fake` is the old answer, used if
++    /// the interval lost draws and counted nothing.
++    pub fn report(&mut self, cb: &gfx::CommandBuffer, addr: u64, fake: u64, ns: u64) {
++        self.open = None;
++        let p = Pending { cb: Shared(cb.retain()), addr, slots: self.since_reset.clone(), lossy: self.lossy, fake, ns };
++        PENDING.lock().unwrap().push(p);
++    }
++}
++
++/// Writes the reports whose command buffers have completed. Called from command-buffer
++/// completion handlers, after the game's fence waits and at each submit.
++pub fn resolve_completed() {
++    let Some(buf) = BUFFER.as_ref() else { return };
++    let mut pending = PENDING.lock().unwrap();
++    if pending.is_empty() {
++        return;
++    }
++    let base = buf.0.contents().as_ptr() as *const u64;
++    pending.retain(|p| {
++        let st = p.cb.0.status();
++        if st != MTLCommandBufferStatus::Completed && st != MTLCommandBufferStatus::Error {
++            return true;
++        }
++        let sum: u64 = p.slots.iter().map(|&s| unsafe { base.add(s as usize).read_volatile() }).sum();
++        let value = if p.lossy && sum == 0 { p.fake } else { sum };
++        if trace() {
++            eprintln!("[occlusion] report at {:#x} = {value} ({} slots{})", p.addr, p.slots.len(), if p.lossy { ", lost draws" } else { "" });
++        }
++        if p.addr != 0 {
++            unsafe {
++                (p.addr as *mut u64).write_unaligned(value);
++                ((p.addr + 8) as *mut u64).write_unaligned(p.ns);
++            }
++        }
++        false
++    });
++}
++
++/// Adds the completion handler that resolves this command buffer's reports.
++pub fn on_commit(cb: &gfx::CommandBuffer) {
++    if !enabled() {
++        return;
++    }
++    let h = block2::RcBlock::new(|_: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| resolve_completed());
++    unsafe { cb.addCompletedHandler(block2::RcBlock::as_ptr(&h)) };
++}
++
++use objc2::Message;
++use objc2::runtime::ProtocolObject;
+-- 
+2.56.1
+

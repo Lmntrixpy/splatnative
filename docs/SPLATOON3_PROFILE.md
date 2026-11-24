@@ -253,6 +253,13 @@ und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen 
   Texturen). **Patch 0043:** Texturen ab der 16. teilen sich Sampler-Slot 15 (Metal: 16 Sampler,
   aber deutlich mehr Textur-Slots), der Shader läuft statt auszufallen. Patch 0044: NVN-Aufrufstatistik
   auch beim Beenden mit Cmd-Q. Noch offen: Tutorial-Test durch den Nutzer.
+- Nutzer-Lauf mit 0043: beide Shader laufen, Wandklettern/Tempo unverändert.
+- **Occlusion-Queries (Patch 0046):** Spiel-Strings `PaintDrawCommandProcessor::QueryBuffer`,
+  `DirectionPaintCheckerMaterial`, `StepPaintByQuery`. Lauf 124: pro Bild ~13 `SAMPLES_PASSED`-Resets
+  mit je einem Report – Mush8 meldete immer 1. Jetzt echte Zählung über Metal-Visibility-Results
+  (Slots je Intervall und Pass, Accumulate, Auflösung nach Abschluss des Command-Buffers). Lauf 125:
+  Werte 0, 46–52, bis 1830; Menüszene vollständig (keine Fehl-Cullings). Abschalten:
+  `NX_REAL_OCCLUSION=0`, Trace: `NX_TRACE_OCCLUSION=1`. Tutorial-Test durch den Nutzer offen.
 - Weitere Kandidaten, falls 0043 nicht reicht: gefälschte Occlusion-Queries (`SAMPLES_PASSED` +1 je
   Report statt echter Pixelzahl), Thread-Kernzuordnung (`ColPaintThread`).
 
