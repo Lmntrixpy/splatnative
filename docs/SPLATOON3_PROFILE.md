@@ -242,6 +242,19 @@ und wartet auf ihn. Mush8 meldete für alle Threads Kern 0 → Warten auf einen 
   endet). Lauf 121: alle sieben Targets werden fehlerfrei zurückgeschrieben, Menüs laufen normal.
   Ob das die Tinten-Abfrage ist, muss ein Tutorial-Lauf zeigen (`NX_TRACE_CPU_TARGETS=1` listet
   dort neu auftauchende Targets). Abschalten: `NX_CPU_TARGET_WRITEBACK=0`.
+- **Nutzer-Lauf mit 0042 (`work/wall-test.log`):** keine Änderung. Im Tutorial tauchen **keine**
+  neuen CPU-lesbaren Targets und **keine** Texture→Buffer-Kopien auf; die sieben Targets aus den Menüs
+  sind also nicht die Tinten-Abfrage. Storage-Buffer schreiben direkt in den gemeinsamen Gast-Heap.
+  Controller des Nutzers: GameSir G7 SE (Xbox, ohne Gyro).
+- yuzu-Kompatibilitätsseite zu Splatoon 2: asynchrones Shader-Kompilieren macht Gelände zufällig
+  „wie mit Gegnertinte bedeckt“ unbegehbar, manche Flächen reagieren nicht auf eigene Tinte → die
+  Tinten-Kollision hängt davon ab, dass bestimmte Shader tatsächlich laufen.
+- Einzige dauerhaft ausfallenden Shader in jenem Lauf: `a791e3bcb93355bb`, `11c0b56ba2312e14` (>16
+  Texturen). **Patch 0043:** Texturen ab der 16. teilen sich Sampler-Slot 15 (Metal: 16 Sampler,
+  aber deutlich mehr Textur-Slots), der Shader läuft statt auszufallen. Patch 0044: NVN-Aufrufstatistik
+  auch beim Beenden mit Cmd-Q. Noch offen: Tutorial-Test durch den Nutzer.
+- Weitere Kandidaten, falls 0043 nicht reicht: gefälschte Occlusion-Queries (`SAMPLES_PASSED` +1 je
+  Report statt echter Pixelzahl), Thread-Kernzuordnung (`ColPaintThread`).
 
 ### Beobachtet, noch nicht umgesetzt: Kernzuordnung
 - Threads mit idealem Kern −2 („Prozesswert“) behalten im Host −2, obwohl das Spiel später Masken 0x2/0x4

@@ -1,7 +1,7 @@
 From 1380b78b4889efa980cd80b8527972bec202bed4 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:36:09 +0100
-Subject: [PATCH 14/42] nxhost: return an event for IApplicationFunctions 210
+Subject: [PATCH 14/44] nxhost: return an event for IApplicationFunctions 210
 
 Splatoon 3's nn::oe::GetOperationMode initialization (sdk 0x408a7c) gets an
 event from IApplicationFunctions 210, attaches it to a system event and

@@ -1,0 +1,30 @@
+From befa69d79722e976fa7c736f6b2990c7056391c4 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Tue, 24 Nov 2026 09:35:53 +0100
+Subject: [PATCH 44/44] nxhost: print the NVN call summary when quitting with
+ Cmd-Q/W
+
+The summary was only printed at NX_EXIT_AT, so logs of hand-played
+sessions had no call counts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxhost/src/gfx/mod.rs | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/crates/nxhost/src/gfx/mod.rs b/crates/nxhost/src/gfx/mod.rs
+index 1ffa60d..58a4e06 100644
+--- a/crates/nxhost/src/gfx/mod.rs
++++ b/crates/nxhost/src/gfx/mod.rs
+@@ -370,6 +370,7 @@ pub fn run_app(title: &str, width: f64, height: f64) -> ! {
+             match ev.charactersIgnoringModifiers().map(|c| c.to_string().to_lowercase()).as_deref() {
+                 Some("q" | "w") => {
+                     eprintln!("[host] quit by Cmd-Q/W");
++                    crate::nvn::summary();
+                     std::process::exit(0)
+                 }
+                 Some("f") if !ev.isARepeat() => win.toggleFullScreen(None),
+-- 
+2.56.1
+

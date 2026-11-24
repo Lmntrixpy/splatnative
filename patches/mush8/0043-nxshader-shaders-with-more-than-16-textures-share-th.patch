@@ -1,0 +1,76 @@
+From d7d04399435020469a864addb8d8647d3d4db595 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Tue, 24 Nov 2026 09:35:53 +0100
+Subject: [PATCH 43/44] nxshader: shaders with more than 16 textures share the
+ last sampler slot
+
+Metal has 16 sampler slots per stage but many more texture slots. Splatoon
+3 has fragment shaders (a791e3bcb93355bb, 11c0b56ba2312e14) with more than
+16 textures; they failed to translate and their draws were dropped from
+the tutorial on. Textures from the 16th on now share sampler slot 15 (an
+alias of the first one's sampler), so the shader runs; only those textures
+may sample with a neighbour's filter or wrap mode. Output for shaders with
+up to 16 textures is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013yetZ2nJDh2A6QWpF2QWuu
+---
+ crates/nxshader/src/msl.rs | 26 +++++++++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/crates/nxshader/src/msl.rs b/crates/nxshader/src/msl.rs
+index 88da794..7ac4ab8 100644
+--- a/crates/nxshader/src/msl.rs
++++ b/crates/nxshader/src/msl.rs
+@@ -8,6 +8,9 @@ use anyhow::{Result, bail};
+ use std::collections::{BTreeMap, BTreeSet};
+ use std::fmt::Write;
+ 
++/// Highest Metal sampler slot per stage (Metal has 16).
++const MAX_SAMPLER_SLOT: u32 = 15;
++
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub enum TexKind {
+     T2D,
+@@ -2112,11 +2115,25 @@ fn translate_code(sph: &Sph, code: &[u8], extra_outputs: u32, uint_targets: u32,
+         }
+     }
+     let bindings: Vec<(u32, TexKind)> = g.iface.textures.iter().map(|(b, k)| (*b, *k)).collect();
++    // SplatNative: Metal has 16 sampler slots per stage but far more texture slots. Splatoon 3 has
++    // fragment shaders with more than 16 textures; the 16th and later share sampler slot 15 (the
++    // host binds the last of their samplers there) instead of failing the whole shader.
++    let mut shared_sampler: Option<u32> = None;
++    let mut aliases = Vec::new();
+     for (slot, (b, k)) in bindings.iter().enumerate() {
+-        if slot >= 16 {
+-            bail!("more than 16 sampled textures");
++        if bindings.len() > 31 {
++            bail!("more than 31 sampled textures");
++        }
++        let slot = slot.min(MAX_SAMPLER_SLOT as usize) as u32;
++        g.iface.samplers.insert(*b, slot);
++        if slot == MAX_SAMPLER_SLOT {
++            if let Some(first) = shared_sampler {
++                params.push(format!("{} t{b} [[texture({b})]]", k.decl()));
++                aliases.push(format!("    sampler s{b} = s{first};\n"));
++                continue;
++            }
++            shared_sampler = Some(*b);
+         }
+-        g.iface.samplers.insert(*b, slot as u32);
+         params.push(format!("{} t{b} [[texture({b})]], sampler s{b} [[sampler({slot})]]", k.decl()));
+     }
+     let (kind, ret) = match stage {
+@@ -2125,6 +2142,9 @@ fn translate_code(sph: &Sph, code: &[u8], extra_outputs: u32, uint_targets: u32,
+         _ => ("fragment", "FOut"),
+     };
+     writeln!(out, "{kind} {ret} {entry}({}) {{", params.join(", ")).unwrap();
++    for a in &aliases {
++        out.push_str(a);
++    }
+ 
+     for r in &g.regs {
+         writeln!(out, "    uint r{r} = 0u;").unwrap();
+-- 
+2.56.1
+
