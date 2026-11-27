@@ -1,7 +1,7 @@
 From e768d5a2890e6a178d05c2339e837487b59aac43 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Sun, 22 Nov 2026 23:57:56 +0100
-Subject: [PATCH 01/54] nxpatch: rewrite compressed switch tables that dispatch
+Subject: [PATCH 01/55] nxpatch: rewrite compressed switch tables that dispatch
  through x18
 
 Mush8 only handled br x18 at a hardcoded list of i32 jump tables (MK8DX).

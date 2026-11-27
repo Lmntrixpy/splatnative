@@ -1,7 +1,7 @@
 From e488969ef413400d3918e230cff236843c33c4ad Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Tue, 24 Nov 2026 13:13:07 +0100
-Subject: [PATCH 50/54] nxshader, nxhost: run geometry shaders as Metal mesh
+Subject: [PATCH 50/55] nxshader, nxhost: run geometry shaders as Metal mesh
  shaders
 
 Metal has no geometry stage; draws whose program has one were dropped (the

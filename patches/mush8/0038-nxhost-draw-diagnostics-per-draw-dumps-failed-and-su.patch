@@ -1,7 +1,7 @@
 From 8c7d9165c3a30517109a17798d5bab35f680a535 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 23:36:59 +0100
-Subject: [PATCH 38/54] nxhost draw diagnostics: per-draw dumps, failed and
+Subject: [PATCH 38/55] nxhost draw diagnostics: per-draw dumps, failed and
  suppressed draws, vertex streams
 
 With NX_TRACE_AT/NX_TRACE_FRAME, the trace now also reports draws that

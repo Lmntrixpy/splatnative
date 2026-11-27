@@ -1,7 +1,7 @@
 From befa69d79722e976fa7c736f6b2990c7056391c4 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Tue, 24 Nov 2026 09:35:53 +0100
-Subject: [PATCH 44/54] nxhost: print the NVN call summary when quitting with
+Subject: [PATCH 44/55] nxhost: print the NVN call summary when quitting with
  Cmd-Q/W
 
 The summary was only printed at NX_EXIT_AT, so logs of hand-played

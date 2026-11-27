@@ -1,0 +1,64 @@
+From 9807acb973d01057eddc0814b46675737e43bb5c Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Fri, 27 Nov 2026 10:48:05 +0100
+Subject: [PATCH 55/55] nxhost: keep the pipeline archive when prewarm didn't
+ rebuild every pipeline
+
+With more than 8 archive files, a start "compacts": only bases looked up
+during prewarm are captured into a new archive, then every old file is
+deleted. Prewarm only builds pipelines whose shaders are precompiled; for
+Splatoon 3 that is 42 of 1594, so compaction threw away almost the whole
+cache. The next start rebuilt hundreds of pipelines in the background,
+drawing without them, and passes the game renders once (lighting, colour
+LUT) stayed empty: the plaza was black with only the HUD visible.
+
+prewarm_done now gets whether prewarm covered the whole list and keeps the
+old files otherwise.
+---
+ crates/nxhost/src/nvn/draw/pso4.rs  | 10 ++++++++--
+ crates/nxhost/src/nvn/draw/state.rs |  5 +++--
+ 2 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/crates/nxhost/src/nvn/draw/pso4.rs b/crates/nxhost/src/nvn/draw/pso4.rs
+index 36b50e4..8d000e6 100644
+--- a/crates/nxhost/src/nvn/draw/pso4.rs
++++ b/crates/nxhost/src/nvn/draw/pso4.rs
+@@ -394,10 +394,16 @@ impl Pso4 {
+         ok
+     }
+ 
+-    pub fn prewarm_done(&self) {
++    /// `complete`: prewarm rebuilt every recorded pipeline. Compaction only carries over what
++    /// prewarm looked up, so with a partial prewarm (Splatoon 3: few precompiled shaders, 42 of
++    /// 1594) deleting the old files threw the cache away; the next start rebuilt hundreds of
++    /// pipelines while drawing without them, and one-off passes left the world black.
++    pub fn prewarm_done(&self, complete: bool) {
+         let ok = self.flush();
+         let old = std::mem::take(&mut *self.old_files.lock().unwrap_or_else(PoisonError::into_inner));
+-        if ok && !old.is_empty() {
++        if !complete && !old.is_empty() {
++            eprintln!("[gfx] pipeline archive: prewarm didn't cover every pipeline, keeping {} old file(s)", old.len());
++        } else if ok && !old.is_empty() {
+             for f in &old {
+                 let _ = std::fs::remove_file(f);
+             }
+diff --git a/crates/nxhost/src/nvn/draw/state.rs b/crates/nxhost/src/nvn/draw/state.rs
+index 82fd8a7..3fae717 100644
+--- a/crates/nxhost/src/nvn/draw/state.rs
++++ b/crates/nxhost/src/nvn/draw/state.rs
+@@ -802,9 +802,10 @@ pub fn prewarm() {
+                     });
+                 }
+             });
+-            eprintln!("[gfx] prewarmed {}/{} recorded pipelines in {:.1} s on {workers} workers", built.into_inner(), list.len(), t0.elapsed().as_secs_f32());
++            let built = built.into_inner();
++            eprintln!("[gfx] prewarmed {built}/{} recorded pipelines in {:.1} s on {workers} workers", list.len(), t0.elapsed().as_secs_f32());
+             if let Some(p4) = super::pso4::get() {
+-                objc2::rc::autoreleasepool(|_| p4.prewarm_done());
++                objc2::rc::autoreleasepool(|_| p4.prewarm_done(built == list.len()));
+             }
+             warm_step(true);
+         })
+-- 
+2.56.1
+
