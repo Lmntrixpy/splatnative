@@ -156,11 +156,11 @@ final class Settings: ObservableObject {
         case "nextendo":
             env["NX_NEXTENDO_PID"] = String(nextendoPid)
             if inspectNetwork {
-                // Decoded NPLN traffic, plus the account, network and parental-control calls the
+                // Decoded NPLN traffic, plus the account, network and parental-control IPC the
                 // game's online checks make (to find where a feature decides it's "offline").
+                // Not NX_TRACE_SYMS: its wrapper crashed nn::account::IsNetworkServiceAccountAvailable.
                 env["NX_NEXTENDO_INSPECT"] = "1"
                 env["NX_TRACE_IPC"] = "acc,account,nifm,pctl,ntc,friend,bcat,ectx,npns,olsc,prepo"
-                env["NX_TRACE_SYMS"] = "nn::account,nn::nifm,nn::pctl,nn::friends,nn::olsc,nn::npns,nn::ec::,nn::err::"
             }
         default:
             break
