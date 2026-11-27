@@ -1,7 +1,7 @@
 From e532626c10e4c30f1a30ee9c4bda685988b5f616 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:39:34 +0100
-Subject: [PATCH 16/52] nxhost: log NX_WATCH watchpoint hits
+Subject: [PATCH 16/53] nxhost: log NX_WATCH watchpoint hits
 
 The hardware watchpoint behind NX_WATCH disarmed silently on a hit. It now
 prints the faulting pc, lr, address and a guest backtrace, which is what

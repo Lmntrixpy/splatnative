@@ -1,7 +1,7 @@
 From f3ba86a93749d777de83a864c617fc7c771fabaa Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Tue, 24 Nov 2026 11:53:20 +0100
-Subject: [PATCH 48/52] nxshader: translate FCMP; dry-run precompile sees zstd
+Subject: [PATCH 48/53] nxshader: translate FCMP; dry-run precompile sees zstd
  shader archives
 
 FCMP (all four forms) selects Ra or B by comparing a float with zero, like

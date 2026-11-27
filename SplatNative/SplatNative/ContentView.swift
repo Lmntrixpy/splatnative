@@ -12,6 +12,9 @@ struct LauncherView: View {
     @StateObject private var s = Settings()
     @StateObject private var sys = SystemInfo()
     @State private var error: String?
+    @State private var launching = false
+    /// A refusal from Nextendo's online gate is shown once; Play again starts anyway.
+    @State private var shownRefusal: String?
     #if os(macOS)
     @StateObject private var prep = Preparer()
     @StateObject private var game = GameSession()
@@ -61,7 +64,10 @@ struct LauncherView: View {
 
     var modeName: String {
         switch s.network {
+        case "lan": "LAN"
+        case "lanplay": "Lan-Play"
         case "wireless": "Wireless"
+        case "nextendo": s.nextendoName.isEmpty ? "Nextendo" : s.nextendoName
         default: "Off"
         }
     }
@@ -79,7 +85,26 @@ struct LauncherView: View {
             Section {
                 Picker("Mode", selection: $s.network) {
                     Text("Off").tag("off")
+                    Text("LAN").tag("lan")
+                    Text("Lan-Play").tag("lanplay")
                     Text("Wireless (nearby)").tag("wireless")
+                    Text("Nextendo").tag("nextendo")
+                }
+                switch s.network {
+                case "lan":
+                    Picker("Network", selection: $s.lanInterface) {
+                        Text("Automatic").tag("")
+                        ForEach(sys.interfaces, id: \.self) { n in Text("\(n.name) · \(n.ip)").tag(n.name) }
+                    }
+                case "lanplay":
+                    TextField("Server", text: $s.lanPlayServer, prompt: Text("host:port"))
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+                        #endif
+                case "nextendo":
+                    NextendoSignIn(pid: $s.nextendoPid, name: $s.nextendoName)
+                default:
+                    EmptyView()
                 }
             } footer: {
                 Text(multiplayerNote).font(.caption).foregroundStyle(.secondary)
@@ -89,8 +114,11 @@ struct LauncherView: View {
 
     var multiplayerNote: String {
         switch s.network {
+        case "lan": "Switch consoles and SplatNative players on the same network can join"
+        case "lanplay": "Players on the same Lan-Play server can join"
         case "wireless": "Nearby SplatNative players can join local play (keep Wi-Fi on)"
-        default: "LAN, Lan-Play and online play come later: with a network connected the game currently hangs on the loading screen"
+        case "nextendo": "Online play on the Nextendo network. Needs a Nextendo account with a confirmed e-mail and linked Discord"
+        default: "The game runs offline"
         }
     }
 
@@ -258,6 +286,37 @@ struct LauncherView: View {
         }
     }
 
+    /// In Nextendo mode, signs the game in first: fresh tokens, then Nextendo's online gate.
+    /// Other modes start right away.
+    func withNextendo(_ start: @escaping ([String: String]) -> Void) {
+        guard s.network == "nextendo" else {
+            start([:])
+            return
+        }
+        guard !launching else { return }
+        launching = true
+        Task { @MainActor in
+            defer { launching = false }
+            do {
+                let login = try await Nextendo.gameLogin()
+                s.nextendoPid = login.pid
+                s.nextendoName = login.name
+                try? s.save()
+                let gate = await Nextendo.onlineGate(login.token)
+                let refusal = gate.problem.map { "\(login.pid) \($0)" }
+                if let problem = gate.problem, shownRefusal != refusal {
+                    shownRefusal = refusal
+                    error = problem + " Press Play again to start anyway: online play won't work until then."
+                    return
+                }
+                shownRefusal = nil
+                start(Nextendo.environment(login, gate: gate))
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
     var lowMemoryHint: String {
         #if os(macOS)
         "4 GB of free memory is recommended"
@@ -318,9 +377,10 @@ extension LauncherView {
                 }
             } else if ready {
                 Button(action: play) {
-                    Text("Play").font(.title3.weight(.semibold)).frame(maxWidth: .infinity)
+                    Text(launching ? "Signing in to Nextendo…" : "Play").font(.title3.weight(.semibold)).frame(maxWidth: .infinity)
                 }
                 .controlSize(.large).buttonStyle(.borderedProminent)
+                .disabled(launching)
                 .keyboardShortcut(pageOpen ? nil : .defaultAction)
             } else {
                 Button { prep.prepare(s) { tick += 1 } } label: {
@@ -382,7 +442,7 @@ extension LauncherView {
             return
         }
         try? s.save()
-        game.start(s)
+        withNextendo { game.start(s, extra: $0) }
     }
 }
 #endif
@@ -404,8 +464,9 @@ extension LauncherView {
                 if files.ready && files.copying == nil {
                     if let error { Text(error).foregroundStyle(.red).font(.callout).multilineTextAlignment(.center) }
                     Button(action: play) {
-                        Text("Play").font(.title3.weight(.semibold)).frame(maxWidth: 220)
+                        Text(launching ? "Signing in…" : "Play").font(.title3.weight(.semibold)).frame(maxWidth: 220)
                     }
+                    .disabled(launching)
                     .controlSize(.large)
                     .buttonStyle(.borderedProminent)
                 } else {
@@ -474,8 +535,10 @@ extension LauncherView {
             self.error = "Could not save settings: \(error.localizedDescription)"
             return
         }
-        for (k, v) in s.environment { setenv(k, v, 1) }
-        error = startLinkedEngine()
+        withNextendo { extra in
+            for (k, v) in s.environment.merging(extra, uniquingKeysWith: { $1 }) { setenv(k, v, 1) }
+            error = startLinkedEngine()
+        }
     }
 }
 #endif

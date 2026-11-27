@@ -222,7 +222,7 @@ final class GameSession: ObservableObject {
     @Published var message: String?
     private var process: Process?
 
-    func start(_ s: Settings) {
+    func start(_ s: Settings, extra: [String: String] = [:]) {
         guard process == nil else { return }
         message = nil
         let fm = FileManager.default
@@ -239,7 +239,7 @@ final class GameSession: ObservableObject {
         p.executableURL = tool("nxhost", in: s.folderURL)
         p.arguments = gameArguments(s)
         p.currentDirectoryURL = s.folderURL
-        p.environment = childEnvironment(s.environment)
+        p.environment = childEnvironment(s.environment.merging(extra) { $1 })
         p.standardOutput = log
         p.standardError = log
         p.terminationHandler = { p in

@@ -30,6 +30,8 @@ final class Settings: ObservableObject {
     @Published var lanInterface = ""
     @Published var lanPlayServer = ""
     @Published var nickname = ""
+    @Published var nextendoPid: UInt64 = 0
+    @Published var nextendoName = ""
     @Published var language = ""
 
     @Published var console = "docked"
@@ -69,9 +71,9 @@ final class Settings: ObservableObject {
         dlc = j["dlc"] as? String ?? ""
         keys = j["keys"] as? String ?? ""
         firmware = j["firmware"] as? String ?? ""
-        // LAN and Lan-Play make nifm report a connected network; Splatoon 3 then starts its
-        // online setup and never leaves the loading screen. Only off and wireless work so far.
-        network = ["off", "wireless"].contains(j["network"] as? String ?? "") ? j["network"] as! String : "off"
+        network = j["network"] as? String ?? "off"
+        nextendoPid = (j["nextendo_pid"] as? NSNumber)?.uint64Value ?? 0
+        nextendoName = j["nextendo_name"] as? String ?? ""
         lanInterface = j["lan_interface"] as? String ?? ""
         lanPlayServer = j["lanplay_server"] as? String ?? ""
         nickname = j["nickname"] as? String ?? ""
@@ -111,6 +113,8 @@ final class Settings: ObservableObject {
         j["lan_interface"] = lanInterface
         j["lanplay_server"] = lanPlayServer
         j["nickname"] = nickname
+        j["nextendo_pid"] = NSNumber(value: nextendoPid)
+        j["nextendo_name"] = nextendoName
         j["player_name"] = nickname
         j["language"] = language
         j["console"] = console
@@ -146,6 +150,8 @@ final class Settings: ObservableObject {
             if !lanInterface.isEmpty { env["NX_LAN_IF"] = lanInterface }
         case "lanplay":
             env["NX_LANPLAY_SERVER"] = lanPlayServer.trimmingCharacters(in: .whitespaces)
+        case "nextendo":
+            env["NX_NEXTENDO_PID"] = String(nextendoPid)
         default:
             break
         }
