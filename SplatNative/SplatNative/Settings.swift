@@ -32,6 +32,7 @@ final class Settings: ObservableObject {
     @Published var nickname = ""
     @Published var nextendoPid: UInt64 = 0
     @Published var nextendoName = ""
+    @Published var inspectNetwork = false
     @Published var language = ""
 
     @Published var console = "docked"
@@ -74,6 +75,7 @@ final class Settings: ObservableObject {
         network = j["network"] as? String ?? "off"
         nextendoPid = (j["nextendo_pid"] as? NSNumber)?.uint64Value ?? 0
         nextendoName = j["nextendo_name"] as? String ?? ""
+        inspectNetwork = j["inspect_network"] as? Bool ?? false
         lanInterface = j["lan_interface"] as? String ?? ""
         lanPlayServer = j["lanplay_server"] as? String ?? ""
         nickname = j["nickname"] as? String ?? ""
@@ -115,6 +117,7 @@ final class Settings: ObservableObject {
         j["nickname"] = nickname
         j["nextendo_pid"] = NSNumber(value: nextendoPid)
         j["nextendo_name"] = nextendoName
+        j["inspect_network"] = inspectNetwork
         j["player_name"] = nickname
         j["language"] = language
         j["console"] = console
@@ -152,6 +155,7 @@ final class Settings: ObservableObject {
             env["NX_LANPLAY_SERVER"] = lanPlayServer.trimmingCharacters(in: .whitespaces)
         case "nextendo":
             env["NX_NEXTENDO_PID"] = String(nextendoPid)
+            if inspectNetwork { env["NX_NEXTENDO_INSPECT"] = "1" }
         default:
             break
         }

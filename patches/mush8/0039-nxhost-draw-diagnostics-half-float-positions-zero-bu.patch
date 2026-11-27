@@ -1,7 +1,7 @@
 From 4ab9095d14c13b5127438781b3205f85c91db784 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Tue, 24 Nov 2026 00:08:18 +0100
-Subject: [PATCH 39/60] nxhost draw diagnostics: half-float positions,
+Subject: [PATCH 39/61] nxhost draw diagnostics: half-float positions,
  zero-buffer flag, several NX_TRACE_UBO specs, NX_DUMP_DRAW_BUFFERS
 
 The position trace also decodes RGBA16F positions and 8-bit index

@@ -1,0 +1,481 @@
+From 6a751e9992c558d4df84939938318c5fb6b33a80 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Fri, 27 Nov 2026 17:48:07 +0100
+Subject: [PATCH 61/61] nxhost: NX_NEXTENDO_INSPECT, a local relay that decodes
+ NPLN traffic
+
+Splatoon 3 speaks gRPC through its own BoringSSL, so a feature that stays
+"offline" after the NPLN login gives no clue which call failed. With
+NX_NEXTENDO_INSPECT=1 (Nextendo mode, macOS) connects to the Nextendo server
+on 443 go to a relay on 127.0.0.1. It finishes TLS with the game, opens its
+own TLS connection to the server with the game's SNI and ALPN h2, passes
+every byte through unchanged and logs the HTTP/2 frames: request paths and
+headers, response status, gRPC status and message, RST_STREAM, GOAWAY and
+readable strings in the payloads ("[npln] ..."). Header values and strings
+that look like credentials are logged by length only.
+
+gRPC checks the server's host name after the handshake (s3certbypass only
+skips chain verification), so the relay's throwaway certificate carries the
+NPLN host patterns as SANs; with a non-matching name the game sent the
+preface and gave up (2321-5760). The certificate and key protect nothing:
+the relay only listens on localhost.
+
+Tested in a localhost-only sandbox against a local TLS server: the game's
+Auth/IssuePrearrangedUserToken call is decoded, its id token hidden.
+---
+ Cargo.lock                                    |  21 +-
+ crates/nxhost/Cargo.toml                      |   1 +
+ crates/nxhost/src/services/bsd.rs             |  19 +-
+ crates/nxhost/src/services/inspect.rs         | 277 ++++++++++++++++++
+ .../src/services/inspect/relay-cert.der       | Bin 0 -> 537 bytes
+ .../nxhost/src/services/inspect/relay-key.der | Bin 0 -> 138 bytes
+ crates/nxhost/src/services/mod.rs             |   2 +
+ crates/nxhost/src/services/ssl.rs             |   2 +-
+ 8 files changed, 319 insertions(+), 3 deletions(-)
+ create mode 100644 crates/nxhost/src/services/inspect.rs
+ create mode 100644 crates/nxhost/src/services/inspect/relay-cert.der
+ create mode 100644 crates/nxhost/src/services/inspect/relay-key.der
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 5f5df0b..ec60649 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -106,7 +106,7 @@ dependencies = [
+  "cexpr",
+  "clang-sys",
+  "itertools",
+- "log",
++ "log 0.4.34",
+  "prettyplease",
+  "proc-macro2",
+  "quote",
+@@ -420,6 +420,15 @@ version = "0.4.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+ 
++[[package]]
++name = "hpack"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1c68f61350ad23817dd207b035b5258d91ac5eaef69e96f906628aaed8854dda"
++dependencies = [
++ "log 0.3.9",
++]
++
+ [[package]]
+ name = "hybrid-array"
+ version = "0.4.15"
+@@ -485,6 +494,15 @@ dependencies = [
+  "windows-link",
+ ]
+ 
++[[package]]
++name = "log"
++version = "0.3.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e19e8d5c34a3e0e2223db8e060f9e8264aeeb5c5fc64a4ee9965c062211c024b"
++dependencies = [
++ "log 0.4.34",
++]
++
+ [[package]]
+ name = "log"
+ version = "0.4.34"
+@@ -622,6 +640,7 @@ dependencies = [
+  "clap",
+  "ctt-astcenc",
+  "dispatch2",
++ "hpack",
+  "libc",
+  "mp4",
+  "nxabi",
+diff --git a/crates/nxhost/Cargo.toml b/crates/nxhost/Cargo.toml
+index 183a54d..bf4cb1e 100644
+--- a/crates/nxhost/Cargo.toml
++++ b/crates/nxhost/Cargo.toml
+@@ -32,6 +32,7 @@ png = "0.18.1"
+ rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+ 
+ [target.'cfg(target_os = "macos")'.dependencies]
++hpack = "0.3.0"
+ ctt-astcenc = "0.6.1"
+ objc2-app-kit = "0.3.2"
+ objc2-core-audio = "0.3.2"
+diff --git a/crates/nxhost/src/services/bsd.rs b/crates/nxhost/src/services/bsd.rs
+index 55568cf..acc1c44 100644
+--- a/crates/nxhost/src/services/bsd.rs
++++ b/crates/nxhost/src/services/bsd.rs
+@@ -653,7 +653,12 @@ impl Service for Bsd {
+                 return 0;
+             }
+             13 | 14 => {
+-                let (ss, len) = sockaddr_in(bytes(in_buf(req, 0)));
++                #[allow(unused_mut)]
++                let (mut ss, len) = sockaddr_in(bytes(in_buf(req, 0)));
++                #[cfg(target_os = "macos")]
++                if req.cmd == 14 {
++                    divert_to_inspector(&mut ss);
++                }
+                 if trace() {
+                     eprintln!("[bsd] {} fd {fd}: {}", if req.cmd == 13 { "bind" } else { "connect" }, addr_str(&ss));
+                 }
+@@ -782,6 +787,18 @@ impl Service for Bsd {
+     }
+ }
+ 
++/// NX_NEXTENDO_INSPECT: send the game's TLS connection to the Nextendo server through the local
++/// decoding relay (inspect.rs).
++#[cfg(target_os = "macos")]
++fn divert_to_inspector(ss: &mut libc::sockaddr_storage) {
++    let Some(ip) = v4(ss) else { return };
++    let port = u16::from_be(unsafe { (*(ss as *const _ as *const libc::sockaddr_in)).sin_port });
++    if let Some(to) = super::inspect::divert(SocketAddrV4::new(Ipv4Addr::from(ip), port)) {
++        set_v4(ss, to.ip().octets());
++        unsafe { (*(ss as *mut _ as *mut libc::sockaddr_in)).sin_port = to.port().to_be() };
++    }
++}
++
+ /// In Nextendo mode, each server the game connects to is logged once, with the host name it
+ /// resolved, so a feature that stays "offline" shows which host it wanted.
+ fn note_connect(ss: &libc::sockaddr_storage, r: (i32, u32)) {
+diff --git a/crates/nxhost/src/services/inspect.rs b/crates/nxhost/src/services/inspect.rs
+new file mode 100644
+index 0000000..3399680
+--- /dev/null
++++ b/crates/nxhost/src/services/inspect.rs
+@@ -0,0 +1,277 @@
++// SplatNative - inspect.rs
++// A local TLS relay for diagnosing Nextendo/NPLN traffic (macOS, NX_NEXTENDO_INSPECT=1).
++//
++// Splatoon 3 speaks gRPC over its own BoringSSL, so the engine never sees the plaintext. With
++// the inspector on, bsd connect() to the Nextendo server on port 443 is pointed at a listener
++// here instead. The game accepts the relay's certificate (s3certbypass), the relay opens its own
++// TLS connection to the real server with the game's SNI, passes every byte through unchanged,
++// and logs the HTTP/2 frames in between: request paths, response status, gRPC status and
++// message, RST_STREAM and GOAWAY, and readable strings inside the protobuf payloads. Header
++// values that look like credentials are logged by length only.
++//
++// The certificate and key under inspect/ were generated for this relay and protect nothing:
++// the relay only listens on 127.0.0.1, and the game skips certificate checks anyway.
++use crate::services::nextendo;
++use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
++use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection, StreamOwned};
++use std::collections::HashMap;
++use std::io::{ErrorKind, Read, Write};
++use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
++use std::sync::{Arc, Mutex, OnceLock};
++use std::time::Duration;
++
++const CERT: &[u8] = include_bytes!("inspect/relay-cert.der");
++const KEY: &[u8] = include_bytes!("inspect/relay-key.der");
++const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
++
++pub fn enabled() -> bool {
++    static E: OnceLock<bool> = OnceLock::new();
++    *E.get_or_init(|| nextendo::enabled() && std::env::var("NX_NEXTENDO_INSPECT").is_ok_and(|v| v.trim() == "1"))
++}
++
++/// Where a connect to `to` should go instead: the relay, for the Nextendo server on 443.
++pub fn divert(to: SocketAddrV4) -> Option<SocketAddrV4> {
++    if !enabled() || to.port() != 443 || !nextendo::is_server(*to.ip()) {
++        return None;
++    }
++    relay_port().map(|p| {
++        UPSTREAM.lock().unwrap().push(to);
++        SocketAddrV4::new(Ipv4Addr::LOCALHOST, p)
++    })
++}
++
++static UPSTREAM: Mutex<Vec<SocketAddrV4>> = Mutex::new(Vec::new());
++
++fn relay_port() -> Option<u16> {
++    static PORT: OnceLock<Option<u16>> = OnceLock::new();
++    *PORT.get_or_init(|| {
++        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
++        let port = l.local_addr().ok()?.port();
++        eprintln!("[npln] inspector relay on 127.0.0.1:{port}: Nextendo TLS traffic is decoded into this log");
++        std::thread::Builder::new()
++            .name("npln-inspect".into())
++            .spawn(move || {
++                for (n, c) in l.incoming().flatten().enumerate() {
++                    let up = UPSTREAM.lock().unwrap().pop().unwrap_or(SocketAddrV4::new(Ipv4Addr::new(51, 178, 29, 194), 443));
++                    std::thread::spawn(move || {
++                        if let Err(e) = relay(n + 1, c, up) {
++                            eprintln!("[npln] c{} ended: {e}", n + 1);
++                        }
++                    });
++                }
++            })
++            .ok()?;
++        Some(port)
++    })
++}
++
++fn server_config() -> Arc<ServerConfig> {
++    static C: OnceLock<Arc<ServerConfig>> = OnceLock::new();
++    C.get_or_init(|| {
++        let mut c = ServerConfig::builder()
++            .with_no_client_auth()
++            .with_single_cert(vec![CertificateDer::from(CERT.to_vec())], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KEY.to_vec())))
++            .expect("relay certificate");
++        c.alpn_protocols = vec![b"h2".to_vec()];
++        Arc::new(c)
++    })
++    .clone()
++}
++
++fn client_config() -> Arc<ClientConfig> {
++    static C: OnceLock<Arc<ClientConfig>> = OnceLock::new();
++    C.get_or_init(|| {
++        let mut c = ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(super::ssl::AcceptAny)).with_no_client_auth();
++        c.alpn_protocols = vec![b"h2".to_vec()];
++        Arc::new(c)
++    })
++    .clone()
++}
++
++fn relay(id: usize, game: TcpStream, up: SocketAddrV4) -> std::io::Result<()> {
++    let t0 = std::time::Instant::now();
++    game.set_nodelay(true)?;
++    let mut g = StreamOwned::new(ServerConnection::new(server_config()).map_err(std::io::Error::other)?, game);
++    while g.conn.is_handshaking() {
++        g.conn.complete_io(&mut g.sock)?;
++    }
++    let t_game = t0.elapsed().as_millis();
++    let sni = g.conn.server_name().unwrap_or("").to_string();
++    let host = if sni.is_empty() { up.ip().to_string() } else { sni.clone() };
++    let name = ServerName::try_from(host.clone()).map_err(std::io::Error::other)?;
++    let sock = TcpStream::connect_timeout(&up.into(), Duration::from_secs(10))?;
++    sock.set_nodelay(true)?;
++    let mut s = StreamOwned::new(ClientConnection::new(client_config(), name).map_err(std::io::Error::other)?, sock);
++    while s.conn.is_handshaking() {
++        s.conn.complete_io(&mut s.sock)?;
++    }
++    eprintln!(
++        "[npln] c{id}: {host} via {up}, ALPN game {:?} server {:?}, handshakes {t_game} ms + {} ms",
++        alpn(g.conn.alpn_protocol()),
++        alpn(s.conn.alpn_protocol()),
++        t0.elapsed().as_millis() - t_game
++    );
++    g.sock.set_read_timeout(Some(Duration::from_millis(20)))?;
++    s.sock.set_read_timeout(Some(Duration::from_millis(20)))?;
++    let (g, s) = (Arc::new(Mutex::new(g)), Arc::new(Mutex::new(s)));
++    let paths: Arc<Mutex<HashMap<u32, String>>> = Arc::default();
++    let up_thread = {
++        let (g, s, paths) = (g.clone(), s.clone(), paths.clone());
++        std::thread::spawn(move || pump(id, "→", &g, &s, Frames::new(true), &paths))
++    };
++    pump(id, "←", &s, &g, Frames::new(false), &paths);
++    let _ = up_thread.join();
++    Ok(())
++}
++
++fn alpn(p: Option<&[u8]>) -> String {
++    p.map_or("none".into(), |p| String::from_utf8_lossy(p).into_owned())
++}
++
++/// Copies one direction until either side closes, decoding what passes.
++fn pump<A: Read + Write, B: Read + Write>(id: usize, dir: &str, from: &Mutex<A>, to: &Mutex<B>, mut frames: Frames, paths: &Mutex<HashMap<u32, String>>) {
++    let mut buf = vec![0u8; 64 * 1024];
++    loop {
++        let n = match from.lock().unwrap().read(&mut buf) {
++            Ok(0) => break,
++            Ok(n) => n,
++            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
++            Err(e) => {
++                eprintln!("[npln] c{id} {dir} read: {e}");
++                break;
++            }
++        };
++        if let Err(e) = to.lock().unwrap().write_all(&buf[..n]) {
++            eprintln!("[npln] c{id} {dir} write: {e}");
++            break;
++        }
++        frames.feed(id, dir, &buf[..n], paths);
++    }
++    eprintln!("[npln] c{id} {dir} closed");
++}
++
++struct Frames {
++    pending: Vec<u8>,
++    preface: bool,
++    hpack: hpack::Decoder<'static>,
++    block: Option<(u32, Vec<u8>, bool)>,
++}
++
++impl Frames {
++    fn new(from_game: bool) -> Frames {
++        Frames { pending: Vec::new(), preface: from_game, hpack: hpack::Decoder::new(), block: None }
++    }
++
++    fn feed(&mut self, id: usize, dir: &str, data: &[u8], paths: &Mutex<HashMap<u32, String>>) {
++        self.pending.extend_from_slice(data);
++        if self.preface {
++            if self.pending.len() < PREFACE.len() {
++                return;
++            }
++            if self.pending.starts_with(PREFACE) {
++                self.pending.drain(..PREFACE.len());
++            }
++            self.preface = false;
++        }
++        while self.pending.len() >= 9 {
++            let len = (self.pending[0] as usize) << 16 | (self.pending[1] as usize) << 8 | self.pending[2] as usize;
++            if self.pending.len() < 9 + len {
++                return;
++            }
++            let (ty, flags) = (self.pending[3], self.pending[4]);
++            let stream = u32::from_be_bytes(self.pending[5..9].try_into().unwrap()) & 0x7fff_ffff;
++            let body: Vec<u8> = self.pending[9..9 + len].to_vec();
++            self.pending.drain(..9 + len);
++            self.frame(id, dir, ty, flags, stream, &body, paths);
++        }
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn frame(&mut self, id: usize, dir: &str, ty: u8, flags: u8, stream: u32, body: &[u8], paths: &Mutex<HashMap<u32, String>>) {
++        let path = || paths.lock().unwrap().get(&stream).cloned().unwrap_or_default();
++        match ty {
++            0 => {
++                let pad = if flags & 0x8 != 0 { body.first().copied().unwrap_or(0) as usize + 1 } else { 0 };
++                let data = &body[pad.min(body.len())..body.len().saturating_sub(if pad > 0 { pad - 1 } else { 0 })];
++                eprintln!("[npln] c{id} {dir} s{stream} DATA {} bytes {}{}", data.len(), path(), describe(data));
++            }
++            1 | 9 => {
++                let mut frag = body;
++                if ty == 1 {
++                    let pad = if flags & 0x8 != 0 { frag.first().copied().unwrap_or(0) as usize } else { 0 };
++                    if flags & 0x8 != 0 {
++                        frag = &frag[1.min(frag.len())..];
++                    }
++                    if flags & 0x20 != 0 {
++                        frag = &frag[5.min(frag.len())..];
++                    }
++                    frag = &frag[..frag.len().saturating_sub(pad)];
++                    self.block = Some((stream, frag.to_vec(), flags & 0x1 != 0));
++                } else if let Some((_, b, _)) = self.block.as_mut() {
++                    b.extend_from_slice(frag);
++                }
++                if flags & 0x4 != 0 {
++                    if let Some((s, block, end)) = self.block.take() {
++                        self.headers(id, dir, s, &block, end, paths);
++                    }
++                }
++            }
++            3 => eprintln!("[npln] c{id} {dir} s{stream} RST_STREAM {} {}", u32::from_be_bytes(body.get(..4).and_then(|b| b.try_into().ok()).unwrap_or([0; 4])), path()),
++            7 => {
++                let code = body.get(4..8).map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap()));
++                eprintln!("[npln] c{id} {dir} GOAWAY error {code} {:?}", String::from_utf8_lossy(body.get(8..).unwrap_or(&[])));
++            }
++            _ => {}
++        }
++    }
++
++    fn headers(&mut self, id: usize, dir: &str, stream: u32, block: &[u8], end: bool, paths: &Mutex<HashMap<u32, String>>) {
++        let list = match self.hpack.decode(block) {
++            Ok(l) => l,
++            Err(e) => {
++                eprintln!("[npln] c{id} {dir} s{stream} HEADERS undecodable ({e:?})");
++                return;
++            }
++        };
++        let mut shown = Vec::new();
++        for (k, v) in &list {
++            let k = String::from_utf8_lossy(k).into_owned();
++            let v = String::from_utf8_lossy(v).into_owned();
++            if k == ":path" {
++                paths.lock().unwrap().insert(stream, v.clone());
++            }
++            let secret = ["auth", "token", "cookie", "session"].iter().any(|s| k.contains(s));
++            shown.push(if secret { format!("{k}=<{} chars>", v.len()) } else { format!("{k}={v}") });
++        }
++        let what = if end { "HEADERS(end)" } else { "HEADERS" };
++        let label = if dir == "←" { paths.lock().unwrap().get(&stream).cloned().unwrap_or_default() } else { String::new() };
++        eprintln!("[npln] c{id} {dir} s{stream} {what} {label} {}", shown.join(" "));
++    }
++}
++
++/// A gRPC message's length and the readable runs inside its protobuf, plus a short hex head.
++fn describe(data: &[u8]) -> String {
++    let mut runs = Vec::new();
++    let mut cur = String::new();
++    for &b in data {
++        if (0x20..0x7f).contains(&b) {
++            cur.push(b as char);
++        } else {
++            if cur.len() >= 4 {
++                runs.push(std::mem::take(&mut cur));
++            }
++            cur.clear();
++        }
++    }
++    if cur.len() >= 4 {
++        runs.push(cur);
++    }
++    let hex: String = data.iter().take(48).map(|b| format!("{b:02x}")).collect();
++    let text: Vec<String> = runs.iter().take(12).map(|r| if looks_secret(r) { format!("<{} chars>", r.len()) } else { format!("{r:?}") }).collect();
++    format!(" [{hex}{}] {}", if data.len() > 48 { "…" } else { "" }, text.join(" "))
++}
++
++/// Long unbroken base64/JWT-like runs are probably tokens.
++fn looks_secret(s: &str) -> bool {
++    s.len() >= 40 && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.=+/".contains(c))
++}
+diff --git a/crates/nxhost/src/services/inspect/relay-cert.der b/crates/nxhost/src/services/inspect/relay-cert.der
+new file mode 100644
+index 0000000000000000000000000000000000000000..bdfbf1ce56dece042f16145140cb025e7feaff1e
+GIT binary patch
+literal 537
+zcmXqLViGlIV%)uenTe5!Nu;E7QgzPDq>$v({+9aEH{64k#akP2v2kd%d7QIlVP-PW
+zFjO;8VPg(uVdjz5(#t6@)GN`;E6B;yD=sS2%gf9wNzF^i*UL*SF_07IH8L|aG%`0d
+zGch%_j1uQH260WGToO!*G!SNE2fKiY5$Y6XMs{W=29~rC#Yv}bDJ*_gcKf=`vi#zl
+ze^*ws<+S^4Z~Oal`TWP?4Ug9UQkl0mROG+nuS>yOMca12OXj)hd!<;_E2G+XFZ<%g
+zLk5le4P=2HlI3F&V-Z<cdGqc0-Ibxuim&c`VVol|^~0Jo2K*ptVMfOPEUX61K+2%8
+z2P7iM(%53q*w}<W9Gb+num@0+FjN9L)S85}Fha7452z3+WKsCZ`MJpP!|cIe;L4<6
+zy<%N!{=v|~>86tWbBf=-Y2!4hKeq7q?WFmB7p*5O5o1zh*i!##<;(f1(ycasB-#v*
+XPnxn;&HCouJ0^``%9_jf%@P0rChNWV
+
+literal 0
+HcmV?d00001
+
+diff --git a/crates/nxhost/src/services/inspect/relay-key.der b/crates/nxhost/src/services/inspect/relay-key.der
+new file mode 100644
+index 0000000000000000000000000000000000000000..6e3740ca28acfd3bc2118d362c339136c1263d4d
+GIT binary patch
+literal 138
+zcmV;50CoQ`frkPC05B5<2P%e0&OHJF1_&yKNX|V20S5$aFlzz<0R$j0>(5P^<G-M(
+z8#WZ+Ey&5&MSgramB(X!aiHk`QqsSnL<2$q1ZGqrlFHg3qvm$o*F2_gb8P<9s|IX`
+sPPc~r>8GFL7l7ig`XrvcRTTdr`qERi6^6U+V+`3%)N>_DXnRe)2SZjo*Z=?k
+
+literal 0
+HcmV?d00001
+
+diff --git a/crates/nxhost/src/services/mod.rs b/crates/nxhost/src/services/mod.rs
+index 2d36156..d7bf7e9 100644
+--- a/crates/nxhost/src/services/mod.rs
++++ b/crates/nxhost/src/services/mod.rs
+@@ -29,6 +29,8 @@ mod time;
+ pub mod vi;
+ mod wireless;
+ mod bcat;
++#[cfg(target_os = "macos")]
++mod inspect;
+ pub mod vnet;
+ 
+ use crate::ipc::{Act, Service, Stub, Table};
+diff --git a/crates/nxhost/src/services/ssl.rs b/crates/nxhost/src/services/ssl.rs
+index dc06e46..7a02c1e 100644
+--- a/crates/nxhost/src/services/ssl.rs
++++ b/crates/nxhost/src/services/ssl.rs
+@@ -146,7 +146,7 @@ impl Service for Context {
+ }
+ 
+ #[derive(Debug)]
+-struct AcceptAny;
++pub(super) struct AcceptAny;
+ 
+ impl ServerCertVerifier for AcceptAny {
+     fn verify_server_cert(&self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+-- 
+2.56.1
+

@@ -1,7 +1,7 @@
 From f738f20d5a5857409e9a2caa6d29f92abb3d1890 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Tue, 24 Nov 2026 09:22:12 +0100
-Subject: [PATCH 41/60] nxhost nvn: NX_TRACE_CPU_TARGETS logs GPU outputs the
+Subject: [PATCH 41/61] nxhost nvn: NX_TRACE_CPU_TARGETS logs GPU outputs the
  CPU can read
 
 Logs once per texture every render target and texture-to-buffer copy whose

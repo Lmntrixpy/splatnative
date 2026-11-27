@@ -103,6 +103,11 @@ struct LauncherView: View {
                         #endif
                 case "nextendo":
                     NextendoSignIn(pid: $s.nextendoPid, name: $s.nextendoName)
+                    #if os(macOS)
+                    Toggle(isOn: $s.inspectNetwork) {
+                        labeled("Network diagnostics", "Writes the game's decoded online traffic to the log. Login tokens are left out")
+                    }
+                    #endif
                 default:
                     EmptyView()
                 }
