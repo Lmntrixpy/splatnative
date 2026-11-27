@@ -1,0 +1,509 @@
+From 0eb1b6434f20f3568f8e64b522637be089529417 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Fri, 27 Nov 2026 19:57:32 +0100
+Subject: [PATCH 65/65] nxhost: Nextendo's BCAT data for Splatoon 3, as a RomFS
+ override and delivery cache
+
+The Lobby and Hotlantis stayed "offline" although every NPLN call succeeded
+and the STUN check got its answer. The game opens its BCAT delivery file
+eu-default and got NotFound; next to "BcatSummaryNotFound" in the game's
+strings sit "GamesyncInactive" and "NoUserHandle", which look like the
+reasons for being offline.
+
+Prelude-Nextendo downloads https://nextendo.network/api/bcat/<title id>, a
+zip with ap-/eu-/jp-/us-default directories (summary.yml naming the fest,
+*.pack.zs.enc), and installs it under romfs DebugUnderPilot/bcat. nexbcat
+now does the same at start in Nextendo mode for Splatoon 3: download (public
+API, no token), unpack the stored zip entries into
+work/nextendo-bcat/romfs/DebugUnderPilot/bcat, layer it over the RomFS like
+a mod, and keep the last good copy if the download fails. The BCAT service
+also serves those directories through the delivery cache (enumerate, open,
+read, size, MD5 digest), since the game asked the system for eu-default.
+---
+ crates/nxhost/src/main.rs             |  12 +-
+ crates/nxhost/src/services/bcat.rs    | 204 +++++++++++++++++++++++---
+ crates/nxhost/src/services/mod.rs     |   1 +
+ crates/nxhost/src/services/nexbcat.rs | 159 ++++++++++++++++++++
+ crates/nxhost/src/services/nexweb.rs  |   5 +
+ 5 files changed, 359 insertions(+), 22 deletions(-)
+ create mode 100644 crates/nxhost/src/services/nexbcat.rs
+
+diff --git a/crates/nxhost/src/main.rs b/crates/nxhost/src/main.rs
+index d8b7a7e..d03c07a 100644
+--- a/crates/nxhost/src/main.rs
++++ b/crates/nxhost/src/main.rs
+@@ -323,6 +323,14 @@ fn apply_launcher_settings() {
+     }
+ }
+ 
++/// The user's mods plus, for Splatoon 3 on Nextendo, the BCAT data Prelude installs as a RomFS
++/// override (services/nexbcat.rs). Called after the game is identified.
++fn game_mods(mods: &[PathBuf]) -> Vec<PathBuf> {
++    let mut all = mods.to_vec();
++    all.extend(services::nexbcat::bcat_mod());
++    all
++}
++
+ fn start(args: Args) -> Result<()> {
+     let dir = args.patched.clone();
+     let npdm = read_npdm(&args.npdm)?;
+@@ -333,7 +341,7 @@ fn start(args: Args) -> Result<()> {
+             let keys = nxfs::keys::Keys::load(&args.keys).unwrap_or_default();
+             let version = game::identify_id(std::fs::read_to_string(p.join("main_id")).context("prepared game data has no main_id")?.trim(), &dir)?;
+             eprintln!("[host] using the prepared game data in {}", p.display());
+-            (keys, version, mods::romfs(prepared_storage(&p.join("romfs.bin"))?, &args.mods)?, prepared_dlc(p))
++            (keys, version, mods::romfs(prepared_storage(&p.join("romfs.bin"))?, &game_mods(&args.mods))?, prepared_dlc(p))
+         }
+         None => {
+             let keys = nxfs::keys::Keys::load(&args.keys)?;
+@@ -346,7 +354,7 @@ fn start(args: Args) -> Result<()> {
+                 gfx::transcode::prepare(romfs, load_dlc(&args, &keys), &game::update_main_id(&update)?, std::path::Path::new("work/prepared_ios.noindex"))?;
+                 std::process::exit(0);
+             }
+-            let romfs = mods::romfs(program(&update)?.patched_romfs(program(&base)?)?, &args.mods)?;
++            let romfs = mods::romfs(program(&update)?.patched_romfs(program(&base)?)?, &game_mods(&args.mods))?;
+             let dlc = load_dlc(&args, &keys);
+             (keys, version, romfs, dlc)
+         }
+diff --git a/crates/nxhost/src/services/bcat.rs b/crates/nxhost/src/services/bcat.rs
+index 0575192..012518f 100644
+--- a/crates/nxhost/src/services/bcat.rs
++++ b/crates/nxhost/src/services/bcat.rs
+@@ -1,10 +1,12 @@
+ // SplatNative - bcat.rs
+-// BCAT (background content delivery) for games that sync it on their way online. Nothing is
+-// downloaded: a sync finishes at once and successfully, and the delivery cache is empty.
++// BCAT (background content delivery) for games that sync it on their way online. A sync finishes
++// at once; the delivery cache holds Nextendo's BCAT data for Splatoon 3 when nexbcat downloaded
++// it (Nextendo mode), and is empty otherwise.
+ // Splatoon 3 calls nn::bcat::RequestSyncDeliveryCache after its NPLN login; the stub that
+ // returned no IBcatService made the SDK dereference null.
+ use crate::ipc::{Request, Response, Service, Stub, new_event, write_buffer};
+-use std::sync::Arc;
++use std::path::PathBuf;
++use std::sync::{Arc, Mutex};
+ 
+ /// bcat module 122, NotFound.
+ const NOT_FOUND: u32 = 122 | 2 << 9;
+@@ -79,46 +81,208 @@ impl Service for Progress {
+ 
+ struct Storage;
+ 
++/// Directory names (the region folders of Nextendo's BCAT zip), sorted.
++fn directories() -> Vec<String> {
++    let Some(root) = super::nexbcat::bcat_root() else { return Vec::new() };
++    let mut v: Vec<String> = std::fs::read_dir(root).into_iter().flatten().flatten().filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().into_string().ok()).collect();
++    v.sort();
++    v
++}
++
++/// A 0x20-byte BCAT name (DirectoryName / FileName), NUL-terminated.
++fn name32(b: &[u8]) -> Option<String> {
++    let b = b.get(..0x20.min(b.len()))?;
++    let s = String::from_utf8_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]).into_owned();
++    (!s.is_empty() && !s.contains('/') && !s.contains("..")).then_some(s)
++}
++
++fn put_name(out: &mut Vec<u8>, name: &str) {
++    let mut n = [0u8; 0x20];
++    let b = name.as_bytes();
++    n[..b.len().min(0x1f)].copy_from_slice(&b[..b.len().min(0x1f)]);
++    out.extend_from_slice(&n);
++}
++
+ impl Service for Storage {
+     fn name(&self) -> String {
+         "bcat::IDeliveryCacheStorageService".into()
+     }
+     fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
+         match req.cmd {
+-            0 => rsp.objects.push(Arc::new(Empty("bcat::IDeliveryCacheFileService"))),
+-            1 => rsp.objects.push(Arc::new(Empty("bcat::IDeliveryCacheDirectoryService"))),
+-            // EnumerateDeliveryCacheDirectory: no directories
+-            10 => rsp.push_u32(0),
++            0 => rsp.objects.push(Arc::new(FileService(Mutex::new(None)))),
++            1 => rsp.objects.push(Arc::new(DirectoryService(Mutex::new(None)))),
++            // EnumerateDeliveryCacheDirectory: DirectoryName[0x20] entries
++            10 => {
++                let dirs = directories();
++                let room = req.out_buffer().map_or(0, |b| b.size as usize / 0x20);
++                let mut out = Vec::new();
++                for d in dirs.iter().take(room) {
++                    put_name(&mut out, d);
++                }
++                if let Some(b) = req.out_buffer() {
++                    write_buffer(&b, &out);
++                }
++                rsp.push_u32(dirs.len().min(room) as u32);
++            }
+             _ => return Stub(self.name()).call(req, rsp),
+         }
+         0
+     }
+ }
+ 
+-/// File and directory services of an empty cache: opening anything says "not found".
+-struct Empty(&'static str);
++struct FileService(Mutex<Option<PathBuf>>);
+ 
+-impl Service for Empty {
++impl Service for FileService {
+     fn name(&self) -> String {
+-        self.0.into()
++        "bcat::IDeliveryCacheFileService".into()
+     }
+     fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
+         match req.cmd {
+-            0 => NOT_FOUND,
+-            // file Read / directory Read: nothing; GetSize / GetCount: 0
++            // Open(DirectoryName, FileName)
++            0 => {
++                let (Some(root), Some(dir), Some(file)) = (super::nexbcat::bcat_root(), name32(&req.data), name32(req.data.get(0x20..).unwrap_or(&[]))) else { return NOT_FOUND };
++                let path = root.join(&dir).join(&file);
++                if !path.is_file() {
++                    eprintln!("[bcat] {dir}/{file}: not in Nextendo's BCAT data");
++                    return NOT_FOUND;
++                }
++                eprintln!("[bcat] {dir}/{file} opened");
++                *self.0.lock().unwrap() = Some(path);
++            }
++            // Read(offset) -> bytes read
+             1 => {
+-                rsp.push_u64(0);
+-                0
++                let Some(path) = self.0.lock().unwrap().clone() else { return NOT_FOUND };
++                let data = std::fs::read(path).unwrap_or_default();
++                let off = (req.u64(0) as usize).min(data.len());
++                let n = req.out_buffer().map_or(0, |b| write_buffer(&b, &data[off..]));
++                rsp.push_u64(n as u64);
+             }
+             2 => {
+-                rsp.push_u64(0);
+-                0
++                let Some(path) = self.0.lock().unwrap().clone() else { return NOT_FOUND };
++                rsp.push_u64(std::fs::metadata(path).map_or(0, |m| m.len()));
+             }
+             3 => {
+-                rsp.data.extend_from_slice(&[0u8; 0x10]);
+-                0
++                let Some(path) = self.0.lock().unwrap().clone() else { return NOT_FOUND };
++                rsp.data.extend_from_slice(&md5(&std::fs::read(path).unwrap_or_default()));
+             }
+-            _ => Stub(self.name()).call(req, rsp),
++            _ => return Stub(self.name()).call(req, rsp),
+         }
++        0
++    }
++}
++
++struct DirectoryService(Mutex<Option<PathBuf>>);
++
++impl DirectoryService {
++    /// DeliveryCacheDirectoryEntry: FileName[0x20], u64 size, digest[0x10].
++    fn entries(&self) -> Vec<(String, u64, [u8; 16])> {
++        let Some(dir) = self.0.lock().unwrap().clone() else { return Vec::new() };
++        let mut v: Vec<(String, u64, [u8; 16])> = std::fs::read_dir(dir)
++            .into_iter()
++            .flatten()
++            .flatten()
++            .filter(|e| e.path().is_file())
++            .filter_map(|e| {
++                let data = std::fs::read(e.path()).ok()?;
++                Some((e.file_name().into_string().ok()?, data.len() as u64, md5(&data)))
++            })
++            .collect();
++        v.sort();
++        v
++    }
++}
++
++impl Service for DirectoryService {
++    fn name(&self) -> String {
++        "bcat::IDeliveryCacheDirectoryService".into()
++    }
++    fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
++        match req.cmd {
++            // Open(DirectoryName)
++            0 => {
++                let (Some(root), Some(dir)) = (super::nexbcat::bcat_root(), name32(&req.data)) else { return NOT_FOUND };
++                let path = root.join(&dir);
++                if !path.is_dir() {
++                    eprintln!("[bcat] directory {dir}: not in Nextendo's BCAT data");
++                    return NOT_FOUND;
++                }
++                *self.0.lock().unwrap() = Some(path);
++            }
++            1 => {
++                let entries = self.entries();
++                let room = req.out_buffer().map_or(0, |b| b.size as usize / 0x38);
++                let mut out = Vec::new();
++                for (name, size, digest) in entries.iter().take(room) {
++                    put_name(&mut out, name);
++                    out.extend_from_slice(&size.to_le_bytes());
++                    out.extend_from_slice(digest);
++                }
++                if let Some(b) = req.out_buffer() {
++                    write_buffer(&b, &out);
++                }
++                rsp.push_u32(entries.len().min(room) as u32);
++            }
++            2 => rsp.push_u32(self.entries().len() as u32),
++            _ => return Stub(self.name()).call(req, rsp),
++        }
++        0
++    }
++}
++
++/// MD5 (RFC 1321), the digest BCAT reports per delivery-cache file.
++fn md5(data: &[u8]) -> [u8; 16] {
++    let s: [u32; 64] = [
++        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15,
++        21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
++    ];
++    let k: Vec<u32> = (0..64).map(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32).collect();
++    let (mut a0, mut b0, mut c0, mut d0) = (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
++    let mut msg = data.to_vec();
++    msg.push(0x80);
++    while msg.len() % 64 != 56 {
++        msg.push(0);
++    }
++    msg.extend_from_slice(&((data.len() as u64).wrapping_mul(8)).to_le_bytes());
++    for chunk in msg.chunks(64) {
++        let m: Vec<u32> = chunk.chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
++        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
++        for i in 0..64 {
++            let (f, g) = match i / 16 {
++                0 => ((b & c) | (!b & d), i),
++                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
++                2 => (b ^ c ^ d, (3 * i + 5) % 16),
++                _ => (c ^ (b | !d), (7 * i) % 16),
++            };
++            let f = f.wrapping_add(a).wrapping_add(k[i]).wrapping_add(m[g]);
++            a = d;
++            d = c;
++            c = b;
++            b = b.wrapping_add(f.rotate_left(s[i]));
++        }
++        a0 = a0.wrapping_add(a);
++        b0 = b0.wrapping_add(b);
++        c0 = c0.wrapping_add(c);
++        d0 = d0.wrapping_add(d);
++    }
++    let mut out = [0u8; 16];
++    for (i, v) in [a0, b0, c0, d0].iter().enumerate() {
++        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::md5;
++
++    fn hex(b: &[u8]) -> String {
++        b.iter().map(|x| format!("{x:02x}")).collect()
++    }
++
++    #[test]
++    fn md5_matches_rfc1321() {
++        assert_eq!(hex(&md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
++        assert_eq!(hex(&md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
++        assert_eq!(hex(&md5(b"The quick brown fox jumps over the lazy dog")), "9e107d9d372bb6826bd81d3542a419d6");
+     }
+ }
+diff --git a/crates/nxhost/src/services/mod.rs b/crates/nxhost/src/services/mod.rs
+index d7bf7e9..13763b4 100644
+--- a/crates/nxhost/src/services/mod.rs
++++ b/crates/nxhost/src/services/mod.rs
+@@ -29,6 +29,7 @@ mod time;
+ pub mod vi;
+ mod wireless;
+ mod bcat;
++pub mod nexbcat;
+ #[cfg(target_os = "macos")]
+ mod inspect;
+ pub mod vnet;
+diff --git a/crates/nxhost/src/services/nexbcat.rs b/crates/nxhost/src/services/nexbcat.rs
+new file mode 100644
+index 0000000..3bc5dc1
+--- /dev/null
++++ b/crates/nxhost/src/services/nexbcat.rs
+@@ -0,0 +1,159 @@
++// SplatNative - nexbcat.rs
++// Nextendo's BCAT data for Splatoon 3, delivered the way Prelude-Nextendo does on a console.
++//
++// Splatoon 3 reads its BCAT delivery (summary.yml and the encrypted *.pack.zs.enc of each
++// region directory) and stays "offline" for the Lobby and the shops when there is none
++// ("BcatSummaryNotFound"). Prelude downloads https://nextendo.network/api/bcat/<title id>, a zip
++// with ap-/eu-/jp-/us-default directories, and installs it as a RomFS override under
++// DebugUnderPilot/bcat, which the game reads instead of the system delivery cache. Here the
++// zip is unpacked into work/nextendo-bcat/romfs/DebugUnderPilot/bcat and layered over the RomFS
++// like a mod. The last good copy is kept when the download fails.
++use std::path::{Path, PathBuf};
++
++const SPLATOON3: u64 = 0x0100_C250_0FC2_0000;
++const DIR: &str = "work/nextendo-bcat";
++const SUBDIR: &str = "romfs/DebugUnderPilot/bcat";
++
++/// The mod folder to layer over the RomFS, if this is Splatoon 3 in Nextendo mode and BCAT
++/// data is available (fresh or from an earlier start).
++pub fn bcat_mod() -> Option<PathBuf> {
++    if !super::nextendo::enabled() || crate::game::current().title_id != SPLATOON3 {
++        return None;
++    }
++    let dir = PathBuf::from(DIR);
++    match refresh(&dir) {
++        Ok(n) => eprintln!("[bcat] Nextendo BCAT data for Splatoon 3: {n} files"),
++        Err(e) if dir.join(SUBDIR).is_dir() => eprintln!("[bcat] Nextendo BCAT download failed ({e}), using the copy from an earlier start"),
++        Err(e) => {
++            eprintln!("[bcat] Nextendo BCAT download failed ({e}): the Lobby and shops will stay offline");
++            return None;
++        }
++    }
++    dir.join(SUBDIR).is_dir().then_some(dir)
++}
++
++/// The unpacked region directories (eu-default, ...) for the BCAT delivery cache, if present.
++pub fn bcat_root() -> Option<PathBuf> {
++    if !super::nextendo::enabled() || crate::game::current().title_id != SPLATOON3 {
++        return None;
++    }
++    Some(PathBuf::from(DIR).join(SUBDIR)).filter(|p| p.is_dir())
++}
++
++fn refresh(dir: &Path) -> Result<usize, String> {
++    let path = format!("/api/bcat/{SPLATOON3:016x}");
++    let (status, zip) = super::nexweb::get(&path)?;
++    match status {
++        200 => {}
++        204 => return Err("Nextendo has no schedule published (204)".into()),
++        s => return Err(format!("HTTP {s}")),
++    }
++    let entries = read_zip(&zip)?;
++    let tmp = dir.with_extension("tmp");
++    let _ = std::fs::remove_dir_all(&tmp);
++    let base = tmp.join(SUBDIR);
++    let mut n = 0;
++    for (name, data) in entries {
++        if name.ends_with('/') {
++            continue;
++        }
++        let rel = Path::new(&name);
++        if rel.is_absolute() || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
++            return Err(format!("unsafe path in the zip: {name}"));
++        }
++        let out = base.join(rel);
++        if let Some(p) = out.parent() {
++            std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
++        }
++        std::fs::write(&out, data).map_err(|e| e.to_string())?;
++        n += 1;
++    }
++    if n == 0 {
++        return Err("the zip is empty".into());
++    }
++    let _ = std::fs::remove_dir_all(dir);
++    std::fs::rename(&tmp, dir).map_err(|e| e.to_string())?;
++    Ok(n)
++}
++
++fn u16_at(b: &[u8], o: usize) -> Option<usize> {
++    b.get(o..o + 2).map(|x| u16::from_le_bytes([x[0], x[1]]) as usize)
++}
++
++fn u32_at(b: &[u8], o: usize) -> Option<usize> {
++    b.get(o..o + 4).map(|x| u32::from_le_bytes(x.try_into().unwrap()) as usize)
++}
++
++/// Stored (uncompressed) zip entries, read through the central directory.
++fn read_zip(b: &[u8]) -> Result<Vec<(String, &[u8])>, String> {
++    let low = b.len().saturating_sub(22 + 0xffff);
++    let eocd = (low..b.len().saturating_sub(21)).rev().find(|&i| u32_at(b, i) == Some(0x0605_4b50)).ok_or("not a zip")?;
++    let count = u16_at(b, eocd + 10).ok_or("short zip")?;
++    let mut p = u32_at(b, eocd + 16).ok_or("short zip")?;
++    let mut out = Vec::new();
++    for _ in 0..count {
++        if u32_at(b, p) != Some(0x0201_4b50) {
++            return Err("bad central directory".into());
++        }
++        let method = u16_at(b, p + 10).ok_or("short zip")?;
++        let size = u32_at(b, p + 20).ok_or("short zip")?;
++        let (nlen, xlen, clen) = (u16_at(b, p + 28).ok_or("short zip")?, u16_at(b, p + 30).ok_or("short zip")?, u16_at(b, p + 32).ok_or("short zip")?);
++        let local = u32_at(b, p + 42).ok_or("short zip")?;
++        let name = String::from_utf8_lossy(b.get(p + 46..p + 46 + nlen).ok_or("short zip")?).into_owned();
++        p += 46 + nlen + xlen + clen;
++        if u32_at(b, local) != Some(0x0403_4b50) {
++            return Err(format!("bad local header for {name}"));
++        }
++        let start = local + 30 + u16_at(b, local + 26).ok_or("short zip")? + u16_at(b, local + 28).ok_or("short zip")?;
++        if method != 0 {
++            return Err(format!("{name} is compressed (method {method}), only stored entries are supported"));
++        }
++        out.push((name, b.get(start..start + size).ok_or("short zip")?));
++    }
++    Ok(out)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A stored zip with one file, as `zip -0` writes it.
++    fn tiny_zip() -> Vec<u8> {
++        let (name, data) = (b"eu-default/summary.yml", b"hello");
++        let mut z = Vec::new();
++        let local = z.len();
++        z.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
++        z.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
++        z.extend_from_slice(&(data.len() as u32).to_le_bytes());
++        z.extend_from_slice(&(data.len() as u32).to_le_bytes());
++        z.extend_from_slice(&(name.len() as u16).to_le_bytes());
++        z.extend_from_slice(&0u16.to_le_bytes());
++        z.extend_from_slice(name);
++        z.extend_from_slice(data);
++        let cd = z.len();
++        z.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
++        z.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
++        z.extend_from_slice(&(data.len() as u32).to_le_bytes());
++        z.extend_from_slice(&(data.len() as u32).to_le_bytes());
++        z.extend_from_slice(&(name.len() as u16).to_le_bytes());
++        z.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
++        z.extend_from_slice(&(local as u32).to_le_bytes());
++        z.extend_from_slice(name);
++        let cd_len = z.len() - cd;
++        z.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
++        z.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
++        z.extend_from_slice(&(cd_len as u32).to_le_bytes());
++        z.extend_from_slice(&(cd as u32).to_le_bytes());
++        z.extend_from_slice(&[0, 0]);
++        z
++    }
++
++    #[test]
++    fn reads_stored_entries() {
++        let z = tiny_zip();
++        let e = read_zip(&z).unwrap();
++        assert_eq!(e.len(), 1);
++        assert_eq!(e[0].0, "eu-default/summary.yml");
++        assert_eq!(e[0].1, b"hello");
++    }
++}
+diff --git a/crates/nxhost/src/services/nexweb.rs b/crates/nxhost/src/services/nexweb.rs
+index 99b8984..6932471 100644
+--- a/crates/nxhost/src/services/nexweb.rs
++++ b/crates/nxhost/src/services/nexweb.rs
+@@ -144,6 +144,11 @@ fn send(token: &str, method: &str, path: &str, body: Option<&str>) -> Result<(is
+     request(method, path, Some(token), body.map(|b| ("application/json", b)))
+ }
+ 
++/// An unauthenticated GET on nextendo.network (public data such as the BCAT zip).
++pub fn get(path: &str) -> Result<(isize, Vec<u8>), String> {
++    request("GET", path, None, None)
++}
++
+ fn request(method: &str, path: &str, token: Option<&str>, body: Option<(&str, &str)>) -> Result<(isize, Vec<u8>), String> {
+     let rx = objc2::rc::autoreleasepool(|_| {
+         let url = NSURL::URLWithString(&NSString::from_str(&format!("{BASE}{path}"))).ok_or("bad url")?;
+-- 
+2.56.1
+

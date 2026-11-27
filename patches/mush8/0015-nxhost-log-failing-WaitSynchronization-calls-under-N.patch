@@ -1,7 +1,7 @@
 From 5e22db4f75f2c1ebc5c59b4cb195b58534043618 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:36:09 +0100
-Subject: [PATCH 15/64] nxhost: log failing WaitSynchronization calls under
+Subject: [PATCH 15/65] nxhost: log failing WaitSynchronization calls under
  NX_TRACE_SVC
 
 Each distinct (handles, result) pair other than OK/timeout is logged once.

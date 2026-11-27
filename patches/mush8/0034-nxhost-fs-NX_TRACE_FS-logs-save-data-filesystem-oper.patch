@@ -1,7 +1,7 @@
 From ccbb6e128420a85adc5ed18637db418dc5f41132 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 21:53:40 +0100
-Subject: [PATCH 34/64] nxhost fs: NX_TRACE_FS logs save-data filesystem
+Subject: [PATCH 34/65] nxhost fs: NX_TRACE_FS logs save-data filesystem
  operations with paths
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

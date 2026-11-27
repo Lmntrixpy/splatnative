@@ -1,7 +1,7 @@
 From a7ef0d813148e62ca54f810cfd77e98dfe2d94f9 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Fri, 27 Nov 2026 18:39:48 +0100
-Subject: [PATCH 64/64] nxhost: log the first UDP datagram received from each
+Subject: [PATCH 64/65] nxhost: log the first UDP datagram received from each
  source in Nextendo mode
 
 Before matchmaking Splatoon 3 sends a STUN binding request to the NPLN
