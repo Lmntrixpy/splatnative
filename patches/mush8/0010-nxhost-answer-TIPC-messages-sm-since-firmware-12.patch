@@ -1,7 +1,7 @@
 From 23d87fe00654bfac17ef9906484cc72bec92562d Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:21:34 +0100
-Subject: [PATCH 10/51] nxhost: answer TIPC messages (sm: since firmware 12)
+Subject: [PATCH 10/52] nxhost: answer TIPC messages (sm: since firmware 12)
 
 Splatoon 3's SDK talks to sm: over TIPC: message type 16 + command id, raw
 data right after the HIPC header (no SFCI, no 16-byte alignment), and a

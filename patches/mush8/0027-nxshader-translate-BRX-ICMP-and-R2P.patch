@@ -1,7 +1,7 @@
 From 12eabcaa057658f8c02c653518e102b21868c176 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 10:23:58 +0100
-Subject: [PATCH 27/51] nxshader: translate BRX, ICMP and R2P
+Subject: [PATCH 27/52] nxshader: translate BRX, ICMP and R2P
 
 About 25 Splatoon 3 programs failed to translate, among them the layout
 text shaders, so menus showed no text:

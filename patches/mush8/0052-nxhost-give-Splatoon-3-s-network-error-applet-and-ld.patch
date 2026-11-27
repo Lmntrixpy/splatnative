@@ -1,0 +1,129 @@
+From 57d851375f8dda2bd4eace31247366d38067341b Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Fri, 27 Nov 2026 10:05:06 +0100
+Subject: [PATCH 52/52] nxhost: give Splatoon 3's network-error applet and ldn
+ monitor real objects
+
+In the lobby the game makes a network request that fails offline, and
+nn::nifm::HandleNetworkRequestErrorResult opens the netConnect applet through
+ILibraryAppletCreator cmd 3 (newer SDKs; id, mode, u64). That command was a
+stub that answered success with no object, so CreateLibraryApplet
+dereferenced null. Cmd 3 now creates an applet like cmd 0, nifm's
+GetAppletInfo names netConnect, and netConnect ends at once with "no
+internet connection" as its result.
+
+Right after, nn::ldn::Initialize calls ldn:u cmd 1
+(CreateClientProcessMonitor, 18.0.0+), also a stub without an object; it now
+returns a monitor that accepts everything.
+---
+ crates/nxhost/src/services/am.rs   | 14 ++++++++++++--
+ crates/nxhost/src/services/ldn.rs  | 19 +++++++++++++++++++
+ crates/nxhost/src/services/nifm.rs | 10 +++++++++-
+ 3 files changed, 40 insertions(+), 3 deletions(-)
+
+diff --git a/crates/nxhost/src/services/am.rs b/crates/nxhost/src/services/am.rs
+index 6ad0b75..a18ae94 100644
+--- a/crates/nxhost/src/services/am.rs
++++ b/crates/nxhost/src/services/am.rs
+@@ -245,6 +245,7 @@ const APPLET_SWKBD: u32 = 0x11;
+ const APPLET_MII: u32 = 0x12;
+ const APPLET_WEB: u32 = 0x13;
+ const APPLET_OFFLINE_WEB: u32 = 0x17;
++pub const APPLET_NET_CONNECT: u32 = 0x0F;
+ 
+ struct LibraryAppletCreator;
+ 
+@@ -254,9 +255,12 @@ impl Service for LibraryAppletCreator {
+     }
+     fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
+         match req.cmd {
+-            0 => {
++            // 3 is what newer SDKs call (applet id, mode, plus a u64 the host has no use for).
++            // Splatoon 3's nifm opens its network-error applet with it; without an object back
++            // nn::applet::CreateLibraryApplet dereferences null.
++            0 | 3 => {
+                 let id = req.u32(0);
+-                eprintln!("[am] library applet {id:#x} (mode {})", req.u32(4));
++                eprintln!("[am] library applet {id:#x} (mode {}, cmd {})", req.u32(4), req.cmd);
+                 rsp.objects.push(Arc::new(LibraryApplet {
+                     id,
+                     input: Mutex::new(Vec::new()),
+@@ -315,6 +319,12 @@ impl LibraryApplet {
+             APPLET_CONTROLLER => Some(controller_applet(&input)),
+             APPLET_MII => Some(mii_applet(&input)),
+             APPLET_WEB | APPLET_OFFLINE_WEB => Some(web_applet(&input)),
++            APPLET_NET_CONNECT => {
++                eprintln!("[am] network connection applet: no connection, closing it");
++                let mut out = vec![0u8; 0x1000];
++                out[..4].copy_from_slice(&crate::services::nifm::NO_INTERNET_CONNECTION.to_le_bytes());
++                Some(out)
++            }
+             APPLET_ERROR => {
+                 for (i, d) in input.iter().enumerate() {
+                     let hex: Vec<String> = d.iter().take(0x40).map(|b| format!("{b:02x}")).collect();
+diff --git a/crates/nxhost/src/services/ldn.rs b/crates/nxhost/src/services/ldn.rs
+index 678a772..8820416 100644
+--- a/crates/nxhost/src/services/ldn.rs
++++ b/crates/nxhost/src/services/ldn.rs
+@@ -43,11 +43,30 @@ impl Service for Creator {
+                 rsp.objects.push(Arc::new(Session::new()));
+                 0
+             }
++            // CreateClientProcessMonitor (18.0.0+). nn::ldn::Initialize keeps the object and
++            // calls it right away; a stub with no object crashed Splatoon 3 in the lobby.
++            1 => {
++                rsp.objects.push(Arc::new(ClientProcessMonitor));
++                0
++            }
+             _ => Stub(self.name()).call(req, rsp),
+         }
+     }
+ }
+ 
++/// Lets the real ldn service notice a crashed client. The host has nothing to clean up, so
++/// RegisterClient (0) and anything else just succeed.
++struct ClientProcessMonitor;
++
++impl Service for ClientProcessMonitor {
++    fn name(&self) -> String {
++        "ldn::IClientProcessMonitor".into()
++    }
++    fn call(&self, _req: &Request, _rsp: &mut Response) -> u32 {
++        0
++    }
++}
++
+ struct Network {
+     /// The NetworkConfig the game created the network with (0x20 bytes).
+     config: [u8; 0x20],
+diff --git a/crates/nxhost/src/services/nifm.rs b/crates/nxhost/src/services/nifm.rs
+index c9e2bfd..6a83bc4 100644
+--- a/crates/nxhost/src/services/nifm.rs
++++ b/crates/nxhost/src/services/nifm.rs
+@@ -4,7 +4,7 @@ use crate::ipc::{Act, Request, Response, Service, Stub, Table, new_event, write_
+ use crate::services::vnet::{self, Mode};
+ use std::sync::Arc;
+ 
+-const NO_INTERNET_CONNECTION: u32 = (300 << 9) | 110;
++pub const NO_INTERNET_CONNECTION: u32 = (300 << 9) | 110;
+ const REQUEST_STATE_ERROR: u32 = 1;
+ const REQUEST_STATE_ACCEPTED: u32 = 3;
+ 
+@@ -145,6 +145,14 @@ impl Service for RequestService {
+             1 => return if online { 0 } else { NO_INTERNET_CONNECTION },
+             2 => rsp.copy_handles.extend([new_event(online), new_event(false)]),
+             3 | 4 | 6 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 => {}
++            // GetAppletInfo: which applet nn::nifm::HandleNetworkRequestErrorResult shows for the
++            // failed request. On a console that's netConnect ("couldn't connect"); am ends it at
++            // once with the error as its result, and the game shows its own offline message.
++            21 => {
++                rsp.push_u32(crate::services::am::APPLET_NET_CONNECT);
++                rsp.push_u32(0);
++                rsp.push_u32(0);
++            }
+             _ => return Stub(self.name()).call(req, rsp),
+         }
+         0
+-- 
+2.56.1
+
