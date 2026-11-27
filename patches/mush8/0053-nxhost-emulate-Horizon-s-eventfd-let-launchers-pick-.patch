@@ -1,7 +1,7 @@
 From 280c9cbe911a150b21769298cb84743bd289178c Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Fri, 27 Nov 2026 10:20:40 +0100
-Subject: [PATCH 53/57] nxhost: emulate Horizon's eventfd; let launchers pick
+Subject: [PATCH 53/58] nxhost: emulate Horizon's eventfd; let launchers pick
  the renewed Nextendo sign-in file
 
 bsd cmd 31 (EventFd) was a stub that answered success with a bogus fd.

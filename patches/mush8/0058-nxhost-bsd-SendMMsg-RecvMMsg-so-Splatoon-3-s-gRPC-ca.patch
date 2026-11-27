@@ -1,0 +1,196 @@
+From 3607dd7f17db72da3fd1194ed62aaf7d73f73f6e Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Fri, 27 Nov 2026 17:24:36 +0100
+Subject: [PATCH 58/58] nxhost: bsd SendMMsg/RecvMMsg, so Splatoon 3's gRPC can
+ talk to NPLN
+
+Splatoon 3's gRPC writes and reads its TCP stream with sendmsg/recvmsg, which
+the SDK sends as bsd cmd 30 (SendMMsg) and 29 (RecvMMsg). Both were stubs:
+the game re-sent its TLS ClientHello ~850,000 times and never left the
+loading screen. They now parse the serialized mmsghdr array in the in/out
+buffer, as observed: per message u32 8, u8 0 (no address), u32 iov count,
+per iov u64 length + data (the room to fill, for recv), then a 12-byte
+trailer whose last u32 receives the message's byte count.
+
+NX_NEXTENDO_SERVER overrides the Nextendo server address for the redirects,
+for testing against a local server.
+
+Tested in a sandbox that only reaches localhost, with a local TLS server:
+TLS 1.2 with ALPN h2 completes, and the game sends its first gRPC call,
+/nn.npln.auth.v1.Auth/IssuePrearrangedUserToken, to the NPLN tenant.
+---
+ crates/nxhost/src/services/bsd.rs      | 109 +++++++++++++++++++++++++
+ crates/nxhost/src/services/nextendo.rs |  16 ++--
+ 2 files changed, 120 insertions(+), 5 deletions(-)
+
+diff --git a/crates/nxhost/src/services/bsd.rs b/crates/nxhost/src/services/bsd.rs
+index d556e1e..59f59ef 100644
+--- a/crates/nxhost/src/services/bsd.rs
++++ b/crates/nxhost/src/services/bsd.rs
+@@ -752,6 +752,22 @@ impl Service for Bsd {
+                     res(-1)
+                 }
+             }
++            30 => {
++                let r = send_mmsg(fd, req.u32(4) as usize, req.u32(8) as i32, bytes_mut(out_buf(req, 0)));
++                if trace() {
++                    eprintln!("[bsd] sendmmsg fd {gfd} -> {} errno {}", r.0, r.1);
++                }
++                reply(rsp, r);
++                return 0;
++            }
++            29 => {
++                let r = recv_mmsg(fd, req.u32(4) as usize, req.u32(8) as i32, bytes_mut(out_buf(req, 0)));
++                if trace() {
++                    eprintln!("[bsd] recvmmsg fd {gfd} -> {} errno {}", r.0, r.1);
++                }
++                reply(rsp, r);
++                return 0;
++            }
+             _ => return Stub(self.name()).call(req, rsp),
+         };
+         if trace() {
+@@ -762,6 +778,99 @@ impl Service for Bsd {
+     }
+ }
+ 
++/// One message of the serialized mmsghdr array that bsd SendMMsg/RecvMMsg (cmds 30/29) take in
++/// their in/out buffer, as seen from Splatoon 3's gRPC (sendmsg on a connected TCP socket):
++/// u32 8, u8 0 (no address), u32 iov count, per iov u64 length + bytes, then a 12-byte trailer
++/// (control length, flags, and the message's sent length in the last u32).
++struct MsgLayout {
++    iovs: Vec<(usize, usize)>,
++    len_at: usize,
++    end: usize,
++}
++
++fn parse_msg(b: &[u8], at: usize) -> Option<MsgLayout> {
++    let u32_at = |o: usize| b.get(o..o + 4).map(|x| u32::from_le_bytes(x.try_into().unwrap()) as usize);
++    let u64_at = |o: usize| b.get(o..o + 8).map(|x| u64::from_le_bytes(x.try_into().unwrap()) as usize);
++    let _ = u32_at(at)?;
++    let has_name = *b.get(at + 4)?;
++    if has_name != 0 {
++        return None;
++    }
++    let mut p = at + 5;
++    let count = u32_at(p)?;
++    p += 4;
++    let mut iovs = Vec::new();
++    for _ in 0..count.min(64) {
++        let len = u64_at(p)?;
++        p += 8;
++        b.get(p..p + len)?;
++        iovs.push((p, len));
++        p += len;
++    }
++    let end = p + 12;
++    b.get(p..end)?;
++    Some(MsgLayout { iovs, len_at: end - 4, end })
++}
++
++fn send_mmsg(fd: i32, vlen: usize, flags: i32, b: &mut [u8]) -> (i32, u32) {
++    let mut at = 0;
++    let mut sent = 0;
++    for _ in 0..vlen {
++        let Some(m) = parse_msg(b, at) else {
++            eprintln!("[bsd] sendmmsg: message {sent} not understood: {}", b.iter().skip(at).take(32).map(|x| format!("{x:02x}")).collect::<String>());
++            return if sent > 0 { (sent, 0) } else { (-1, linux_errno(libc::EINVAL)) };
++        };
++        let data: Vec<u8> = m.iovs.iter().flat_map(|&(o, l)| b[o..o + l].iter().copied()).collect();
++        let n = crate::kernel::blocking(|| unsafe { libc::send(fd, data.as_ptr().cast(), data.len(), flags) });
++        if n < 0 {
++            let e = res(-1);
++            return if sent > 0 { (sent, 0) } else { e };
++        }
++        b[m.len_at..m.len_at + 4].copy_from_slice(&(n as u32).to_le_bytes());
++        sent += 1;
++        at = m.end;
++        if (n as usize) < data.len() {
++            break;
++        }
++    }
++    (sent, 0)
++}
++
++/// RecvMMsg: the same layout, with each iov's length naming the room behind it. Received bytes
++/// go into that room and their count into the message's length field; only the first message
++/// may block, like recvmmsg(2).
++fn recv_mmsg(fd: i32, vlen: usize, flags: i32, b: &mut [u8]) -> (i32, u32) {
++    let mut at = 0;
++    let mut got = 0;
++    for i in 0..vlen {
++        let Some(m) = parse_msg(b, at) else {
++            eprintln!("[bsd] recvmmsg: message {got} not understood: {}", b.iter().skip(at).take(32).map(|x| format!("{x:02x}")).collect::<String>());
++            return if got > 0 { (got, 0) } else { (-1, linux_errno(libc::EINVAL)) };
++        };
++        let room: usize = m.iovs.iter().map(|&(_, l)| l).sum();
++        let mut tmp = vec![0u8; room];
++        let f = if i == 0 { flags } else { flags | libc::MSG_DONTWAIT };
++        let n = crate::kernel::blocking(|| unsafe { libc::recv(fd, tmp.as_mut_ptr().cast(), room, f) });
++        if n < 0 {
++            let e = res(-1);
++            return if got > 0 { (got, 0) } else { e };
++        }
++        let mut left = &tmp[..n as usize];
++        for &(o, l) in &m.iovs {
++            let k = left.len().min(l);
++            b[o..o + k].copy_from_slice(&left[..k]);
++            left = &left[k..];
++        }
++        b[m.len_at..m.len_at + 4].copy_from_slice(&(n as u32).to_le_bytes());
++        got += 1;
++        at = m.end;
++        if n == 0 {
++            break;
++        }
++    }
++    (got, 0)
++}
++
+ fn guest_v4(b: &[u8]) -> Option<SocketAddrV4> {
+     (b.len() >= 8 && i32::from(b[1]) == libc::AF_INET).then(|| SocketAddrV4::new(Ipv4Addr::new(b[4], b[5], b[6], b[7]), u16::from_be_bytes([b[2], b[3]])))
+ }
+diff --git a/crates/nxhost/src/services/nextendo.rs b/crates/nxhost/src/services/nextendo.rs
+index 4abcaed..d7fbe4e 100644
+--- a/crates/nxhost/src/services/nextendo.rs
++++ b/crates/nxhost/src/services/nextendo.rs
+@@ -6,6 +6,12 @@ use std::net::Ipv4Addr;
+ use std::sync::{Mutex, OnceLock};
+ 
+ const SERVER: Ipv4Addr = Ipv4Addr::new(51, 178, 29, 194);
++
++/// The Nextendo server; NX_NEXTENDO_SERVER points the redirects elsewhere (a local test server).
++fn server() -> Ipv4Addr {
++    static S: OnceLock<Ipv4Addr> = OnceLock::new();
++    *S.get_or_init(|| std::env::var("NX_NEXTENDO_SERVER").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(SERVER))
++}
+ const NAT: Ipv4Addr = Ipv4Addr::new(164, 132, 111, 120);
+ const BAAS: &str = "e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com";
+ 
+@@ -42,10 +48,10 @@ pub fn redirect(host: &str) -> Option<Ipv4Addr> {
+     let rules = [
+         ("nncs2-*.n.n.srv.nintendo.net", NAT),
+         ("g2b309e01-lp1.s.n.srv.nintendo.net", NAT),
+-        ("*.nintendo.net", SERVER),
+-        ("*.nintendo.com", SERVER),
+-        ("*.nintendowifi.net", SERVER),
+-        ("*.nintendo.co.jp", SERVER),
++        ("*.nintendo.net", server()),
++        ("*.nintendo.com", server()),
++        ("*.nintendowifi.net", server()),
++        ("*.nintendo.co.jp", server()),
+     ];
+     let to = rules.iter().find(|(p, _)| matches(p, host)).map(|(_, a)| *a)?;
+     LAST_HOST.lock().unwrap().get_or_insert_with(HashMap::new).insert(to, host.to_string());
+@@ -53,7 +59,7 @@ pub fn redirect(host: &str) -> Option<Ipv4Addr> {
+ }
+ 
+ pub fn is_server(addr: Ipv4Addr) -> bool {
+-    addr == SERVER || addr == NAT
++    addr == server() || addr == NAT
+ }
+ 
+ pub fn host_for(addr: Ipv4Addr) -> Option<String> {
+-- 
+2.56.1
+
