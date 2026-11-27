@@ -1,7 +1,7 @@
 From c962cc208653be3aebe53bf3decf2c5c5db72088 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Fri, 27 Nov 2026 10:59:51 +0100
-Subject: [PATCH 56/58] nxhost: LoadOpenContext returns the user's
+Subject: [PATCH 56/59] nxhost: LoadOpenContext returns the user's
  IManagerForApplication
 
 acc:u0 cmd 130 (LoadOpenContext) answered success without an object.

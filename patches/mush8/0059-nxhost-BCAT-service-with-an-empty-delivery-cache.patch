@@ -1,0 +1,170 @@
+From eb3007672c064318068dd34d88c7798277e4e7e7 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Fri, 27 Nov 2026 17:32:37 +0100
+Subject: [PATCH 59/59] nxhost: BCAT service with an empty delivery cache
+
+After its NPLN login (and the Splatfest region question) Splatoon 3 calls
+nn::bcat::RequestSyncDeliveryCache. bcat:u cmd 0 (CreateBcatService) was a
+stub without an object, so the SDK dereferenced null. bcat:u/a/m/s now
+create an IBcatService whose sync finishes at once (progress Done, result 0)
+and a delivery cache storage with no directories; opening a file or
+directory there answers NotFound. Downloading real BCAT content is not done.
+---
+ crates/nxhost/src/services/bcat.rs | 124 +++++++++++++++++++++++++++++
+ crates/nxhost/src/services/mod.rs  |   2 +
+ 2 files changed, 126 insertions(+)
+ create mode 100644 crates/nxhost/src/services/bcat.rs
+
+diff --git a/crates/nxhost/src/services/bcat.rs b/crates/nxhost/src/services/bcat.rs
+new file mode 100644
+index 0000000..0575192
+--- /dev/null
++++ b/crates/nxhost/src/services/bcat.rs
+@@ -0,0 +1,124 @@
++// SplatNative - bcat.rs
++// BCAT (background content delivery) for games that sync it on their way online. Nothing is
++// downloaded: a sync finishes at once and successfully, and the delivery cache is empty.
++// Splatoon 3 calls nn::bcat::RequestSyncDeliveryCache after its NPLN login; the stub that
++// returned no IBcatService made the SDK dereference null.
++use crate::ipc::{Request, Response, Service, Stub, new_event, write_buffer};
++use std::sync::Arc;
++
++/// bcat module 122, NotFound.
++const NOT_FOUND: u32 = 122 | 2 << 9;
++/// DeliveryCacheProgressStatus::Done.
++const PROGRESS_DONE: u32 = 9;
++
++pub struct Bcat(pub String);
++
++impl Service for Bcat {
++    fn name(&self) -> String {
++        self.0.clone()
++    }
++    fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
++        match req.cmd {
++            // CreateBcatService / CreateBcatServiceWithApplicationId (pid or application id)
++            0 | 3 => rsp.objects.push(Arc::new(BcatService)),
++            // CreateDeliveryCacheStorageService / ...WithApplicationId
++            1 | 2 => rsp.objects.push(Arc::new(Storage)),
++            _ => return Stub(self.name()).call(req, rsp),
++        }
++        0
++    }
++}
++
++struct BcatService;
++
++impl Service for BcatService {
++    fn name(&self) -> String {
++        "bcat::IBcatService".into()
++    }
++    fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
++        match req.cmd {
++            // RequestSyncDeliveryCache, ...WithDirectoryName
++            10100 | 10101 => {
++                if req.cmd == 10100 {
++                    eprintln!("[bcat] delivery cache sync requested: nothing to download, done");
++                }
++                rsp.objects.push(Arc::new(Progress));
++            }
++            // CancelSyncDeliveryCacheRequest, passphrase and storage housekeeping
++            10200 | 20100 | 20101 | 20102 | 20103 | 20104 | 20200 | 20300 | 20301 | 30100 | 30101 | 30200 | 30201 | 30202 | 30203 | 30204 | 30205 | 30210 | 30211 | 30212 | 30213 | 30214 | 30215 | 30216 | 90100 | 90200 | 90201 | 90300 => {}
++            _ => return Stub(self.name()).call(req, rsp),
++        }
++        0
++    }
++}
++
++struct Progress;
++
++impl Service for Progress {
++    fn name(&self) -> String {
++        "bcat::IDeliveryCacheProgressService".into()
++    }
++    fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
++        match req.cmd {
++            0 => rsp.copy_handles.push(new_event(true)),
++            // GetImpl: DeliveryCacheProgressImpl (0x200 bytes), state Done and result 0
++            1 => {
++                if let Some(b) = req.out_buffer() {
++                    let mut p = vec![0u8; b.size as usize];
++                    if p.len() >= 8 {
++                        p[..4].copy_from_slice(&PROGRESS_DONE.to_le_bytes());
++                    }
++                    write_buffer(&b, &p);
++                }
++            }
++            _ => return Stub(self.name()).call(req, rsp),
++        }
++        0
++    }
++}
++
++struct Storage;
++
++impl Service for Storage {
++    fn name(&self) -> String {
++        "bcat::IDeliveryCacheStorageService".into()
++    }
++    fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
++        match req.cmd {
++            0 => rsp.objects.push(Arc::new(Empty("bcat::IDeliveryCacheFileService"))),
++            1 => rsp.objects.push(Arc::new(Empty("bcat::IDeliveryCacheDirectoryService"))),
++            // EnumerateDeliveryCacheDirectory: no directories
++            10 => rsp.push_u32(0),
++            _ => return Stub(self.name()).call(req, rsp),
++        }
++        0
++    }
++}
++
++/// File and directory services of an empty cache: opening anything says "not found".
++struct Empty(&'static str);
++
++impl Service for Empty {
++    fn name(&self) -> String {
++        self.0.into()
++    }
++    fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
++        match req.cmd {
++            0 => NOT_FOUND,
++            // file Read / directory Read: nothing; GetSize / GetCount: 0
++            1 => {
++                rsp.push_u64(0);
++                0
++            }
++            2 => {
++                rsp.push_u64(0);
++                0
++            }
++            3 => {
++                rsp.data.extend_from_slice(&[0u8; 0x10]);
++                0
++            }
++            _ => Stub(self.name()).call(req, rsp),
++        }
++    }
++}
+diff --git a/crates/nxhost/src/services/mod.rs b/crates/nxhost/src/services/mod.rs
+index 9d85e0d..2d36156 100644
+--- a/crates/nxhost/src/services/mod.rs
++++ b/crates/nxhost/src/services/mod.rs
+@@ -28,6 +28,7 @@ mod ssl;
+ mod time;
+ pub mod vi;
+ mod wireless;
++mod bcat;
+ pub mod vnet;
+ 
+ use crate::ipc::{Act, Service, Stub, Table};
+@@ -58,6 +59,7 @@ pub fn open(name: &str) -> Arc<dyn Service> {
+         "prepo:u" | "prepo:a" | "prepo:a2" | "prepo:m" | "prepo:s" if nextendo::enabled() => Arc::new(prepo::Prepo(name.to_string())),
+         "nfp:user" => nfp::open(),
+         "ldn:u" => ldn::open(),
++        "bcat:u" | "bcat:a" | "bcat:m" | "bcat:s" => Arc::new(bcat::Bcat(name.to_string())),
+         "ntc" => Arc::new(Table { name: "ntc", cmds: &[(0, Act::Obj(ensure_network_clock)), (100, Act::Ok), (101, Act::Ok)] }),
+         "set" => Arc::new(set::Settings),
+         "pctl" | "pctl:s" | "pctl:a" | "pctl:r" => Arc::new(Table {
+-- 
+2.56.1
+

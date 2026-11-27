@@ -1,7 +1,7 @@
 From cd2b72ae94d290ea8f81e5f2b6b7b4e331d85ae5 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 10:23:58 +0100
-Subject: [PATCH 28/58] nxhost diag: NX_TRACE_UBO dumps uniform buffer words of
+Subject: [PATCH 28/59] nxhost diag: NX_TRACE_UBO dumps uniform buffer words of
  traced draws
 
 NX_TRACE_UBO=stage:index:first:count[:vs-hash] prints the words a traced

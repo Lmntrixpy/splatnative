@@ -1,7 +1,7 @@
 From ab38b40a19a1a0094e54f16b2bf754f64997c3f2 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Fri, 27 Nov 2026 10:29:52 +0100
-Subject: [PATCH 54/58] nxhost: Nextendo presence and play time name the
+Subject: [PATCH 54/59] nxhost: Nextendo presence and play time name the
  running game, not MK8
 
 nexweb published presence and play history with Mario Kart 8 Deluxe's title
