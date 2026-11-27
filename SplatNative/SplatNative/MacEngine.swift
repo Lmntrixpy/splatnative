@@ -163,7 +163,7 @@ final class Preparer: ObservableObject {
         p.executableURL = step.exe
         p.arguments = step.args()
         p.currentDirectoryURL = folder
-        p.environment = ProcessInfo.processInfo.environment.merging(step.env) { $1 }
+        p.environment = childEnvironment(step.env)
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
@@ -200,6 +200,15 @@ final class Preparer: ObservableObject {
     }
 }
 
+/// The launcher's environment without what Xcode injects into a debug run (Metal API
+/// validation, GPU frame capture, dyld inserts, malloc debugging). Inherited by nxhost,
+/// Metal validation aborts the game on assertions the release driver tolerates.
+func childEnvironment(_ extra: [String: String]) -> [String: String] {
+    let dropPrefixes = ["MTL_", "METAL_", "DYLD_", "__XPC_", "__XCODE", "XCODE_", "GPUTOOLS", "MallocStack", "NSZombie", "OS_ACTIVITY_DT_MODE", "LLVM_PROFILE_FILE", "CA_DEBUG", "CA_ASSERT"]
+    let base = ProcessInfo.processInfo.environment.filter { key, _ in !dropPrefixes.contains { key.hasPrefix($0) } }
+    return base.merging(extra) { $1 }
+}
+
 func gameArguments(_ s: Settings) -> [String] {
     var a = ["--patched", patchedDir, "--npdm", "\(exefsDir)/main.npdm",
              "--keys", s.keys, "--base", s.base, "--update", s.update, "--firmware", s.firmware]
@@ -230,7 +239,7 @@ final class GameSession: ObservableObject {
         p.executableURL = tool("nxhost", in: s.folderURL)
         p.arguments = gameArguments(s)
         p.currentDirectoryURL = s.folderURL
-        p.environment = ProcessInfo.processInfo.environment.merging(s.environment) { $1 }
+        p.environment = childEnvironment(s.environment)
         p.standardOutput = log
         p.standardError = log
         p.terminationHandler = { p in
