@@ -155,7 +155,13 @@ final class Settings: ObservableObject {
             env["NX_LANPLAY_SERVER"] = lanPlayServer.trimmingCharacters(in: .whitespaces)
         case "nextendo":
             env["NX_NEXTENDO_PID"] = String(nextendoPid)
-            if inspectNetwork { env["NX_NEXTENDO_INSPECT"] = "1" }
+            if inspectNetwork {
+                // Decoded NPLN traffic, plus the account, network and parental-control calls the
+                // game's online checks make (to find where a feature decides it's "offline").
+                env["NX_NEXTENDO_INSPECT"] = "1"
+                env["NX_TRACE_IPC"] = "acc,account,nifm,pctl,ntc,friend,bcat,ectx,npns,olsc,prepo"
+                env["NX_TRACE_SYMS"] = "nn::account,nn::nifm,nn::pctl,nn::friends,nn::olsc,nn::npns,nn::ec::,nn::err::"
+            }
         default:
             break
         }

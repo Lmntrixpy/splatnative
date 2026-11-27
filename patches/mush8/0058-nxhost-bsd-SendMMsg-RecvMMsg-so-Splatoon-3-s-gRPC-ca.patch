@@ -1,7 +1,7 @@
 From 3607dd7f17db72da3fd1194ed62aaf7d73f73f6e Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Fri, 27 Nov 2026 17:24:36 +0100
-Subject: [PATCH 58/61] nxhost: bsd SendMMsg/RecvMMsg, so Splatoon 3's gRPC can
+Subject: [PATCH 58/62] nxhost: bsd SendMMsg/RecvMMsg, so Splatoon 3's gRPC can
  talk to NPLN
 
 Splatoon 3's gRPC writes and reads its TCP stream with sendmsg/recvmsg, which

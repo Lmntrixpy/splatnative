@@ -1,0 +1,88 @@
+From 96b3f9cfcb2c86d3a7e2cfe6f54336d360f7776b Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Fri, 27 Nov 2026 18:20:20 +0100
+Subject: [PATCH 62/62] nxhost: NX_TRACE_IPC can be limited to services by name
+
+NX_TRACE_IPC=1 (or empty) still traces every IPC call. A comma-separated list
+of name fragments ("acc,nifm,pctl") now traces only sessions and objects
+whose service name contains one of them; buffer descriptors are only logged
+when tracing everything. Tracing all IPC floods the log with hid and fs
+calls, which hid the few account and network calls behind Splatoon 3's
+"you're offline" decision in the lobby.
+---
+ crates/nxhost/src/ipc.rs | 30 ++++++++++++++++++++++++------
+ 1 file changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/crates/nxhost/src/ipc.rs b/crates/nxhost/src/ipc.rs
+index d4d944b..885ddc4 100644
+--- a/crates/nxhost/src/ipc.rs
++++ b/crates/nxhost/src/ipc.rs
+@@ -214,9 +214,27 @@ pub fn new_session_handle(svc: Arc<dyn Service>) -> u32 {
+     KERNEL.lock().add(Obj::Session(Session::new(svc)))
+ }
+ 
++/// NX_TRACE_IPC=1 (or empty) traces every IPC call; a comma-separated list of name fragments
++/// ("acc,nifm,pctl") traces only services whose name contains one of them.
++fn trace_filter() -> &'static Option<Vec<String>> {
++    static T: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
++    T.get_or_init(|| {
++        let v = std::env::var("NX_TRACE_IPC").ok()?;
++        let v = v.trim();
++        Some(if v.is_empty() || v == "1" { Vec::new() } else { v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect() })
++    })
++}
++
++/// Tracing everything (buffer descriptors and the like).
+ fn trace() -> bool {
+-    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *T.get_or_init(|| std::env::var_os("NX_TRACE_IPC").is_some())
++    trace_filter().as_ref().is_some_and(|f| f.is_empty())
++}
++
++fn trace_name(name: &str) -> bool {
++    match trace_filter() {
++        None => false,
++        Some(f) => f.is_empty() || f.iter().any(|p| name.contains(p.as_str())),
++    }
+ }
+ 
+ fn rd(buf: &[u8], i: usize) -> u32 {
+@@ -288,7 +306,7 @@ pub fn handle(session: &Arc<Session>, handle: u32, buf: &mut [u8]) -> bool {
+     let result;
+     match kind {
+         2 => {
+-            if trace() {
++            if trace_name(&session.name()) {
+                 eprintln!("[ipc] {} ({handle:#x}): close", session.name());
+             }
+             return false;
+@@ -344,7 +362,7 @@ pub fn handle(session: &Arc<Session>, handle: u32, buf: &mut [u8]) -> bool {
+             let data_start = r + 0x10;
+             req.data = buf[data_start.min(raw_end)..raw_end.max(data_start)].to_vec();
+             result = target.call(&req, &mut rsp);
+-            if trace() {
++            if trace_name(&target.name()) {
+                 eprintln!(
+                     "[ipc] {} ({handle:#x}{}) cmd {} in {:02x?} -> {result:#x} out {:02x?} objects {}",
+                     target.name(),
+@@ -359,7 +377,7 @@ pub fn handle(session: &Arc<Session>, handle: u32, buf: &mut [u8]) -> bool {
+         5 | 7 => {
+             req.cmd = rd(buf, raw_start / 4 + 2);
+             result = control(session, &req, &mut rsp);
+-            if trace() {
++            if trace_name(&session.name()) {
+                 eprintln!("[ipc] {} ({handle:#x}) control {} -> {result:#x}", session.name(), req.cmd);
+             }
+         }
+@@ -374,7 +392,7 @@ pub fn handle(session: &Arc<Session>, handle: u32, buf: &mut [u8]) -> bool {
+             let start = i * 4;
+             req.data = buf[start.min(raw_end)..raw_end.max(start)].to_vec();
+             result = session.root.call(&req, &mut rsp);
+-            if trace() {
++            if trace_name(&session.name()) {
+                 eprintln!("[ipc] {} ({handle:#x}) tipc {} in {:02x?} -> {result:#x} out {:02x?}", session.name(), req.cmd, &req.data[..req.data.len().min(16)], &rsp.data[..rsp.data.len().min(16)]);
+             }
+             for o in std::mem::take(&mut rsp.objects) {
+-- 
+2.56.1
+
