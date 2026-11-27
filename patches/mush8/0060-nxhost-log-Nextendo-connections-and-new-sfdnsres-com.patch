@@ -1,0 +1,90 @@
+From 098b1dd794375ec5879edbda28435c1abb9f2400 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Fri, 27 Nov 2026 17:37:54 +0100
+Subject: [PATCH 60/60] nxhost: log Nextendo connections and new sfdnsres
+ commands
+
+In Nextendo mode every server the game connects to is now logged once
+("[net] connect ip:port (host): connected/connecting/failed"), and the first
+use of each sfdnsres command other than the logged lookups is noted. Splatoon
+3 opened sfdnsres a dozen times without a logged lookup, and a shop that
+stays "offline" gave no hint which host it wanted.
+---
+ crates/nxhost/src/services/bsd.rs      | 31 ++++++++++++++++++++++++--
+ crates/nxhost/src/services/sfdnsres.rs |  8 +++++++
+ 2 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/crates/nxhost/src/services/bsd.rs b/crates/nxhost/src/services/bsd.rs
+index 59f59ef..55568cf 100644
+--- a/crates/nxhost/src/services/bsd.rs
++++ b/crates/nxhost/src/services/bsd.rs
+@@ -665,11 +665,15 @@ impl Service for Bsd {
+                     if req.cmd == 14 {
+                         shout_map().lock().unwrap().remove(&fd);
+                     }
+-                    res(if req.cmd == 13 {
++                    let r = res(if req.cmd == 13 {
+                         if unpark(fd, &ss) { 0 } else { unsafe { libc::bind(fd, p, len) as isize } }
+                     } else {
+                         crate::kernel::blocking(|| unsafe { libc::connect(fd, p, len) as isize })
+-                    })
++                    });
++                    if req.cmd == 14 {
++                        note_connect(&ss, r);
++                    }
++                    r
+                 }
+             }
+             17 => {
+@@ -778,6 +782,29 @@ impl Service for Bsd {
+     }
+ }
+ 
++/// In Nextendo mode, each server the game connects to is logged once, with the host name it
++/// resolved, so a feature that stays "offline" shows which host it wanted.
++fn note_connect(ss: &libc::sockaddr_storage, r: (i32, u32)) {
++    if !crate::services::nextendo::enabled() {
++        return;
++    }
++    let Some(ip) = v4(ss) else { return };
++    let port = u16::from_be(unsafe { (*(ss as *const _ as *const libc::sockaddr_in)).sin_port });
++    static SEEN: Mutex<Vec<([u8; 4], u16)>> = Mutex::new(Vec::new());
++    let mut seen = SEEN.lock().unwrap();
++    if seen.contains(&(ip, port)) {
++        return;
++    }
++    seen.push((ip, port));
++    let host = crate::services::nextendo::host_for(Ipv4Addr::from(ip)).unwrap_or_else(|| "?".into());
++    let how = match r {
++        (0, _) => "connected".to_string(),
++        (_, 115) => "connecting".to_string(),
++        (_, e) => format!("failed, errno {e}"),
++    };
++    eprintln!("[net] connect {}:{port} ({host}): {how}", ip_str(ip));
++}
++
+ /// One message of the serialized mmsghdr array that bsd SendMMsg/RecvMMsg (cmds 30/29) take in
+ /// their in/out buffer, as seen from Splatoon 3's gRPC (sendmsg on a connected TCP socket):
+ /// u32 8, u8 0 (no address), u32 iov count, per iov u64 length + bytes, then a 12-byte trailer
+diff --git a/crates/nxhost/src/services/sfdnsres.rs b/crates/nxhost/src/services/sfdnsres.rs
+index 6d3a08e..5f08aaf 100644
+--- a/crates/nxhost/src/services/sfdnsres.rs
++++ b/crates/nxhost/src/services/sfdnsres.rs
+@@ -107,6 +107,14 @@ impl Service for Resolver {
+         "sfdnsres".into()
+     }
+     fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
++        if !matches!(req.cmd, 2 | 6 | 10 | 12) {
++            static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
++            let mut seen = SEEN.lock().unwrap();
++            if !seen.contains(&req.cmd) {
++                seen.push(req.cmd);
++                eprintln!("[sfdnsres] cmd {} first used (in {} bytes)", req.cmd, req.data.len());
++            }
++        }
+         match req.cmd {
+             2 | 10 => {
+                 let host = cstr(bytes(in_buf(req, 0)));
+-- 
+2.56.1
+
