@@ -1,7 +1,7 @@
 From da408dba9ab22eb7e738d189bde702998365f5b1 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 10:32:23 +0100
-Subject: [PATCH 29/53] nxshader: translate LEA.HI
+Subject: [PATCH 29/54] nxshader: translate LEA.HI
 
 Rd = base + low32(((Rc:Ra), negated with .NEG) >> (32 - scale)), base Rb
 or a constant. Three Splatoon 3 tutorial shaders use it for addresses; the

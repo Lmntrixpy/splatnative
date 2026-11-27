@@ -1,0 +1,84 @@
+From ab38b40a19a1a0094e54f16b2bf754f64997c3f2 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Fri, 27 Nov 2026 10:29:52 +0100
+Subject: [PATCH 54/54] nxhost: Nextendo presence and play time name the
+ running game, not MK8
+
+nexweb published presence and play history with Mario Kart 8 Deluxe's title
+id and name hard-coded, so a Splatoon 3 session showed up on Nextendo as
+Mario Kart. Presence, history and the friends count now use
+game::current() (still MK8DX before identification and in tests).
+---
+ crates/nxhost/src/services/nexweb.rs | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/crates/nxhost/src/services/nexweb.rs b/crates/nxhost/src/services/nexweb.rs
+index c60bfed..99b8984 100644
+--- a/crates/nxhost/src/services/nexweb.rs
++++ b/crates/nxhost/src/services/nexweb.rs
+@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
+ 
+ const BASE: &str = "https://nextendo.network";
+ const CLIENT_ID: &str = "nxc_PZv-XFn79sLo";
++#[cfg(test)]
+ pub const MK8: u64 = crate::svc::PROGRAM_ID;
+ const FRIENDS_TTL: Duration = Duration::from_secs(10);
+ const PRESENCE_EVERY: Duration = Duration::from_secs(45);
+@@ -17,7 +18,6 @@ const ACCESS_LIFE: Duration = Duration::from_secs(50 * 60);
+ const RENEW_RETRY: Duration = Duration::from_secs(5 * 60);
+ const HISTORY_TICK: Duration = Duration::from_secs(15);
+ const HISTORY_EVERY: Duration = Duration::from_secs(60);
+-const MK8_NAME: &str = "Mario Kart 8 Deluxe";
+ 
+ fn signed_in_access() -> String {
+     std::env::var("NX_NEXTENDO_ACCESS").unwrap_or_default().trim().to_string()
+@@ -413,8 +413,9 @@ impl Friend {
+     pub fn online(&self) -> bool {
+         self.status > 0
+     }
++    /// Online in the game that is running now (Mario Kart before identification).
+     pub fn in_mk8(&self) -> bool {
+-        self.online() && self.app_id == MK8
++        self.online() && self.app_id == crate::game::current().title_id
+     }
+ }
+ 
+@@ -462,7 +463,7 @@ fn refresh_friends() {
+     match fetched {
+         Some(list) => {
+             if !c.loaded || c.list.len() != list.len() {
+-                eprintln!("[nextendo] {} friend(s), {} in Mario Kart", list.len(), list.iter().filter(|f| f.in_mk8()).count());
++                eprintln!("[nextendo] {} friend(s), {} in {}", list.len(), list.iter().filter(|f| f.in_mk8()).count(), crate::game::current().name);
+             }
+             c.list = list;
+             c.loaded = true;
+@@ -505,7 +506,7 @@ pub fn presence_body(app_field: &[u8], detail: &str) -> String {
+     format!(
+         "{{\"status\":2,\"app_field\":{},\"app_id\":{},\"app_detail\":{}}}",
+         json_str(&base64(&app_field[..end])),
+-        json_str(&format!("{MK8:016X}")),
++        json_str(&format!("{:016X}", crate::game::current().title_id)),
+         json_str(detail)
+     )
+ }
+@@ -567,14 +568,14 @@ pub fn history_seconds(body: &str) -> Option<u64> {
+     let root = Json::parse(body)?;
+     let list = root.get("history");
+     matches!(list, Json::Arr(_)).then_some(())?;
+-    Some(list.arr().iter().find(|h| u64::from_str_radix(h.get("title_id").str(), 16).ok() == Some(MK8)).map_or(0, |h| h.get("seconds").u64()))
++    Some(list.arr().iter().find(|h| u64::from_str_radix(h.get("title_id").str(), 16).ok() == Some(crate::game::current().title_id)).map_or(0, |h| h.get("seconds").u64()))
+ }
+ 
+ pub fn history_body(seconds: u64, last_played: &str) -> String {
+     format!(
+         "{{\"history\":[{{\"title_id\":{},\"name\":{},\"icon\":\"\",\"seconds\":{seconds},\"last_played\":{}}}]}}",
+-        json_str(&format!("{MK8:016x}")),
+-        json_str(MK8_NAME),
++        json_str(&format!("{:016x}", crate::game::current().title_id)),
++        json_str(crate::game::current().name),
+         json_str(last_played)
+     )
+ }
+-- 
+2.56.1
+
