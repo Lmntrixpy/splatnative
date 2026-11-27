@@ -1,7 +1,7 @@
 From 96b3f9cfcb2c86d3a7e2cfe6f54336d360f7776b Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Fri, 27 Nov 2026 18:20:20 +0100
-Subject: [PATCH 62/62] nxhost: NX_TRACE_IPC can be limited to services by name
+Subject: [PATCH 62/63] nxhost: NX_TRACE_IPC can be limited to services by name
 
 NX_TRACE_IPC=1 (or empty) still traces every IPC call. A comma-separated list
 of name fragments ("acc,nifm,pctl") now traces only sessions and objects

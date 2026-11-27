@@ -1,7 +1,7 @@
 From 6062c4a051c4ee1e1af5ade6ab15582a3862712a Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:17:29 +0100
-Subject: [PATCH 07/62] nxhost: enter the five-argument nn::init::Start of
+Subject: [PATCH 07/63] nxhost: enter the five-argument nn::init::Start of
  newer SDKs
 
 Splatoon 3's sdk exports nn::init::Start(u64, u64, void(*)(), void(*)(),

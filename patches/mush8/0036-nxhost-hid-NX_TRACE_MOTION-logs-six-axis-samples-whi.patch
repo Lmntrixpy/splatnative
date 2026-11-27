@@ -1,7 +1,7 @@
 From cd92c187bfb8ee7feb542e32b15563135d01f4e3 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 22:49:41 +0100
-Subject: [PATCH 36/62] nxhost hid: NX_TRACE_MOTION logs six-axis samples while
+Subject: [PATCH 36/63] nxhost hid: NX_TRACE_MOTION logs six-axis samples while
  the sensor turns
 
 ---

@@ -1,7 +1,7 @@
 From 41216882f8903e6406f10f20412949bdd6196536 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Tue, 24 Nov 2026 12:07:03 +0100
-Subject: [PATCH 49/62] nxhost: ldn:u local wireless service that finds nobody
+Subject: [PATCH 49/63] nxhost: ldn:u local wireless service that finds nobody
 
 ldn:u was a stub that returned no session object, so nn::ldn::Initialize
 dereferenced null when Splatoon 3 entered the Inkcade. The new service

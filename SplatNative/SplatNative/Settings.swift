@@ -160,7 +160,7 @@ final class Settings: ObservableObject {
                 // game's online checks make (to find where a feature decides it's "offline").
                 // Not NX_TRACE_SYMS: its wrapper crashed nn::account::IsNetworkServiceAccountAvailable.
                 env["NX_NEXTENDO_INSPECT"] = "1"
-                env["NX_TRACE_IPC"] = "acc,account,nifm,pctl,ntc,friend,bcat,ectx,npns,olsc,prepo"
+                env["NX_TRACE_IPC"] = "acc,account,nifm,pctl,ntc,friend,bcat,ectx,npns,olsc,sfdnsres,nsd,am::IApplicationFunctions"
             }
         default:
             break

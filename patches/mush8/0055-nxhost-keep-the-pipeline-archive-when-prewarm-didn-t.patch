@@ -1,7 +1,7 @@
 From 9807acb973d01057eddc0814b46675737e43bb5c Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Fri, 27 Nov 2026 10:48:05 +0100
-Subject: [PATCH 55/62] nxhost: keep the pipeline archive when prewarm didn't
+Subject: [PATCH 55/63] nxhost: keep the pipeline archive when prewarm didn't
  rebuild every pipeline
 
 With more than 8 archive files, a start "compacts": only bases looked up

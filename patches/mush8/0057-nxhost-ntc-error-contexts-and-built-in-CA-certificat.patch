@@ -1,7 +1,7 @@
 From 5f72493a2552d42ba48b58c4075cad0ed4e76f76 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Fri, 27 Nov 2026 11:14:55 +0100
-Subject: [PATCH 57/62] nxhost: ntc, error contexts and built-in CA
+Subject: [PATCH 57/63] nxhost: ntc, error contexts and built-in CA
  certificates for Splatoon 3 online
 
 Signed in to Nextendo, Splatoon 3 now goes online at boot and hit three

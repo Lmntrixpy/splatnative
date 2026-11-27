@@ -1,7 +1,7 @@
 From 57d851375f8dda2bd4eace31247366d38067341b Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Fri, 27 Nov 2026 10:05:06 +0100
-Subject: [PATCH 52/62] nxhost: give Splatoon 3's network-error applet and ldn
+Subject: [PATCH 52/63] nxhost: give Splatoon 3's network-error applet and ldn
  monitor real objects
 
 In the lobby the game makes a network request that fails offline, and
