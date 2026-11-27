@@ -1,0 +1,209 @@
+From 5f72493a2552d42ba48b58c4075cad0ed4e76f76 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Fri, 27 Nov 2026 11:14:55 +0100
+Subject: [PATCH 57/57] nxhost: ntc, error contexts and built-in CA
+ certificates for Splatoon 3 online
+
+Signed in to Nextendo, Splatoon 3 now goes online at boot and hit three
+more services that answered success without what the SDK expects:
+
+- ntc cmd 0 (OpenEnsureNetworkClockAvailabilityService) returned no object;
+  nn::time::AsyncEnsureNetworkClockAvailabilityTask dereferenced null. It now
+  gets a service whose check finishes at once (time:u's network clock already
+  follows the host clock).
+- ssl:s GetCertificateBufSize/GetCertificates (cmds 3/2) returned nothing.
+  The game runs its own BoringSSL and loads the console's root CAs through
+  them, so it gave up before connecting. ssl/ssl:s now serve the entries of
+  the firmware's ssl_TrustedCerts.bdf (0100000000000800; "sslT", count,
+  16-byte entries with offsets from the end of the header): 127 certs, the
+  game asks for ids 1, 2, 0x3e8, 0x3f3-0x3f5, 0x409. ssl:s is routed to the
+  ssl service in Nextendo mode.
+- ectx:aw cmd 0 (CreateContextRegistrar) returned no object; nn::err crashed
+  filing an error. It now gets a registrar that logs the result code.
+
+In a sandbox without outbound network the game now resolves the NPLN tenant,
+connects to 51.178.29.194:443, gets refused and reports 2321-4992 instead
+of crashing.
+---
+ crates/nxhost/src/services/mod.rs | 55 ++++++++++++++++++++-
+ crates/nxhost/src/services/ssl.rs | 82 ++++++++++++++++++++++++++++++-
+ 2 files changed, 134 insertions(+), 3 deletions(-)
+
+diff --git a/crates/nxhost/src/services/mod.rs b/crates/nxhost/src/services/mod.rs
+index 9d363e0..9d85e0d 100644
+--- a/crates/nxhost/src/services/mod.rs
++++ b/crates/nxhost/src/services/mod.rs
+@@ -53,10 +53,12 @@ pub fn open(name: &str) -> Arc<dyn Service> {
+         "aoc:u" => Arc::new(aoc::Aoc),
+         "sfdnsres" if nextendo::enabled() => Arc::new(sfdnsres::Resolver),
+         "nsd:u" | "nsd:a" if nextendo::enabled() => Arc::new(nsd::Nsd),
+-        "ssl" if nextendo::enabled() => ssl::open(),
++        "ssl" | "ssl:s" if nextendo::enabled() => ssl::open(),
++        "ectx:aw" | "ectx:w" => Arc::new(Table { name: "ectx", cmds: &[(0, Act::Obj(error_context))] }),
+         "prepo:u" | "prepo:a" | "prepo:a2" | "prepo:m" | "prepo:s" if nextendo::enabled() => Arc::new(prepo::Prepo(name.to_string())),
+         "nfp:user" => nfp::open(),
+         "ldn:u" => ldn::open(),
++        "ntc" => Arc::new(Table { name: "ntc", cmds: &[(0, Act::Obj(ensure_network_clock)), (100, Act::Ok), (101, Act::Ok)] }),
+         "set" => Arc::new(set::Settings),
+         "pctl" | "pctl:s" | "pctl:a" | "pctl:r" => Arc::new(Table {
+             name: "pctl",
+@@ -70,6 +72,57 @@ pub fn open(name: &str) -> Arc<dyn Service> {
+     }
+ }
+ 
++/// ectx's IContextRegistrar: the SDK files an error's context here before showing it. Splatoon 3
++/// does so when going online fails; without the object nn::err dereferenced null. The result
++/// code is logged, which is the useful part.
++fn error_context() -> Arc<dyn Service> {
++    Arc::new(ErrorContext)
++}
++
++struct ErrorContext;
++
++impl Service for ErrorContext {
++    fn name(&self) -> String {
++        "ectx::IContextRegistrar".into()
++    }
++    fn call(&self, req: &crate::ipc::Request, _rsp: &mut crate::ipc::Response) -> u32 {
++        if req.cmd == 0 {
++            let r = req.u32(0);
++            eprintln!("[ectx] the game reports error {:04}-{:04} (result {r:#x})", 2000 + (r & 0x1ff), (r >> 9) & 0x1fff);
++        }
++        0
++    }
++}
++
++/// ntc's IEnsureNetworkClockAvailabilityService. The network clock in time:u already follows
++/// the host's clock, so the check finishes at once and succeeds. Splatoon 3 opens it on its way
++/// online (nn::time::AsyncEnsureNetworkClockAvailabilityTask); without the object the SDK
++/// dereferenced null.
++fn ensure_network_clock() -> Arc<dyn Service> {
++    Arc::new(EnsureNetworkClock)
++}
++
++struct EnsureNetworkClock;
++
++impl Service for EnsureNetworkClock {
++    fn name(&self) -> String {
++        "ntc::IEnsureNetworkClockAvailabilityService".into()
++    }
++    fn call(&self, req: &crate::ipc::Request, rsp: &mut crate::ipc::Response) -> u32 {
++        match req.cmd {
++            0 | 2 | 3 => {}
++            1 => rsp.copy_handles.push(crate::ipc::new_event(true)),
++            4 => rsp.data.push(0),
++            5 => {
++                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
++                rsp.push_u64(now);
++            }
++            _ => return Stub(self.name()).call(req, rsp),
++        }
++        0
++    }
++}
++
+ fn pctl_service() -> Arc<dyn Service> {
+     Arc::new(Table {
+         name: "pctl::IParentalControlService",
+diff --git a/crates/nxhost/src/services/ssl.rs b/crates/nxhost/src/services/ssl.rs
+index d2d1fbe..dc06e46 100644
+--- a/crates/nxhost/src/services/ssl.rs
++++ b/crates/nxhost/src/services/ssl.rs
+@@ -40,14 +40,92 @@ impl Service for SslService {
+     fn call(&self, req: &Request, rsp: &mut Response) -> u32 {
+         match req.cmd {
+             0 | 100 => rsp.objects.push(Arc::new(Context)),
+-            3 => rsp.push_u32(0),
+-            2 | 5 | 101 => {}
++            2 => {
++                let certs = requested(req);
++                if let Some(b) = out_buf(req, 0) {
++                    write_buffer(&b, &builtin_blob(&certs));
++                }
++                rsp.push_u32(certs.len() as u32);
++            }
++            3 => rsp.push_u32(builtin_blob(&requested(req)).len() as u32),
++            5 | 101 => {}
+             _ => return Stub(self.name()).call(req, rsp),
+         }
+         0
+     }
+ }
+ 
++/// One entry of the console's trusted CA store (system data 0100000000000800,
++/// ssl_TrustedCerts.bdf): id, status, DER bytes.
++struct BuiltInCert {
++    id: u32,
++    status: u32,
++    der: Vec<u8>,
++}
++
++const CERT_STORE: u64 = 0x0100_0000_0000_0800;
++const ALL_CERTS: u32 = u32::MAX;
++
++/// "sslT" header (magic, count), then 16-byte entries (id, status, size, offset) with offsets
++/// counted from the end of the 8-byte header (the first one equals the table size). Splatoon 3 runs its own BoringSSL and asks
++/// nn::ssl for these roots (GetCertificates); an empty answer made it give up before
++/// connecting.
++fn builtin_certs() -> &'static [BuiltInCert] {
++    static C: OnceLock<Vec<BuiltInCert>> = OnceLock::new();
++    C.get_or_init(|| {
++        let file = super::fs::CONFIG.get().and_then(|cfg| super::fs::system_data(cfg, CERT_STORE)).and_then(|s| {
++            let fs = nxfs::romfs::RomFs::open(s).ok()?;
++            let f = fs.files().into_iter().find(|f| f.path.ends_with("ssl_TrustedCerts.bdf"))?;
++            fs.storage().read_vec(f.offset, f.size as usize).ok()
++        });
++        let Some(d) = file else {
++            eprintln!("[ssl] built-in certificates unavailable: no ssl_TrustedCerts.bdf in the firmware (0100000000000800)");
++            return Vec::new();
++        };
++        let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
++        let (Some(magic), Some(count)) = (u32_at(0), u32_at(4)) else { return Vec::new() };
++        let data_start = 8;
++        let mut out = Vec::new();
++        for i in 0..count as usize {
++            let e = 8 + i * 16;
++            let (Some(id), Some(status), Some(size), Some(off)) = (u32_at(e), u32_at(e + 4), u32_at(e + 8), u32_at(e + 12)) else { break };
++            let Some(der) = d.get(data_start + off as usize..data_start + off as usize + size as usize) else { break };
++            out.push(BuiltInCert { id, status, der: der.to_vec() });
++        }
++        let der_like = out.iter().filter(|c| c.der.first() == Some(&0x30)).count();
++        eprintln!("[ssl] {} built-in certificates from the firmware (magic {magic:#x}, {der_like} look like DER)", out.len());
++        if der_like != out.len() || out.is_empty() {
++            let head: String = d.iter().take(48).map(|b| format!("{b:02x}")).collect();
++            eprintln!("[ssl] certificate store layout not understood, first bytes {head}");
++        }
++        out
++    })
++}
++
++fn requested(req: &Request) -> Vec<&'static BuiltInCert> {
++    let ids: Vec<u32> = bytes(in_buf(req, 0)).chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
++    let all = builtin_certs();
++    let picked: Vec<_> = if ids.contains(&ALL_CERTS) { all.iter().collect() } else { all.iter().filter(|c| ids.contains(&c.id)).collect() };
++    nextendo::diag_once(&format!("certs{ids:?}"), || format!("[ssl] built-in certificates asked for {ids:x?}: {} of {}", picked.len(), all.len()));
++    picked
++}
++
++/// GetCertificates' layout: one 0x18-byte BuiltInCertificateInfo per certificate (id, status,
++/// size, offset from the buffer start), then the DER data.
++fn builtin_blob(certs: &[&BuiltInCert]) -> Vec<u8> {
++    let mut out = vec![0u8; certs.len() * 0x18];
++    for (i, c) in certs.iter().enumerate() {
++        let off = out.len() as u64;
++        let e = i * 0x18;
++        out[e..e + 4].copy_from_slice(&c.id.to_le_bytes());
++        out[e + 4..e + 8].copy_from_slice(&c.status.to_le_bytes());
++        out[e + 8..e + 16].copy_from_slice(&(c.der.len() as u64).to_le_bytes());
++        out[e + 16..e + 24].copy_from_slice(&off.to_le_bytes());
++        out.extend_from_slice(&c.der);
++    }
++    out
++}
++
+ struct Context;
+ 
+ impl Service for Context {
+-- 
+2.56.1
+

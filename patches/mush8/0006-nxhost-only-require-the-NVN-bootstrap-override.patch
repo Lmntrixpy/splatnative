@@ -1,7 +1,7 @@
 From 333fbe4d3ae095efa9d4dbc6ad466029917e8b93 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Mon, 23 Nov 2026 00:17:29 +0100
-Subject: [PATCH 06/56] nxhost: only require the NVN bootstrap override
+Subject: [PATCH 06/57] nxhost: only require the NVN bootstrap override
 
 The loader failed when any host override was not imported. Overrides are
 per library (NVN, nn::diag abort variants, the SDK movie library) and

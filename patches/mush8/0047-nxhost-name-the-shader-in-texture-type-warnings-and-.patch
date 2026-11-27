@@ -1,7 +1,7 @@
 From e9a37845eb0ae504a88d04dbc6b5637447f91277 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Tue, 24 Nov 2026 11:39:24 +0100
-Subject: [PATCH 47/56] nxhost: name the shader in texture type warnings and
+Subject: [PATCH 47/57] nxhost: name the shader in texture type warnings and
  NX_DUMP_MSL
 
 The texture type mismatch warning now says which shader and binding it is

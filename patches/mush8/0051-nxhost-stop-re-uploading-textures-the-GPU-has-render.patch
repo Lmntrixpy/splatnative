@@ -1,7 +1,7 @@
 From f0083199f12a4c0dbf565208ec279cd975da31fb Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Tue, 24 Nov 2026 13:56:51 +0100
-Subject: [PATCH 51/56] nxhost: stop re-uploading textures the GPU has rendered
+Subject: [PATCH 51/57] nxhost: stop re-uploading textures the GPU has rendered
  into
 
 A texture first created for sampling is re-uploaded from guest memory
