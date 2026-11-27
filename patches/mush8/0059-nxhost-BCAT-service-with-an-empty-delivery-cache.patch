@@ -1,7 +1,7 @@
 From eb3007672c064318068dd34d88c7798277e4e7e7 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Fri, 27 Nov 2026 17:32:37 +0100
-Subject: [PATCH 59/63] nxhost: BCAT service with an empty delivery cache
+Subject: [PATCH 59/64] nxhost: BCAT service with an empty delivery cache
 
 After its NPLN login (and the Splatfest region question) Splatoon 3 calls
 nn::bcat::RequestSyncDeliveryCache. bcat:u cmd 0 (CreateBcatService) was a

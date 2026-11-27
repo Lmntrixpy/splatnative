@@ -1,7 +1,7 @@
 From 6a751e9992c558d4df84939938318c5fb6b33a80 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Fri, 27 Nov 2026 17:48:07 +0100
-Subject: [PATCH 61/63] nxhost: NX_NEXTENDO_INSPECT, a local relay that decodes
+Subject: [PATCH 61/64] nxhost: NX_NEXTENDO_INSPECT, a local relay that decodes
  NPLN traffic
 
 Splatoon 3 speaks gRPC through its own BoringSSL, so a feature that stays

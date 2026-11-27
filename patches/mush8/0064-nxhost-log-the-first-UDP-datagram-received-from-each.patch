@@ -1,0 +1,57 @@
+From a7ef0d813148e62ca54f810cfd77e98dfe2d94f9 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Fri, 27 Nov 2026 18:39:48 +0100
+Subject: [PATCH 64/64] nxhost: log the first UDP datagram received from each
+ source in Nextendo mode
+
+Before matchmaking Splatoon 3 sends a STUN binding request to the NPLN
+latency server (46.202.179.11:3478) and repeats it about 14 times, as if no
+answer arrived; the server does answer (checked from the host in 171 ms).
+recvfrom now logs the first datagram from each source once
+("[net] udp from ip:port: first datagram received"), to tell a lost reply
+from one the game reads but discards.
+---
+ crates/nxhost/src/services/bsd.rs | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/crates/nxhost/src/services/bsd.rs b/crates/nxhost/src/services/bsd.rs
+index d3a44be..cca5e72 100644
+--- a/crates/nxhost/src/services/bsd.rs
++++ b/crates/nxhost/src/services/bsd.rs
+@@ -344,6 +344,9 @@ fn read_udp(fd: i32, buf: &mut [u8], flags: i32) -> (i32, u32, libc::sockaddr_st
+             continue;
+         }
+         let r = res(n as isize);
++        if r.0 >= 0 && len > 0 {
++            note_udp_recv(&ss, r.0);
++        }
+         return (r.0, r.1, ss, if r.0 >= 0 { len } else { 0 });
+     }
+ }
+@@ -842,6 +845,23 @@ fn note_udp(ss: &libc::sockaddr_storage, len: usize, r: (i32, u32)) {
+     eprintln!("[net] udp {}:{port}: first datagram, {len} bytes, {how}", ip_str(ip));
+ }
+ 
++/// In Nextendo mode, the first UDP datagram received from each source is logged (the STUN
++/// answer from the NPLN latency server, P2P peers).
++fn note_udp_recv(ss: &libc::sockaddr_storage, n: i32) {
++    if !crate::services::nextendo::enabled() || ss.ss_family as i32 != libc::AF_INET {
++        return;
++    }
++    let Some(ip) = v4(ss) else { return };
++    let port = u16::from_be(unsafe { (*(ss as *const _ as *const libc::sockaddr_in)).sin_port });
++    static SEEN: Mutex<Vec<([u8; 4], u16)>> = Mutex::new(Vec::new());
++    let mut seen = SEEN.lock().unwrap();
++    if seen.contains(&(ip, port)) || seen.len() > 64 {
++        return;
++    }
++    seen.push((ip, port));
++    eprintln!("[net] udp from {}:{port}: first datagram received, {n} bytes", ip_str(ip));
++}
++
+ /// One message of the serialized mmsghdr array that bsd SendMMsg/RecvMMsg (cmds 30/29) take in
+ /// their in/out buffer, as seen from Splatoon 3's gRPC (sendmsg on a connected TCP socket):
+ /// u32 8, u8 0 (no address), u32 iov count, per iov u64 length + bytes, then a 12-byte trailer
+-- 
+2.56.1
+

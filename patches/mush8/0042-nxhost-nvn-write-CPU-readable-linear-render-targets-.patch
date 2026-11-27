@@ -1,7 +1,7 @@
 From d0b4bf100079fe8cd9ad62315286c6f2c4048a8b Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Tue, 24 Nov 2026 09:22:12 +0100
-Subject: [PATCH 42/63] nxhost nvn: write CPU-readable linear render targets
+Subject: [PATCH 42/64] nxhost nvn: write CPU-readable linear render targets
  back to guest memory
 
 A game that renders into a linear texture (LINEAR or LINEAR_RENDER_TARGET)

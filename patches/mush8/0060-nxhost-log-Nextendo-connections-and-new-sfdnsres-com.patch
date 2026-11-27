@@ -1,7 +1,7 @@
 From 098b1dd794375ec5879edbda28435c1abb9f2400 Mon Sep 17 00:00:00 2001
 From: schoeremy <jeremyfroeb2007@gmail.com>
 Date: Fri, 27 Nov 2026 17:37:54 +0100
-Subject: [PATCH 60/63] nxhost: log Nextendo connections and new sfdnsres
+Subject: [PATCH 60/64] nxhost: log Nextendo connections and new sfdnsres
  commands
 
 In Nextendo mode every server the game connects to is now logged once
