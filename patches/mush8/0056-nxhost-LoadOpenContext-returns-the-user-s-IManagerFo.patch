@@ -1,0 +1,39 @@
+From c962cc208653be3aebe53bf3decf2c5c5db72088 Mon Sep 17 00:00:00 2001
+From: schoeremy <jeremyfroeb2007@gmail.com>
+Date: Fri, 27 Nov 2026 10:59:51 +0100
+Subject: [PATCH 56/56] nxhost: LoadOpenContext returns the user's
+ IManagerForApplication
+
+acc:u0 cmd 130 (LoadOpenContext) answered success without an object.
+nn::account::PopOpenUsers stores that object in the user handle, so
+Splatoon 3's handle had no manager and the SDK judged the network service
+account unavailable without any IPC: the game stayed offline in Nextendo
+mode and never tried to log in. Cmd 130 now returns the same manager as
+cmd 101; the game then calls CheckAvailability and, in Nextendo mode,
+EnsureIdTokenCacheAsync at boot. Offline it gets "not linked" as before.
+---
+ crates/nxhost/src/services/account.rs | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/crates/nxhost/src/services/account.rs b/crates/nxhost/src/services/account.rs
+index 9334126..be5ad07 100644
+--- a/crates/nxhost/src/services/account.rs
++++ b/crates/nxhost/src/services/account.rs
+@@ -59,8 +59,12 @@ impl Service for Account {
+             5 => rsp.objects.push(Arc::new(Profile)),
+             50 => rsp.data.push(0),
+             51 => rsp.data.extend_from_slice(&USER_ID),
+-            100 | 140 | 110 | 111 | 130 => {}
+-            101 => rsp.objects.push(Arc::new(ManagerForApplication)),
++            100 | 140 | 110 | 111 => {}
++            // 130 LoadOpenContext hands over the launch user's IManagerForApplication, like 101.
++            // nn::account::PopOpenUsers stores it in the user handle; with no object Splatoon 3's
++            // handle had no manager and the SDK reported "no network service account" without
++            // asking, so the game stayed offline and never tried to log in.
++            101 | 130 => rsp.objects.push(Arc::new(ManagerForApplication)),
+             150 => rsp.data.push(0),
+             _ => return Stub(self.name()).call(req, rsp),
+         }
+-- 
+2.56.1
+
